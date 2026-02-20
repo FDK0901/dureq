@@ -1,0 +1,1714 @@
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/FDK0901/dureq/pkg/types"
+	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/redis/rueidis"
+)
+
+// Sentinel errors for the Redis store.
+var (
+	ErrCASConflict   = errors.New("dureq: CAS conflict")
+	ErrAlreadyExists = errors.New("dureq: already exists")
+)
+
+// --- Filter types (formerly in history.go) ---
+
+// RunFilter specifies criteria for listing job runs.
+type RunFilter struct {
+	JobID    *string
+	NodeID   *string
+	Status   *types.RunStatus
+	TaskType *types.TaskType
+	Tags     []string
+	Since    *time.Time
+	Until    *time.Time
+	Limit    int
+	Offset   int
+	Sort     string // "newest" (default) or "oldest"
+}
+
+// EventFilter specifies criteria for listing job events.
+type EventFilter struct {
+	JobID     *string
+	EventType *types.EventType
+	Since     *time.Time
+	Until     *time.Time
+	Limit     int
+	Offset    int
+}
+
+// StatsFilter specifies criteria for aggregated stats queries.
+type StatsFilter struct {
+	TaskType *types.TaskType
+	Tags     []string
+	Since    *time.Time
+	Until    *time.Time
+}
+
+// JobStats holds aggregated statistics.
+type JobStats struct {
+	TotalJobs   int64                     `json:"total_jobs"`
+	TotalRuns   int64                     `json:"total_runs"`
+	ByStatus    map[types.JobStatus]int64 `json:"by_status"`
+	ByTaskType  map[types.TaskType]int64  `json:"by_task_type"`
+	AvgDuration time.Duration             `json:"avg_duration"`
+	SuccessRate float64                   `json:"success_rate"`
+	FailureRate float64                   `json:"failure_rate"`
+}
+
+// WorkflowFilter specifies criteria for listing workflow instances.
+type WorkflowFilter struct {
+	WorkflowName *string
+	Status       *types.WorkflowStatus
+	Sort         string // "newest" or "oldest"
+	Limit        int
+	Offset       int
+}
+
+// BatchFilter specifies criteria for listing batch instances.
+type BatchFilter struct {
+	Name   *string
+	Status *types.WorkflowStatus
+	Sort   string // "newest" or "oldest"
+	Limit  int
+	Offset int
+}
+
+// JobFilter specifies criteria for listing active jobs.
+type JobFilter struct {
+	Status   *types.JobStatus
+	TaskType *types.TaskType
+	Tag      *string
+	Search   *string // substring match on ID or TaskType
+	Sort     string  // "newest" or "oldest"
+	Limit    int
+	Offset   int
+}
+
+// ScheduleFilter specifies criteria for listing active schedules.
+type ScheduleFilter struct {
+	Sort   string // "newest" or "oldest"
+	Limit  int
+	Offset int
+}
+
+// --- RedisStore ---
+
+// RedisStore manages all dureq state in Redis, replacing both NATSStore and HistoryStore.
+type RedisStore struct {
+	rdb    rueidis.Client
+	cfg    RedisStoreConfig
+	prefix string
+	logger gochainedlog.Logger
+
+	// Pre-compiled Lua scripts (all single-key for Redis Cluster compatibility)
+	scriptSaveJob       *rueidis.Lua
+	scriptCreateJob     *rueidis.Lua
+	scriptCASJob        *rueidis.Lua
+	scriptCASUpdate     *rueidis.Lua
+	scriptCreateNX      *rueidis.Lua
+	scriptLeaderRefresh *rueidis.Lua
+	scriptMoveDelayed   *rueidis.Lua
+}
+
+// NewRedisStore creates a new Redis store and registers tier configuration.
+func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog.Logger) (*RedisStore, error) {
+	cfg.defaults()
+
+	s := &RedisStore{
+		rdb:    rdb,
+		cfg:    cfg,
+		prefix: cfg.prefix(),
+		logger: logger,
+
+		scriptSaveJob:       rueidis.NewLuaScript(luaSaveJobSingleKey),
+		scriptCreateJob:     rueidis.NewLuaScript(luaCreateIfNotExists),
+		scriptCASJob:        rueidis.NewLuaScript(luaCASUpdateJobSingleKey),
+		scriptCASUpdate:     rueidis.NewLuaScript(luaCASUpdate),
+		scriptCreateNX:      rueidis.NewLuaScript(luaCreateIfNotExists),
+		scriptLeaderRefresh: rueidis.NewLuaScript(luaLeaderRefresh),
+		scriptMoveDelayed:   rueidis.NewLuaScript(luaMoveDelayedToStream),
+	}
+
+	// Register tiers in sorted set so workers can discover them.
+	ctx := context.Background()
+	for _, tier := range cfg.Tiers {
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(TiersKey(s.prefix)).ScoreMember().ScoreMember(float64(tier.Weight), tier.Name).Build())
+	}
+
+	return s, nil
+}
+
+// --- Accessors ---
+
+func (s *RedisStore) Client() rueidis.Client   { return s.rdb }
+func (s *RedisStore) Prefix() string           { return s.prefix }
+func (s *RedisStore) Config() RedisStoreConfig { return s.cfg }
+
+func (s *RedisStore) Ping(ctx context.Context) error {
+	return s.rdb.Do(ctx, s.rdb.B().Ping().Build()).Error()
+}
+
+func (s *RedisStore) Close() error {
+	s.rdb.Close()
+	return nil
+}
+
+// ============================================================
+// Job operations
+// ============================================================
+
+// SaveJob upserts a job and maintains all secondary indexes.
+// The job hash is updated atomically via a single-key Lua script;
+// secondary indexes are updated individually (best-effort) for Redis Cluster compatibility.
+func (s *RedisStore) SaveJob(ctx context.Context, job *types.Job) (uint64, error) {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return 0, fmt.Errorf("marshal job: %w", err)
+	}
+
+	// Single-key Lua: upsert job hash, returns "old_data\nnew_version".
+	result, err := s.scriptSaveJob.Exec(ctx, s.rdb,
+		[]string{JobKey(s.prefix, job.ID)},
+		[]string{string(data)},
+	).ToString()
+	if err != nil {
+		return 0, fmt.Errorf("save job: %w", err)
+	}
+
+	oldData, ver := parseSaveJobResult(result)
+	s.updateJobIndexes(ctx, job, oldData)
+	s.updateJobAssociationIndexes(ctx, job)
+	s.mirrorJobPayload(ctx, job) // best-effort JSON mirror for JSONPath search
+	return ver, nil
+}
+
+// CreateJob atomically creates a job only if it doesn't already exist.
+// Secondary indexes are added individually after creation.
+func (s *RedisStore) CreateJob(ctx context.Context, job *types.Job) (uint64, error) {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return 0, fmt.Errorf("marshal job: %w", err)
+	}
+
+	// Single-key Lua: create hash only if key doesn't exist.
+	_, err = s.scriptCreateJob.Exec(ctx, s.rdb,
+		[]string{JobKey(s.prefix, job.ID)},
+		[]string{string(data)},
+	).ToString()
+	if err != nil {
+		if strings.Contains(err.Error(), "ALREADY_EXISTS") {
+			return 0, ErrAlreadyExists
+		}
+		return 0, fmt.Errorf("create job: %w", err)
+	}
+
+	// Add all indexes (no old data to diff against).
+	s.addJobIndexes(ctx, job)
+	s.updateJobAssociationIndexes(ctx, job)
+	s.mirrorJobPayload(ctx, job) // best-effort JSON mirror for JSONPath search
+	return 1, nil
+}
+
+// GetJob retrieves a job by ID.
+func (s *RedisStore) GetJob(ctx context.Context, jobID string) (*types.Job, uint64, error) {
+	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(JobKey(s.prefix, jobID)).Build()).AsStrMap()
+	if err != nil {
+		return nil, 0, fmt.Errorf("get job: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, 0, types.ErrJobNotFound
+	}
+
+	dataStr, ok := result["data"]
+	if !ok {
+		return nil, 0, fmt.Errorf("get job: missing data field")
+	}
+
+	var job types.Job
+	if err := json.Unmarshal([]byte(dataStr), &job); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal job: %w", err)
+	}
+
+	ver := parseVersion(result["_version"])
+	return &job, ver, nil
+}
+
+// UpdateJob performs a CAS update on a job and maintains all secondary indexes.
+// The job hash is updated atomically via a single-key Lua script;
+// secondary indexes are diffed and updated individually.
+func (s *RedisStore) UpdateJob(ctx context.Context, job *types.Job, expectedRev uint64) (uint64, error) {
+	data, err := json.Marshal(job)
+	if err != nil {
+		return 0, fmt.Errorf("marshal job: %w", err)
+	}
+
+	// Single-key CAS Lua: returns "old_data\nnew_version".
+	result, err := s.scriptCASJob.Exec(ctx, s.rdb,
+		[]string{JobKey(s.prefix, job.ID)},
+		[]string{strconv.FormatUint(expectedRev, 10), string(data)},
+	).ToString()
+	if err != nil {
+		if strings.Contains(err.Error(), "CAS_CONFLICT") {
+			return 0, ErrCASConflict
+		}
+		return 0, fmt.Errorf("update job (CAS): %w", err)
+	}
+
+	oldData, ver := parseSaveJobResult(result)
+	s.updateJobIndexes(ctx, job, oldData)
+	s.updateJobAssociationIndexes(ctx, job)
+	s.mirrorJobPayload(ctx, job) // best-effort JSON mirror for JSONPath search
+	return ver, nil
+}
+
+// DeleteJob removes a job and cleans all secondary indexes individually.
+func (s *RedisStore) DeleteJob(ctx context.Context, jobID string) error {
+	// Read old data for index cleanup.
+	oldData, err := s.rdb.Do(ctx, s.rdb.B().Hget().Key(JobKey(s.prefix, jobID)).Field("data").Build()).ToString()
+	if err != nil && !rueidis.IsRedisNil(err) {
+		return fmt.Errorf("read job for deletion: %w", err)
+	}
+
+	// Delete the job hash key.
+	if err := s.rdb.Do(ctx, s.rdb.B().Del().Key(JobKey(s.prefix, jobID)).Build()).Error(); err != nil {
+		return fmt.Errorf("delete job: %w", err)
+	}
+
+	// Clean all secondary indexes from old data.
+	if oldData != "" {
+		var old types.Job
+		if json.Unmarshal([]byte(oldData), &old) == nil {
+			s.removeJobIndexes(ctx, jobID, &old)
+		}
+	}
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		s.rdb.Do(bgCtx, s.rdb.B().JsonDel().Key(JobPayloadKey(s.prefix, jobID)).Path("$").Build())
+	}()
+	return nil
+}
+
+// ListJobs returns all jobs (use sparingly for large datasets).
+func (s *RedisStore) ListJobs(ctx context.Context) ([]*types.Job, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrange().Key(JobsByCreatedKey(s.prefix)).Min("0").Max("-1").Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list job IDs: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateJobs(ctx, ids)
+}
+
+// JobStatusCounts returns job counts by status using ZCARD on index sets.
+func (s *RedisStore) JobStatusCounts(ctx context.Context) (map[types.JobStatus]int, error) {
+	statuses := []types.JobStatus{
+		types.JobStatusPending, types.JobStatusScheduled, types.JobStatusRunning,
+		types.JobStatusCompleted, types.JobStatusFailed, types.JobStatusRetrying,
+		types.JobStatusDead, types.JobStatusCancelled,
+	}
+
+	cmds := make(rueidis.Commands, 0, len(statuses))
+	for _, st := range statuses {
+		cmds = append(cmds, s.rdb.B().Zcard().Key(JobsByStatusKey(s.prefix, string(st))).Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+
+	counts := make(map[types.JobStatus]int, len(statuses))
+	for i, st := range statuses {
+		if n, err := results[i].AsInt64(); err == nil && n > 0 {
+			counts[st] = int(n)
+		}
+	}
+	return counts, nil
+}
+
+// GetActiveJobStats returns aggregated counts by job status (alias for monitor API).
+func (s *RedisStore) GetActiveJobStats(ctx context.Context) (map[types.JobStatus]int, error) {
+	return s.JobStatusCounts(ctx)
+}
+
+// GetJobStats returns aggregated job statistics.
+func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats, error) {
+	totalJobs, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
+	totalRuns, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(HistoryRunsKey(s.prefix)).Build()).AsInt64()
+
+	statuses := []types.JobStatus{
+		types.JobStatusPending, types.JobStatusScheduled, types.JobStatusRunning,
+		types.JobStatusCompleted, types.JobStatusFailed, types.JobStatusRetrying,
+		types.JobStatusDead, types.JobStatusCancelled,
+	}
+
+	cmds := make(rueidis.Commands, 0, len(statuses))
+	for _, st := range statuses {
+		cmds = append(cmds, s.rdb.B().Zcard().Key(JobsByStatusKey(s.prefix, string(st))).Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+
+	byStatus := make(map[types.JobStatus]int64)
+	for i, st := range statuses {
+		if n, err := results[i].AsInt64(); err == nil && n > 0 {
+			byStatus[st] = n
+		}
+	}
+
+	return &JobStats{
+		TotalJobs:  totalJobs,
+		TotalRuns:  totalRuns,
+		ByStatus:   byStatus,
+		ByTaskType: make(map[types.TaskType]int64),
+	}, nil
+}
+
+// ============================================================
+// Schedule operations
+// ============================================================
+
+// SaveSchedule upserts a schedule and updates the due sorted set.
+func (s *RedisStore) SaveSchedule(ctx context.Context, entry *types.ScheduleEntry) (uint64, error) {
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return 0, fmt.Errorf("marshal schedule: %w", err)
+	}
+
+	cmds := make(rueidis.Commands, 0, 3)
+	cmds = append(cmds, s.rdb.B().Hset().Key(ScheduleKey(s.prefix, entry.JobID)).FieldValue().FieldValue("data", string(data)).Build())
+	cmds = append(cmds, s.rdb.B().Hincrby().Key(ScheduleKey(s.prefix, entry.JobID)).Field("_version").Increment(1).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(SchedulesDueKey(s.prefix)).ScoreMember().ScoreMember(float64(entry.NextRunAt.UnixNano()), entry.JobID).Build())
+
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return 0, fmt.Errorf("save schedule: %w", err)
+		}
+	}
+	ver, _ := results[1].AsInt64()
+	return uint64(ver), nil
+}
+
+// GetSchedule retrieves a schedule entry by job ID.
+func (s *RedisStore) GetSchedule(ctx context.Context, jobID string) (*types.ScheduleEntry, uint64, error) {
+	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(ScheduleKey(s.prefix, jobID)).Build()).AsStrMap()
+	if err != nil {
+		return nil, 0, fmt.Errorf("get schedule: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, 0, types.ErrScheduleNotFound
+	}
+
+	var sched types.ScheduleEntry
+	if err := json.Unmarshal([]byte(result["data"]), &sched); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal schedule: %w", err)
+	}
+	return &sched, parseVersion(result["_version"]), nil
+}
+
+// DeleteSchedule removes a schedule and its index entry.
+func (s *RedisStore) DeleteSchedule(ctx context.Context, jobID string) error {
+	cmds := make(rueidis.Commands, 0, 2)
+	cmds = append(cmds, s.rdb.B().Del().Key(ScheduleKey(s.prefix, jobID)).Build())
+	cmds = append(cmds, s.rdb.B().Zrem().Key(SchedulesDueKey(s.prefix)).Member(jobID).Build())
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListDueSchedules returns schedules where NextRunAt <= cutoff.
+// O(log N + M) using sorted set.
+func (s *RedisStore) ListDueSchedules(ctx context.Context, cutoff time.Time) ([]*types.ScheduleEntry, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(SchedulesDueKey(s.prefix)).Min("-inf").Max(strconv.FormatInt(cutoff.UnixNano(), 10)).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list due schedules: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateSchedules(ctx, ids)
+}
+
+// ListSchedules returns all active schedule entries.
+func (s *RedisStore) ListSchedules(ctx context.Context) ([]*types.ScheduleEntry, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrange().Key(SchedulesDueKey(s.prefix)).Min("0").Max("-1").Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list schedules: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateSchedules(ctx, ids)
+}
+
+// ============================================================
+// Run operations
+// ============================================================
+
+// SaveRun upserts a job run and maintains the active set and by-job index.
+func (s *RedisStore) SaveRun(ctx context.Context, run *types.JobRun) (uint64, error) {
+	data, err := json.Marshal(run)
+	if err != nil {
+		return 0, fmt.Errorf("marshal run: %w", err)
+	}
+
+	cmds := make(rueidis.Commands, 0, 6)
+	cmds = append(cmds, s.rdb.B().Hset().Key(RunKey(s.prefix, run.ID)).FieldValue().FieldValue("data", string(data)).Build())
+	cmds = append(cmds, s.rdb.B().Hincrby().Key(RunKey(s.prefix, run.ID)).Field("_version").Increment(1).Build())
+
+	if !run.Status.IsTerminal() {
+		cmds = append(cmds, s.rdb.B().Sadd().Key(RunsActiveKey(s.prefix)).Member(run.ID).Build())
+		cmds = append(cmds, s.rdb.B().Sadd().Key(RunsActiveByJobKey(s.prefix, run.JobID)).Member(run.ID).Build())
+	} else {
+		cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveKey(s.prefix)).Member(run.ID).Build())
+		cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveByJobKey(s.prefix, run.JobID)).Member(run.ID).Build())
+	}
+	cmds = append(cmds, s.rdb.B().Zadd().Key(RunsByJobKey(s.prefix, run.JobID)).ScoreMember().ScoreMember(float64(run.StartedAt.UnixNano()), run.ID).Build())
+
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return 0, fmt.Errorf("save run: %w", err)
+		}
+	}
+	ver, _ := results[1].AsInt64()
+	return uint64(ver), nil
+}
+
+// GetRun retrieves a job run by ID.
+func (s *RedisStore) GetRun(ctx context.Context, runID string) (*types.JobRun, uint64, error) {
+	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(RunKey(s.prefix, runID)).Build()).AsStrMap()
+	if err != nil {
+		return nil, 0, fmt.Errorf("get run: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, 0, types.ErrRunNotFound
+	}
+
+	var run types.JobRun
+	if err := json.Unmarshal([]byte(result["data"]), &run); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal run: %w", err)
+	}
+	return &run, parseVersion(result["_version"]), nil
+}
+
+// DeleteRun removes a run and cleans its indexes.
+func (s *RedisStore) DeleteRun(ctx context.Context, runID string) error {
+	dataStr, err := s.rdb.Do(ctx, s.rdb.B().Hget().Key(RunKey(s.prefix, runID)).Field("data").Build()).ToString()
+	if err != nil && !rueidis.IsRedisNil(err) {
+		return err
+	}
+
+	cmds := make(rueidis.Commands, 0, 5)
+	cmds = append(cmds, s.rdb.B().Del().Key(RunKey(s.prefix, runID)).Build())
+	cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveKey(s.prefix)).Member(runID).Build())
+
+	if dataStr != "" {
+		var run types.JobRun
+		if json.Unmarshal([]byte(dataStr), &run) == nil {
+			cmds = append(cmds, s.rdb.B().Zrem().Key(RunsByJobKey(s.prefix, run.JobID)).Member(runID).Build())
+			cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveByJobKey(s.prefix, run.JobID)).Member(runID).Build())
+		}
+	}
+
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListRuns returns all active (non-terminal) runs.
+func (s *RedisStore) ListRuns(ctx context.Context) ([]*types.JobRun, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Smembers().Key(RunsActiveKey(s.prefix)).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list active runs: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateRuns(ctx, ids)
+}
+
+// ListActiveRunsByJobID returns all active runs belonging to a specific job.
+func (s *RedisStore) ListActiveRunsByJobID(ctx context.Context, jobID string) ([]*types.JobRun, error) {
+	all, err := s.ListRuns(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var result []*types.JobRun
+	for _, r := range all {
+		if r.JobID == jobID {
+			result = append(result, r)
+		}
+	}
+	return result, nil
+}
+
+// CancelChannel returns the Redis Pub/Sub channel name used for task cancellation signals.
+func (s *RedisStore) CancelChannel() string {
+	return CancelChannelKey(s.prefix)
+}
+
+// HasActiveRunForJob returns true if any non-terminal run exists for the given jobID.
+// Uses the per-job active run set for O(1) check.
+func (s *RedisStore) HasActiveRunForJob(ctx context.Context, jobID string) (bool, error) {
+	count, err := s.rdb.Do(ctx, s.rdb.B().Scard().Key(RunsActiveByJobKey(s.prefix, jobID)).Build()).AsInt64()
+	if err != nil {
+		return false, fmt.Errorf("check active runs for job: %w", err)
+	}
+	return count > 0, nil
+}
+
+// ============================================================
+// Overlap buffer operations (schedule overlap policy)
+// ============================================================
+
+// SaveOverlapBuffer stores a buffered dispatch timestamp for BUFFER_ONE policy.
+// Overwrites any previous buffered entry.
+func (s *RedisStore) SaveOverlapBuffer(ctx context.Context, jobID string, nextRunAt time.Time) error {
+	return s.rdb.Do(ctx, s.rdb.B().Set().Key(OverlapBufferedKey(s.prefix, jobID)).Value(strconv.FormatInt(nextRunAt.UnixNano(), 10)).Ex(24*time.Hour).Build()).Error()
+}
+
+// PopOverlapBuffer retrieves and deletes the buffered dispatch for BUFFER_ONE.
+func (s *RedisStore) PopOverlapBuffer(ctx context.Context, jobID string) (time.Time, bool, error) {
+	val, err := s.rdb.Do(ctx, s.rdb.B().Getdel().Key(OverlapBufferedKey(s.prefix, jobID)).Build()).ToString()
+	if rueidis.IsRedisNil(err) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("pop overlap buffer: %w", err)
+	}
+	nanos, _ := strconv.ParseInt(val, 10, 64)
+	return time.Unix(0, nanos), true, nil
+}
+
+// PushOverlapBufferAll appends to the BUFFER_ALL queue.
+func (s *RedisStore) PushOverlapBufferAll(ctx context.Context, jobID string, nextRunAt time.Time) error {
+	key := OverlapBufferListKey(s.prefix, jobID)
+	cmds := make(rueidis.Commands, 0, 2)
+	cmds = append(cmds, s.rdb.B().Rpush().Key(key).Element(strconv.FormatInt(nextRunAt.UnixNano(), 10)).Build())
+	cmds = append(cmds, s.rdb.B().Expire().Key(key).Seconds(int64((24 * time.Hour).Seconds())).Build())
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// PopOverlapBufferAll pops the next buffered dispatch from BUFFER_ALL.
+func (s *RedisStore) PopOverlapBufferAll(ctx context.Context, jobID string) (time.Time, bool, error) {
+	val, err := s.rdb.Do(ctx, s.rdb.B().Lpop().Key(OverlapBufferListKey(s.prefix, jobID)).Build()).ToString()
+	if rueidis.IsRedisNil(err) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("pop overlap buffer all: %w", err)
+	}
+	nanos, _ := strconv.ParseInt(val, 10, 64)
+	return time.Unix(0, nanos), true, nil
+}
+
+// ============================================================
+// Node operations
+// ============================================================
+
+// SaveNode upserts a node with TTL for automatic dead-node cleanup.
+func (s *RedisStore) SaveNode(ctx context.Context, node *types.NodeInfo) (uint64, error) {
+	data, err := json.Marshal(node)
+	if err != nil {
+		return 0, fmt.Errorf("marshal node: %w", err)
+	}
+
+	key := NodeKey(s.prefix, node.NodeID)
+	cmds := make(rueidis.Commands, 0, 3)
+	cmds = append(cmds, s.rdb.B().Hset().Key(key).FieldValue().FieldValue("data", string(data)).FieldValue("_version", "1").Build())
+	cmds = append(cmds, s.rdb.B().Expire().Key(key).Seconds(int64(s.cfg.NodeTTL.Seconds())).Build())
+	cmds = append(cmds, s.rdb.B().Sadd().Key(NodesAllKey(s.prefix)).Member(node.NodeID).Build())
+
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return 0, fmt.Errorf("save node: %w", err)
+		}
+	}
+	return 1, nil
+}
+
+// GetNode retrieves a node by ID, returns nil if not found or TTL expired.
+func (s *RedisStore) GetNode(ctx context.Context, nodeID string) (*types.NodeInfo, error) {
+	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(NodeKey(s.prefix, nodeID)).Build()).AsStrMap()
+	if err != nil || len(result) == 0 {
+		return nil, nil
+	}
+
+	var node types.NodeInfo
+	if err := json.Unmarshal([]byte(result["data"]), &node); err != nil {
+		return nil, fmt.Errorf("unmarshal node: %w", err)
+	}
+	return &node, nil
+}
+
+// ListNodes returns all live nodes, pruning stale entries from the tracking set.
+func (s *RedisStore) ListNodes(ctx context.Context) ([]*types.NodeInfo, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Smembers().Key(NodesAllKey(s.prefix)).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list node IDs: %w", err)
+	}
+
+	var nodes []*types.NodeInfo
+	var staleIDs []string
+
+	for _, id := range ids {
+		result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(NodeKey(s.prefix, id)).Build()).AsStrMap()
+		if err != nil || len(result) == 0 {
+			staleIDs = append(staleIDs, id)
+			continue
+		}
+		var node types.NodeInfo
+		if err := json.Unmarshal([]byte(result["data"]), &node); err != nil {
+			continue
+		}
+		nodes = append(nodes, &node)
+	}
+
+	// Prune stale entries whose hash keys have expired.
+	if len(staleIDs) > 0 {
+		cmds := make(rueidis.Commands, 0, len(staleIDs))
+		for _, id := range staleIDs {
+			cmds = append(cmds, s.rdb.B().Srem().Key(NodesAllKey(s.prefix)).Member(id).Build())
+		}
+		s.rdb.DoMulti(ctx, cmds...)
+	}
+	return nodes, nil
+}
+
+// ============================================================
+// Unique key deduplication
+// ============================================================
+
+// CheckUniqueKey checks whether a unique key is claimed. Returns (jobID, exists, error).
+func (s *RedisStore) CheckUniqueKey(ctx context.Context, uniqueKey string) (string, bool, error) {
+	val, err := s.rdb.Do(ctx, s.rdb.B().Get().Key(UniqueKeyKey(s.prefix, uniqueKey)).Build()).ToString()
+	if rueidis.IsRedisNil(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return val, true, nil
+}
+
+// SetUniqueKey atomically claims a unique key for a job ID.
+func (s *RedisStore) SetUniqueKey(ctx context.Context, uniqueKey, jobID string) error {
+	err := s.rdb.Do(ctx, s.rdb.B().Set().Key(UniqueKeyKey(s.prefix, uniqueKey)).Value(jobID).Nx().Build()).Error()
+	if err == nil {
+		return nil
+	}
+	if rueidis.IsRedisNil(err) {
+		return types.ErrDuplicateJob
+	}
+	return err
+}
+
+// DeleteUniqueKey releases a unique key.
+func (s *RedisStore) DeleteUniqueKey(ctx context.Context, uniqueKey string) error {
+	return s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, uniqueKey)).Build()).Error()
+}
+
+// ============================================================
+// Workflow operations
+// ============================================================
+
+// SaveWorkflow upserts a workflow instance and maintains sorted-set indexes.
+func (s *RedisStore) SaveWorkflow(ctx context.Context, wf *types.WorkflowInstance) (uint64, error) {
+	data, err := json.Marshal(wf)
+	if err != nil {
+		return 0, fmt.Errorf("marshal workflow: %w", err)
+	}
+
+	key := WorkflowKey(s.prefix, wf.ID)
+	oldStatus := hashFieldFromJSON(ctx, s.rdb, key, "status")
+
+	cmds := make(rueidis.Commands, 0, 6)
+	cmds = append(cmds, s.rdb.B().Hset().Key(key).FieldValue().FieldValue("data", string(data)).Build())
+	incrIdx := len(cmds)
+	cmds = append(cmds, s.rdb.B().Hincrby().Key(key).Field("_version").Increment(1).Build())
+
+	score := float64(wf.CreatedAt.UnixNano())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(WorkflowsByCreatedKey(s.prefix)).ScoreMember().ScoreMember(score, wf.ID).Build())
+	if oldStatus != "" && oldStatus != string(wf.Status) {
+		cmds = append(cmds, s.rdb.B().Zrem().Key(WorkflowsByStatusKey(s.prefix, oldStatus)).Member(wf.ID).Build())
+	}
+	cmds = append(cmds, s.rdb.B().Zadd().Key(WorkflowsByStatusKey(s.prefix, string(wf.Status))).ScoreMember().ScoreMember(score, wf.ID).Build())
+
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return 0, fmt.Errorf("save workflow: %w", err)
+		}
+	}
+	ver, _ := results[incrIdx].AsInt64()
+	s.mirrorWorkflowPayloads(ctx, wf) // best-effort JSON mirror for JSONPath search
+	return uint64(ver), nil
+}
+
+// GetWorkflow retrieves a workflow instance by ID.
+func (s *RedisStore) GetWorkflow(ctx context.Context, id string) (*types.WorkflowInstance, uint64, error) {
+	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(WorkflowKey(s.prefix, id)).Build()).AsStrMap()
+	if err != nil {
+		return nil, 0, fmt.Errorf("get workflow: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, 0, types.ErrWorkflowNotFound
+	}
+
+	var wf types.WorkflowInstance
+	if err := json.Unmarshal([]byte(result["data"]), &wf); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal workflow: %w", err)
+	}
+	return &wf, parseVersion(result["_version"]), nil
+}
+
+// UpdateWorkflow performs a CAS update on a workflow instance.
+func (s *RedisStore) UpdateWorkflow(ctx context.Context, wf *types.WorkflowInstance, expectedRev uint64) (uint64, error) {
+	key := WorkflowKey(s.prefix, wf.ID)
+	oldStatus := hashFieldFromJSON(ctx, s.rdb, key, "status")
+
+	data, err := json.Marshal(wf)
+	if err != nil {
+		return 0, fmt.Errorf("marshal workflow: %w", err)
+	}
+
+	result, err := s.scriptCASUpdate.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{
+			strconv.FormatUint(expectedRev, 10),
+			string(data),
+			strconv.FormatUint(expectedRev+1, 10),
+		},
+	).ToString()
+	if err != nil {
+		if strings.Contains(err.Error(), "CAS_CONFLICT") {
+			return 0, ErrCASConflict
+		}
+		return 0, fmt.Errorf("update workflow (CAS): %w", err)
+	}
+
+	ver, _ := strconv.ParseUint(result, 10, 64)
+
+	// Update status index (remove old, add new).
+	score := float64(wf.CreatedAt.UnixNano())
+	if oldStatus != "" && oldStatus != string(wf.Status) {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(WorkflowsByStatusKey(s.prefix, oldStatus)).Member(wf.ID).Build())
+	}
+	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(WorkflowsByStatusKey(s.prefix, string(wf.Status))).ScoreMember().ScoreMember(score, wf.ID).Build())
+	s.mirrorWorkflowPayloads(ctx, wf) // best-effort JSON mirror for JSONPath search
+	return ver, nil
+}
+
+// DeleteWorkflow removes a workflow instance and its indexes.
+func (s *RedisStore) DeleteWorkflow(ctx context.Context, id string) error {
+	oldStatus := hashFieldFromJSON(ctx, s.rdb, WorkflowKey(s.prefix, id), "status")
+
+	cmds := make(rueidis.Commands, 0, 4)
+	cmds = append(cmds, s.rdb.B().Del().Key(WorkflowKey(s.prefix, id)).Build())
+	cmds = append(cmds, s.rdb.B().Zrem().Key(WorkflowsByCreatedKey(s.prefix)).Member(id).Build())
+	if oldStatus != "" {
+		cmds = append(cmds, s.rdb.B().Zrem().Key(WorkflowsByStatusKey(s.prefix, oldStatus)).Member(id).Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+	var firstErr error
+	for _, r := range results {
+		if err := r.Error(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		s.rdb.Do(bgCtx, s.rdb.B().JsonDel().Key(WorkflowPayloadKey(s.prefix, id)).Path("$").Build())
+	}()
+	return firstErr
+}
+
+// ListWorkflows returns all workflow instances.
+func (s *RedisStore) ListWorkflows(ctx context.Context) ([]*types.WorkflowInstance, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrange().Key(WorkflowsByCreatedKey(s.prefix)).Min("0").Max("-1").Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list workflows: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateWorkflows(ctx, ids)
+}
+
+// ============================================================
+// Batch operations
+// ============================================================
+
+// SaveBatch upserts a batch instance and maintains sorted-set indexes.
+func (s *RedisStore) SaveBatch(ctx context.Context, batch *types.BatchInstance) (uint64, error) {
+	data, err := json.Marshal(batch)
+	if err != nil {
+		return 0, fmt.Errorf("marshal batch: %w", err)
+	}
+
+	key := BatchKey(s.prefix, batch.ID)
+	oldStatus := hashFieldFromJSON(ctx, s.rdb, key, "status")
+
+	cmds := make(rueidis.Commands, 0, 6)
+	cmds = append(cmds, s.rdb.B().Hset().Key(key).FieldValue().FieldValue("data", string(data)).Build())
+	incrIdx := len(cmds)
+	cmds = append(cmds, s.rdb.B().Hincrby().Key(key).Field("_version").Increment(1).Build())
+
+	score := float64(batch.CreatedAt.UnixNano())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(BatchesByCreatedKey(s.prefix)).ScoreMember().ScoreMember(score, batch.ID).Build())
+	if oldStatus != "" && oldStatus != string(batch.Status) {
+		cmds = append(cmds, s.rdb.B().Zrem().Key(BatchesByStatusKey(s.prefix, oldStatus)).Member(batch.ID).Build())
+	}
+	cmds = append(cmds, s.rdb.B().Zadd().Key(BatchesByStatusKey(s.prefix, string(batch.Status))).ScoreMember().ScoreMember(score, batch.ID).Build())
+
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return 0, fmt.Errorf("save batch: %w", err)
+		}
+	}
+	ver, _ := results[incrIdx].AsInt64()
+	s.mirrorBatchPayloads(ctx, batch) // best-effort JSON mirror for JSONPath search
+	return uint64(ver), nil
+}
+
+// GetBatch retrieves a batch instance by ID.
+func (s *RedisStore) GetBatch(ctx context.Context, batchID string) (*types.BatchInstance, uint64, error) {
+	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(BatchKey(s.prefix, batchID)).Build()).AsStrMap()
+	if err != nil {
+		return nil, 0, fmt.Errorf("get batch: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, 0, types.ErrBatchNotFound
+	}
+
+	var batch types.BatchInstance
+	if err := json.Unmarshal([]byte(result["data"]), &batch); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal batch: %w", err)
+	}
+	return &batch, parseVersion(result["_version"]), nil
+}
+
+// UpdateBatch performs a CAS update on a batch instance.
+func (s *RedisStore) UpdateBatch(ctx context.Context, batch *types.BatchInstance, expectedRev uint64) (uint64, error) {
+	key := BatchKey(s.prefix, batch.ID)
+	oldStatus := hashFieldFromJSON(ctx, s.rdb, key, "status")
+
+	data, err := json.Marshal(batch)
+	if err != nil {
+		return 0, fmt.Errorf("marshal batch: %w", err)
+	}
+
+	result, err := s.scriptCASUpdate.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{
+			strconv.FormatUint(expectedRev, 10),
+			string(data),
+			strconv.FormatUint(expectedRev+1, 10),
+		},
+	).ToString()
+	if err != nil {
+		if strings.Contains(err.Error(), "CAS_CONFLICT") {
+			return 0, ErrCASConflict
+		}
+		return 0, fmt.Errorf("update batch (CAS): %w", err)
+	}
+
+	ver, _ := strconv.ParseUint(result, 10, 64)
+
+	// Update status index (remove old, add new).
+	score := float64(batch.CreatedAt.UnixNano())
+	if oldStatus != "" && oldStatus != string(batch.Status) {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(BatchesByStatusKey(s.prefix, oldStatus)).Member(batch.ID).Build())
+	}
+	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(BatchesByStatusKey(s.prefix, string(batch.Status))).ScoreMember().ScoreMember(score, batch.ID).Build())
+	s.mirrorBatchPayloads(ctx, batch) // best-effort JSON mirror for JSONPath search
+	return ver, nil
+}
+
+// DeleteBatch removes a batch instance and its indexes.
+func (s *RedisStore) DeleteBatch(ctx context.Context, batchID string) error {
+	oldStatus := hashFieldFromJSON(ctx, s.rdb, BatchKey(s.prefix, batchID), "status")
+
+	cmds := make(rueidis.Commands, 0, 4)
+	cmds = append(cmds, s.rdb.B().Del().Key(BatchKey(s.prefix, batchID)).Build())
+	cmds = append(cmds, s.rdb.B().Zrem().Key(BatchesByCreatedKey(s.prefix)).Member(batchID).Build())
+	if oldStatus != "" {
+		cmds = append(cmds, s.rdb.B().Zrem().Key(BatchesByStatusKey(s.prefix, oldStatus)).Member(batchID).Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+	var firstErr error
+	for _, r := range results {
+		if err := r.Error(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	go func() {
+		bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		s.rdb.Do(bgCtx, s.rdb.B().JsonDel().Key(BatchPayloadKey(s.prefix, batchID)).Path("$").Build())
+	}()
+	return firstErr
+}
+
+// ListBatches returns all batch instances.
+func (s *RedisStore) ListBatches(ctx context.Context) ([]*types.BatchInstance, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrange().Key(BatchesByCreatedKey(s.prefix)).Min("0").Max("-1").Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list batches: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateBatches(ctx, ids)
+}
+
+// ============================================================
+// Batch item result operations
+// ============================================================
+
+// SaveBatchItemResult stores a single batch item result.
+func (s *RedisStore) SaveBatchItemResult(ctx context.Context, result *types.BatchItemResult) error {
+	data, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal batch item result: %w", err)
+	}
+
+	cmds := make(rueidis.Commands, 0, 2)
+	cmds = append(cmds, s.rdb.B().Hset().Key(BatchResultKey(s.prefix, result.BatchID, result.ItemID)).FieldValue().FieldValue("data", string(data)).Build())
+	cmds = append(cmds, s.rdb.B().Sadd().Key(BatchResultsSetKey(s.prefix, result.BatchID)).Member(result.ItemID).Build())
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// GetBatchItemResult retrieves a single batch item result.
+func (s *RedisStore) GetBatchItemResult(ctx context.Context, batchID, itemID string) (*types.BatchItemResult, error) {
+	dataStr, err := s.rdb.Do(ctx, s.rdb.B().Hget().Key(BatchResultKey(s.prefix, batchID, itemID)).Field("data").Build()).ToString()
+	if rueidis.IsRedisNil(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get batch item result: %w", err)
+	}
+
+	var result types.BatchItemResult
+	if err := json.Unmarshal([]byte(dataStr), &result); err != nil {
+		return nil, fmt.Errorf("unmarshal batch item result: %w", err)
+	}
+	return &result, nil
+}
+
+// ListBatchItemResults returns all item results for a batch.
+func (s *RedisStore) ListBatchItemResults(ctx context.Context, batchID string) ([]*types.BatchItemResult, error) {
+	itemIDs, err := s.rdb.Do(ctx, s.rdb.B().Smembers().Key(BatchResultsSetKey(s.prefix, batchID)).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list batch result IDs: %w", err)
+	}
+	if len(itemIDs) == 0 {
+		return nil, nil
+	}
+
+	cmds := make(rueidis.Commands, 0, len(itemIDs))
+	for _, itemID := range itemIDs {
+		cmds = append(cmds, s.rdb.B().Hget().Key(BatchResultKey(s.prefix, batchID, itemID)).Field("data").Build())
+	}
+	pipeResults := s.rdb.DoMulti(ctx, cmds...)
+
+	var results []*types.BatchItemResult
+	for _, r := range pipeResults {
+		dataStr, err := r.ToString()
+		if err != nil {
+			continue
+		}
+		var result types.BatchItemResult
+		if json.Unmarshal([]byte(dataStr), &result) == nil {
+			results = append(results, &result)
+		}
+	}
+	return results, nil
+}
+
+// ============================================================
+// DLQ operations
+// ============================================================
+
+// ListDLQ reads recent messages from the DLQ stream.
+func (s *RedisStore) ListDLQ(ctx context.Context, limit int) ([]*types.WorkMessage, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	msgs, err := s.rdb.Do(ctx, s.rdb.B().Xrevrange().Key(DLQStreamKey(s.prefix)).End("+").Start("-").Count(int64(limit)).Build()).AsXRange()
+	if err != nil {
+		return nil, fmt.Errorf("list DLQ: %w", err)
+	}
+
+	var result []*types.WorkMessage
+	for _, msg := range msgs {
+		wm := WorkMessageFromStreamValues(msg.FieldValues)
+		result = append(result, &wm)
+	}
+	return result, nil
+}
+
+// ============================================================
+// History: Job Runs
+// ============================================================
+
+// SaveJobRun persists a job run to the history indexes.
+func (s *RedisStore) SaveJobRun(ctx context.Context, run *types.JobRun) error {
+	data, err := json.Marshal(run)
+	if err != nil {
+		return fmt.Errorf("marshal job run: %w", err)
+	}
+
+	score := float64(run.StartedAt.UnixNano())
+	cmds := make(rueidis.Commands, 0, 4)
+	cmds = append(cmds, s.rdb.B().Hset().Key(HistoryRunKey(s.prefix, run.ID)).FieldValue().FieldValue("data", string(data)).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsKey(s.prefix)).ScoreMember().ScoreMember(score, run.ID).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByJobKey(s.prefix, run.JobID)).ScoreMember().ScoreMember(score, run.ID).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByStatusKey(s.prefix, string(run.Status))).ScoreMember().ScoreMember(score, run.ID).Build())
+
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ============================================================
+// History: Job Events
+// ============================================================
+
+// SaveJobEvent persists a job event to the history indexes.
+func (s *RedisStore) SaveJobEvent(ctx context.Context, event *types.JobEvent) error {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal job event: %w", err)
+	}
+
+	eventID := fmt.Sprintf("%s_%s_%d", event.JobID, string(event.Type), event.Timestamp.UnixNano())
+	score := float64(event.Timestamp.UnixNano())
+
+	cmds := make(rueidis.Commands, 0, 4)
+	cmds = append(cmds, s.rdb.B().Hset().Key(HistoryEventKey(s.prefix, eventID)).FieldValue().FieldValue("data", string(data)).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryEventsKey(s.prefix)).ScoreMember().ScoreMember(score, eventID).Build())
+	if event.JobID != "" {
+		cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryEventsByJobKey(s.prefix, event.JobID)).ScoreMember().ScoreMember(score, eventID).Build())
+	}
+	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryEventsByTypeKey(s.prefix, string(event.Type))).ScoreMember().ScoreMember(score, eventID).Build())
+
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ============================================================
+// Cleanup
+// ============================================================
+
+// Cleanup removes history entries older than the given time.
+func (s *RedisStore) Cleanup(ctx context.Context, olderThan time.Time) (int64, error) {
+	cutoff := strconv.FormatFloat(float64(olderThan.UnixNano()), 'f', 0, 64)
+	var cleaned int64
+
+	// Clean old history runs.
+	runIDs, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(HistoryRunsKey(s.prefix)).Min("-inf").Max(cutoff).Build()).AsStrSlice()
+	if err != nil {
+		return 0, err
+	}
+	if len(runIDs) > 0 {
+		// Read run data to extract JobID/Status for secondary index cleanup.
+		readCmds := make(rueidis.Commands, 0, len(runIDs))
+		for _, id := range runIDs {
+			readCmds = append(readCmds, s.rdb.B().Hget().Key(HistoryRunKey(s.prefix, id)).Field("data").Build())
+		}
+		readResults := s.rdb.DoMulti(ctx, readCmds...)
+
+		for i, id := range runIDs {
+			cmds := make(rueidis.Commands, 0, 5)
+			cmds = append(cmds, s.rdb.B().Del().Key(HistoryRunKey(s.prefix, id)).Build())
+			cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryRunsKey(s.prefix)).Member(id).Build())
+
+			// Clean secondary indexes if we can read the run data.
+			if dataStr, err := readResults[i].ToString(); err == nil {
+				var run types.JobRun
+				if json.Unmarshal([]byte(dataStr), &run) == nil {
+					if run.JobID != "" {
+						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryRunsByJobKey(s.prefix, run.JobID)).Member(id).Build())
+					}
+					if run.Status != "" {
+						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryRunsByStatusKey(s.prefix, string(run.Status))).Member(id).Build())
+					}
+				}
+			}
+
+			s.rdb.DoMulti(ctx, cmds...)
+			cleaned++
+		}
+	}
+
+	// Clean old history events.
+	eventIDs, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(HistoryEventsKey(s.prefix)).Min("-inf").Max(cutoff).Build()).AsStrSlice()
+	if err != nil {
+		return cleaned, err
+	}
+	if len(eventIDs) > 0 {
+		// Read event data to extract JobID/Type for secondary index cleanup.
+		readCmds := make(rueidis.Commands, 0, len(eventIDs))
+		for _, id := range eventIDs {
+			readCmds = append(readCmds, s.rdb.B().Hget().Key(HistoryEventKey(s.prefix, id)).Field("data").Build())
+		}
+		readResults := s.rdb.DoMulti(ctx, readCmds...)
+
+		for i, id := range eventIDs {
+			cmds := make(rueidis.Commands, 0, 5)
+			cmds = append(cmds, s.rdb.B().Del().Key(HistoryEventKey(s.prefix, id)).Build())
+			cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryEventsKey(s.prefix)).Member(id).Build())
+
+			// Clean secondary indexes if we can read the event data.
+			if dataStr, err := readResults[i].ToString(); err == nil {
+				var event types.JobEvent
+				if json.Unmarshal([]byte(dataStr), &event) == nil {
+					if event.JobID != "" {
+						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryEventsByJobKey(s.prefix, event.JobID)).Member(id).Build())
+					}
+					if event.Type != "" {
+						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryEventsByTypeKey(s.prefix, string(event.Type))).Member(id).Build())
+					}
+				}
+			}
+
+			s.rdb.DoMulti(ctx, cmds...)
+			cleaned++
+		}
+	}
+
+	return cleaned, nil
+}
+
+// ============================================================
+// Hydration helpers — DoMulti HGET for bulk reads
+// ============================================================
+
+func (s *RedisStore) hydrateJobs(ctx context.Context, ids []string) ([]*types.Job, error) {
+	cmds := make(rueidis.Commands, 0, len(ids))
+	for _, id := range ids {
+		cmds = append(cmds, s.rdb.B().Hget().Key(JobKey(s.prefix, id)).Field("data").Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+
+	jobs := make([]*types.Job, 0, len(ids))
+	for _, r := range results {
+		dataStr, err := r.ToString()
+		if err != nil {
+			continue
+		}
+		var job types.Job
+		if json.Unmarshal([]byte(dataStr), &job) == nil {
+			jobs = append(jobs, &job)
+		}
+	}
+	return jobs, nil
+}
+
+func (s *RedisStore) hydrateSchedules(ctx context.Context, ids []string) ([]*types.ScheduleEntry, error) {
+	cmds := make(rueidis.Commands, 0, len(ids))
+	for _, id := range ids {
+		cmds = append(cmds, s.rdb.B().Hget().Key(ScheduleKey(s.prefix, id)).Field("data").Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+
+	var scheds []*types.ScheduleEntry
+	for _, r := range results {
+		dataStr, err := r.ToString()
+		if err != nil {
+			continue
+		}
+		var sched types.ScheduleEntry
+		if json.Unmarshal([]byte(dataStr), &sched) == nil {
+			scheds = append(scheds, &sched)
+		}
+	}
+	return scheds, nil
+}
+
+func (s *RedisStore) hydrateRuns(ctx context.Context, ids []string) ([]*types.JobRun, error) {
+	cmds := make(rueidis.Commands, 0, len(ids))
+	for _, id := range ids {
+		cmds = append(cmds, s.rdb.B().Hget().Key(RunKey(s.prefix, id)).Field("data").Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+
+	var runs []*types.JobRun
+	for _, r := range results {
+		dataStr, err := r.ToString()
+		if err != nil {
+			continue
+		}
+		var run types.JobRun
+		if json.Unmarshal([]byte(dataStr), &run) == nil {
+			runs = append(runs, &run)
+		}
+	}
+	return runs, nil
+}
+
+func (s *RedisStore) hydrateWorkflows(ctx context.Context, ids []string) ([]*types.WorkflowInstance, error) {
+	cmds := make(rueidis.Commands, 0, len(ids))
+	for _, id := range ids {
+		cmds = append(cmds, s.rdb.B().Hget().Key(WorkflowKey(s.prefix, id)).Field("data").Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+
+	var wfs []*types.WorkflowInstance
+	for _, r := range results {
+		dataStr, err := r.ToString()
+		if err != nil {
+			continue
+		}
+		var wf types.WorkflowInstance
+		if json.Unmarshal([]byte(dataStr), &wf) == nil {
+			wfs = append(wfs, &wf)
+		}
+	}
+	return wfs, nil
+}
+
+func (s *RedisStore) hydrateBatches(ctx context.Context, ids []string) ([]*types.BatchInstance, error) {
+	cmds := make(rueidis.Commands, 0, len(ids))
+	for _, id := range ids {
+		cmds = append(cmds, s.rdb.B().Hget().Key(BatchKey(s.prefix, id)).Field("data").Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+
+	var batches []*types.BatchInstance
+	for _, r := range results {
+		dataStr, err := r.ToString()
+		if err != nil {
+			continue
+		}
+		var batch types.BatchInstance
+		if json.Unmarshal([]byte(dataStr), &batch) == nil {
+			batches = append(batches, &batch)
+		}
+	}
+	return batches, nil
+}
+
+// ============================================================
+// Internal helpers
+// ============================================================
+
+func (s *RedisStore) updateJobAssociationIndexes(ctx context.Context, job *types.Job) {
+	score := float64(job.CreatedAt.UnixNano())
+	if job.WorkflowID != nil && *job.WorkflowID != "" {
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByWorkflowKey(s.prefix, *job.WorkflowID)).ScoreMember().ScoreMember(score, job.ID).Build())
+	}
+	if job.BatchID != nil && *job.BatchID != "" {
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByBatchKey(s.prefix, *job.BatchID)).ScoreMember().ScoreMember(score, job.ID).Build())
+	}
+}
+
+// addJobIndexes adds all secondary indexes for a newly created job.
+func (s *RedisStore) addJobIndexes(ctx context.Context, job *types.Job) {
+	score := float64(job.CreatedAt.UnixNano())
+	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByCreatedKey(s.prefix)).ScoreMember().ScoreMember(score, job.ID).Build())
+	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
+	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
+	for _, tag := range job.Tags {
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, tag)).ScoreMember().ScoreMember(score, job.ID).Build())
+	}
+}
+
+// updateJobIndexes diffs old and new job data and updates secondary indexes accordingly.
+func (s *RedisStore) updateJobIndexes(ctx context.Context, job *types.Job, oldDataStr string) {
+	score := float64(job.CreatedAt.UnixNano())
+
+	// Always ensure by_created is current.
+	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByCreatedKey(s.prefix)).ScoreMember().ScoreMember(score, job.ID).Build())
+
+	if oldDataStr == "" {
+		// No previous data — add all indexes as new.
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
+		for _, tag := range job.Tags {
+			s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, tag)).ScoreMember().ScoreMember(score, job.ID).Build())
+		}
+		return
+	}
+
+	var old types.Job
+	if json.Unmarshal([]byte(oldDataStr), &old) != nil {
+		// Can't parse old data — just add new indexes.
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
+		for _, tag := range job.Tags {
+			s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, tag)).ScoreMember().ScoreMember(score, job.ID).Build())
+		}
+		return
+	}
+
+	// Status index diff.
+	if old.Status != job.Status {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByStatusKey(s.prefix, string(old.Status))).Member(job.ID).Build())
+	}
+	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
+
+	// TaskType index diff.
+	if old.TaskType != job.TaskType {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByTaskTypeKey(s.prefix, string(old.TaskType))).Member(job.ID).Build())
+	}
+	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
+
+	// Tags index diff.
+	oldTags := make(map[string]bool, len(old.Tags))
+	for _, t := range old.Tags {
+		oldTags[t] = true
+	}
+	newTags := make(map[string]bool, len(job.Tags))
+	for _, t := range job.Tags {
+		newTags[t] = true
+	}
+	for t := range oldTags {
+		if !newTags[t] {
+			s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByTagKey(s.prefix, t)).Member(job.ID).Build())
+		}
+	}
+	for _, t := range job.Tags {
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, t)).ScoreMember().ScoreMember(score, job.ID).Build())
+	}
+
+	// Clean old unique key if changed.
+	if old.UniqueKey != nil && *old.UniqueKey != "" {
+		if job.UniqueKey == nil || *job.UniqueKey != *old.UniqueKey {
+			s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, *old.UniqueKey)).Build())
+		}
+	}
+}
+
+// removeJobIndexes removes all secondary indexes for a deleted job.
+func (s *RedisStore) removeJobIndexes(ctx context.Context, jobID string, old *types.Job) {
+	s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByCreatedKey(s.prefix)).Member(jobID).Build())
+	s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByStatusKey(s.prefix, string(old.Status))).Member(jobID).Build())
+	s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByTaskTypeKey(s.prefix, string(old.TaskType))).Member(jobID).Build())
+	for _, tag := range old.Tags {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByTagKey(s.prefix, tag)).Member(jobID).Build())
+	}
+	if old.UniqueKey != nil && *old.UniqueKey != "" {
+		s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, *old.UniqueKey)).Build())
+	}
+	if old.WorkflowID != nil && *old.WorkflowID != "" {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByWorkflowKey(s.prefix, *old.WorkflowID)).Member(jobID).Build())
+	}
+	if old.BatchID != nil && *old.BatchID != "" {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByBatchKey(s.prefix, *old.BatchID)).Member(jobID).Build())
+	}
+}
+
+// parseSaveJobResult splits the "old_data\nnew_version" response from single-key Lua scripts.
+func parseSaveJobResult(result string) (string, uint64) {
+	idx := strings.LastIndex(result, "\n")
+	if idx < 0 {
+		ver, _ := strconv.ParseUint(result, 10, 64)
+		return "", ver
+	}
+	oldData := result[:idx]
+	ver, _ := strconv.ParseUint(result[idx+1:], 10, 64)
+	return oldData, ver
+}
+
+// hashFieldFromJSON reads a hash's "data" field, parses JSON, and extracts a named field value.
+func hashFieldFromJSON(ctx context.Context, rdb rueidis.Client, key, field string) string {
+	dataStr, err := rdb.Do(ctx, rdb.B().Hget().Key(key).Field("data").Build()).ToString()
+	if err != nil {
+		return ""
+	}
+	var m map[string]interface{}
+	if json.Unmarshal([]byte(dataStr), &m) != nil {
+		return ""
+	}
+	if v, ok := m[field]; ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// parseVersion extracts a uint64 version from a string, defaulting to 1.
+func parseVersion(s string) uint64 {
+	if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return v
+	}
+	return 1
+}
+
+// WorkMessageFromStreamValues constructs a WorkMessage from Redis stream field map.
+func WorkMessageFromStreamValues(values map[string]string) types.WorkMessage {
+	wm := types.WorkMessage{
+		RunID:    values["run_id"],
+		JobID:    values["job_id"],
+		TaskType: types.TaskType(values["task_type"]),
+	}
+
+	// Handle payload carefully: empty string -> nil (not json.RawMessage("") which is invalid JSON).
+	if p := values["payload"]; p != "" {
+		wm.Payload = json.RawMessage(p)
+	}
+
+	if v := values["attempt"]; v != "" {
+		n, _ := strconv.Atoi(v)
+		wm.Attempt = n
+	}
+	if v := values["deadline"]; v != "" {
+		t, _ := time.Parse(time.RFC3339Nano, v)
+		wm.Deadline = t
+	}
+	if v := values["priority"]; v != "" {
+		n, _ := strconv.Atoi(v)
+		wm.Priority = types.Priority(n)
+	}
+	if v := values["dispatched_at"]; v != "" {
+		t, _ := time.Parse(time.RFC3339Nano, v)
+		wm.DispatchedAt = t
+	}
+	// Parse headers (JSON-encoded map).
+	if h := values["headers"]; h != "" {
+		var headers map[string]string
+		if json.Unmarshal([]byte(h), &headers) == nil {
+			wm.Headers = headers
+		}
+	}
+	// Capture error field (present in DLQ entries).
+	if e := values["error"]; e != "" {
+		wm.Metadata = map[string]string{"error": e}
+	}
+	return wm
+}
+
+// ============================================================
+// RedisJSON payload mirrors — best-effort writes for JSONPath search
+// ============================================================
+
+// mirrorJobPayload stores the job's Payload as a RedisJSON document for JSONPath queries.
+// Uses a detached context so it never steals deadline budget from the caller.
+func (s *RedisStore) mirrorJobPayload(_ context.Context, job *types.Job) {
+	bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	payload := job.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage("{}")
+	}
+	s.rdb.Do(bgCtx, s.rdb.B().JsonSet().Key(JobPayloadKey(s.prefix, job.ID)).Path("$").Value(string(payload)).Build())
+}
+
+// mirrorWorkflowPayloads stores all task payloads from a workflow definition as a JSON array.
+// Uses a detached context so it never steals deadline budget from the caller.
+func (s *RedisStore) mirrorWorkflowPayloads(_ context.Context, wf *types.WorkflowInstance) {
+	bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	payloads := make([]json.RawMessage, 0, len(wf.Definition.Tasks))
+	for _, t := range wf.Definition.Tasks {
+		p := t.Payload
+		if len(p) == 0 {
+			p = json.RawMessage("{}")
+		}
+		payloads = append(payloads, p)
+	}
+	data, _ := json.Marshal(payloads)
+	s.rdb.Do(bgCtx, s.rdb.B().JsonSet().Key(WorkflowPayloadKey(s.prefix, wf.ID)).Path("$").Value(string(data)).Build())
+}
+
+// mirrorBatchPayloads stores onetime + item payloads from a batch definition as a JSON document.
+// Uses a detached context so it never steals deadline budget from the caller.
+func (s *RedisStore) mirrorBatchPayloads(_ context.Context, batch *types.BatchInstance) {
+	bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	type batchPayloads struct {
+		Onetime json.RawMessage   `json:"onetime"`
+		Items   []json.RawMessage `json:"items"`
+	}
+	bp := batchPayloads{Onetime: batch.Definition.OnetimePayload}
+	if len(bp.Onetime) == 0 {
+		bp.Onetime = json.RawMessage("null")
+	}
+	for _, item := range batch.Definition.Items {
+		p := item.Payload
+		if len(p) == 0 {
+			p = json.RawMessage("{}")
+		}
+		bp.Items = append(bp.Items, p)
+	}
+	data, _ := json.Marshal(bp)
+	s.rdb.Do(bgCtx, s.rdb.B().JsonSet().Key(BatchPayloadKey(s.prefix, batch.ID)).Path("$").Value(string(data)).Build())
+}
+
+// ============================================================
+// JSONPath search — scan entities and match payload fields via RedisJSON
+// ============================================================
+
+const jsonPathSearchChunkSize = 100
+
+// FindJobByPayloadPath scans all jobs and returns the first whose Payload matches
+// the given JSONPath + value. Uses RedisJSON's JSON.GET for native path extraction.
+func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, value any) (*types.Job, uint64, error) {
+	fullPath := "$." + jsonPath
+	valueStr := fmt.Sprintf("%v", value)
+
+	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return nil, 0, fmt.Errorf("count jobs: %w", err)
+	}
+
+	for offset := int64(0); offset < total; offset += jsonPathSearchChunkSize {
+		end := offset + jsonPathSearchChunkSize - 1
+		ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(JobsByCreatedKey(s.prefix)).Start(offset).Stop(end).Build()).AsStrSlice()
+		if err != nil || len(ids) == 0 {
+			break
+		}
+
+		// Pipeline JSON.GET for each key.
+		cmds := make(rueidis.Commands, 0, len(ids))
+		for _, id := range ids {
+			cmds = append(cmds, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, id)).Path(fullPath).Build())
+		}
+		results := s.rdb.DoMulti(ctx, cmds...)
+
+		for i, r := range results {
+			if matchJSONGetResult(r, valueStr) {
+				return s.GetJob(ctx, ids[i])
+			}
+		}
+	}
+	return nil, 0, types.ErrJobNotFound
+}
+
+// FindWorkflowByTaskPayloadPath scans all workflows and returns the first where any task's
+// Payload matches the given JSONPath + value.
+func (s *RedisStore) FindWorkflowByTaskPayloadPath(ctx context.Context, jsonPath string, value any) (*types.WorkflowInstance, uint64, error) {
+	// JSON array stored as [task0_payload, task1_payload, ...].
+	// Query all task payloads: $[*].{path}
+	fullPath := "$[*]." + jsonPath
+	valueStr := fmt.Sprintf("%v", value)
+
+	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(WorkflowsByCreatedKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return nil, 0, fmt.Errorf("count workflows: %w", err)
+	}
+
+	for offset := int64(0); offset < total; offset += jsonPathSearchChunkSize {
+		end := offset + jsonPathSearchChunkSize - 1
+		ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(WorkflowsByCreatedKey(s.prefix)).Start(offset).Stop(end).Build()).AsStrSlice()
+		if err != nil || len(ids) == 0 {
+			break
+		}
+
+		cmds := make(rueidis.Commands, 0, len(ids))
+		for _, id := range ids {
+			cmds = append(cmds, s.rdb.B().JsonGet().Key(WorkflowPayloadKey(s.prefix, id)).Path(fullPath).Build())
+		}
+		results := s.rdb.DoMulti(ctx, cmds...)
+
+		for i, r := range results {
+			if matchJSONGetResult(r, valueStr) {
+				return s.GetWorkflow(ctx, ids[i])
+			}
+		}
+	}
+	return nil, 0, types.ErrWorkflowNotFound
+}
+
+// FindBatchByPayloadPath scans all batches and returns the first where onetime or any item
+// Payload matches the given JSONPath + value.
+func (s *RedisStore) FindBatchByPayloadPath(ctx context.Context, jsonPath string, value any) (*types.BatchInstance, uint64, error) {
+	valueStr := fmt.Sprintf("%v", value)
+
+	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(BatchesByCreatedKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return nil, 0, fmt.Errorf("count batches: %w", err)
+	}
+
+	for offset := int64(0); offset < total; offset += jsonPathSearchChunkSize {
+		end := offset + jsonPathSearchChunkSize - 1
+		ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(BatchesByCreatedKey(s.prefix)).Start(offset).Stop(end).Build()).AsStrSlice()
+		if err != nil || len(ids) == 0 {
+			break
+		}
+
+		// Check onetime payload: $.onetime.{path} and items: $.items[*].{path}
+		cmds := make(rueidis.Commands, 0, len(ids)*2)
+		for _, id := range ids {
+			key := BatchPayloadKey(s.prefix, id)
+			cmds = append(cmds, s.rdb.B().JsonGet().Key(key).Path("$.onetime."+jsonPath).Build())
+			cmds = append(cmds, s.rdb.B().JsonGet().Key(key).Path("$.items[*]."+jsonPath).Build())
+		}
+		results := s.rdb.DoMulti(ctx, cmds...)
+
+		for i := range ids {
+			onetimeResult := results[i*2]
+			itemsResult := results[i*2+1]
+			if matchJSONGetResult(onetimeResult, valueStr) || matchJSONGetResult(itemsResult, valueStr) {
+				return s.GetBatch(ctx, ids[i])
+			}
+		}
+	}
+	return nil, 0, types.ErrBatchNotFound
+}
+
+// matchJSONGetResult checks if a JSON.GET result array contains the expected value.
+// JSON.GET returns a JSON array like ["value"] or [42] for scalar matches.
+func matchJSONGetResult(r rueidis.RedisResult, expected string) bool {
+	raw, err := r.ToString()
+	if err != nil || raw == "" || raw == "[]" {
+		return false
+	}
+
+	// Parse the JSON array of results.
+	var results []any
+	if json.Unmarshal([]byte(raw), &results) != nil {
+		return false
+	}
+	for _, v := range results {
+		if fmt.Sprintf("%v", v) == expected {
+			return true
+		}
+	}
+	return false
+}

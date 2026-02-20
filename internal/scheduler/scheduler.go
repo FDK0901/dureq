@@ -1,0 +1,475 @@
+package scheduler
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/FDK0901/dureq/internal/cache"
+	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/pkg/types"
+	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
+)
+
+// Dispatcher is the interface the scheduler uses to dispatch work.
+type Dispatcher interface {
+	Dispatch(ctx context.Context, job *types.Job, attempt int) error
+	PublishEvent(event types.JobEvent)
+}
+
+// Config holds scheduler configuration.
+type Config struct {
+	Store        *store.RedisStore
+	Dispatcher   Dispatcher
+	TickInterval time.Duration
+	Logger       gochainedlog.Logger
+
+	// OrphanCheckInterval controls how often orphan run detection runs.
+	// Defaults to 30s. Set to 0 to disable.
+	OrphanCheckInterval time.Duration
+}
+
+// Scheduler runs on the leader node and periodically checks for due jobs.
+type Scheduler struct {
+	store      *store.RedisStore
+	cache      *cache.ScheduleCache
+	dispatcher Dispatcher
+	interval   time.Duration
+	logger     gochainedlog.Logger
+
+	orphanInterval  time.Duration
+	lastOrphanCheck time.Time
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
+	active bool
+}
+
+// New creates a new scheduler. Call Start() to begin the tick loop.
+func New(cfg Config) *Scheduler {
+	if cfg.TickInterval == 0 {
+		cfg.TickInterval = 1 * time.Second
+	}
+	if cfg.OrphanCheckInterval == 0 {
+		cfg.OrphanCheckInterval = 30 * time.Second
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = chainedslog.NewSlog(chainedslog.NewSlogBase())
+	}
+	return &Scheduler{
+		store:          cfg.Store,
+		cache:          cache.NewScheduleCache(cfg.Store, cache.DefaultCacheConfig()),
+		dispatcher:     cfg.Dispatcher,
+		interval:       cfg.TickInterval,
+		orphanInterval: cfg.OrphanCheckInterval,
+		logger:         cfg.Logger,
+	}
+}
+
+// Start begins the scheduler tick loop. Safe to call multiple times (idempotent).
+func (s *Scheduler) Start(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.active {
+		return
+	}
+
+	tickCtx, cancel := context.WithCancel(ctx)
+	s.cancel = cancel
+	s.done = make(chan struct{})
+	s.active = true
+
+	go s.tickLoop(tickCtx)
+	s.logger.Info().Duration("interval", s.interval).Msg("scheduler started")
+}
+
+// Stop halts the scheduler tick loop. Safe to call multiple times.
+func (s *Scheduler) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.active {
+		return
+	}
+
+	s.cancel()
+	<-s.done
+	s.active = false
+	s.logger.Info().Msg("scheduler stopped")
+}
+
+func (s *Scheduler) tickLoop(ctx context.Context) {
+	defer close(s.done)
+
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
+
+	// Run one tick immediately on start.
+	s.tick(ctx)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.tick(ctx)
+		}
+	}
+}
+
+// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs.
+func (s *Scheduler) tick(ctx context.Context) {
+	now := time.Now()
+
+	dueSchedules, err := s.cache.ListDueSchedules(ctx, now)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("scheduler: failed to list due schedules")
+		return
+	}
+
+	for _, entry := range dueSchedules {
+		s.processScheduleEntry(ctx, entry, now)
+	}
+
+	// Orphan detection runs less frequently than the main tick.
+	if s.orphanInterval > 0 && now.Sub(s.lastOrphanCheck) >= s.orphanInterval {
+		s.lastOrphanCheck = now
+		s.checkOrphanedRuns(ctx)
+	}
+}
+
+func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.ScheduleEntry, now time.Time) {
+	// Check if the schedule has expired.
+	if IsExpired(entry.Schedule, now) {
+		s.expireSchedule(ctx, entry)
+		return
+	}
+
+	// Load the job (via cache).
+	job, rev, err := s.cache.GetJob(ctx, entry.JobID)
+	if err != nil {
+		s.logger.Error().String("job_id", entry.JobID).Err(err).Msg("scheduler: failed to get job")
+		if err == types.ErrJobNotFound {
+			s.store.DeleteSchedule(ctx, entry.JobID)
+			s.cache.InvalidateSchedules()
+		}
+		return
+	}
+
+	// Skip if job is in a terminal state.
+	if job.Status.IsTerminal() {
+		s.store.DeleteSchedule(ctx, entry.JobID)
+		s.cache.InvalidateSchedules()
+		return
+	}
+
+	// --- Overlap policy check ---
+	policy := entry.Schedule.OverlapPolicy
+	if policy == "" {
+		policy = types.OverlapAllowAll
+	}
+	if policy != types.OverlapAllowAll {
+		hasActive, err := s.store.HasActiveRunForJob(ctx, entry.JobID)
+		if err != nil {
+			s.logger.Warn().String("job_id", entry.JobID).Err(err).Msg("scheduler: overlap check failed")
+		} else if hasActive {
+			switch policy {
+			case types.OverlapSkip:
+				s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: skipping overlapping dispatch")
+				s.advanceSchedule(ctx, entry, now)
+				return
+			case types.OverlapBufferOne:
+				s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: buffering overlapping dispatch (one)")
+				s.store.SaveOverlapBuffer(ctx, entry.JobID, now)
+				s.advanceSchedule(ctx, entry, now)
+				return
+			case types.OverlapBufferAll:
+				s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: buffering overlapping dispatch (all)")
+				s.store.PushOverlapBufferAll(ctx, entry.JobID, now)
+				s.advanceSchedule(ctx, entry, now)
+				return
+			}
+		}
+	}
+
+	// --- Backfill missed firings ---
+	maxBackfill := 10
+	if entry.Schedule.MaxBackfillPerTick != nil {
+		maxBackfill = *entry.Schedule.MaxBackfillPerTick
+	}
+
+	refTime := entry.NextRunAt
+	if entry.LastProcessedAt != nil {
+		refTime = *entry.LastProcessedAt
+	}
+
+	missedFirings, _ := MissedFirings(entry.Schedule, refTime, now, maxBackfill)
+
+	if len(missedFirings) > 1 {
+		s.logger.Info().String("job_id", entry.JobID).Int("missed_count", len(missedFirings)).Msg("scheduler: backfilling missed firings")
+		for _, firingTime := range missedFirings {
+			s.dispatchFiring(ctx, job, rev, entry, firingTime)
+		}
+		lastFiring := missedFirings[len(missedFirings)-1]
+		entry.LastProcessedAt = &lastFiring
+	} else {
+		// Normal single dispatch.
+		s.dispatchFiring(ctx, job, rev, entry, now)
+		entry.LastProcessedAt = &now
+	}
+
+	s.cache.InvalidateJob(job.ID)
+	s.advanceSchedule(ctx, entry, now)
+}
+
+// dispatchFiring dispatches a single firing of a scheduled job.
+func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time) {
+	job.Status = types.JobStatusPending
+	job.LastRunAt = &firingTime
+	job.UpdatedAt = time.Now()
+
+	if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+		s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: CAS update failed")
+		return
+	}
+
+	// Add backfill headers if firing time differs from now.
+	if !firingTime.Equal(time.Now().Truncate(time.Second)) && entry.Schedule.CatchupWindow != nil {
+		if job.Headers == nil {
+			job.Headers = make(map[string]string)
+		}
+		job.Headers["x-dureq-backfill"] = "true"
+		job.Headers["x-dureq-scheduled-at"] = firingTime.Format(time.RFC3339Nano)
+	}
+
+	if err := s.dispatcher.Dispatch(ctx, job, job.Attempt); err != nil {
+		s.logger.Error().String("job_id", job.ID).Err(err).Msg("scheduler: dispatch failed")
+		return
+	}
+
+	s.dispatcher.PublishEvent(types.JobEvent{
+		Type:      types.EventJobDispatched,
+		JobID:     job.ID,
+		TaskType:  job.TaskType,
+		Timestamp: firingTime,
+	})
+}
+
+// advanceSchedule calculates and saves the next run time for a schedule.
+func (s *Scheduler) advanceSchedule(ctx context.Context, entry *types.ScheduleEntry, now time.Time) {
+	nextRun, err := NextRunTime(entry.Schedule, now)
+	if err != nil || nextRun.IsZero() {
+		s.store.DeleteSchedule(ctx, entry.JobID)
+		s.cache.InvalidateSchedules()
+		s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: schedule exhausted")
+		return
+	}
+
+	if entry.Schedule.EndsAt != nil && nextRun.After(*entry.Schedule.EndsAt) {
+		s.store.DeleteSchedule(ctx, entry.JobID)
+		s.cache.InvalidateSchedules()
+		s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: schedule will expire before next run")
+		return
+	}
+
+	entry.NextRunAt = nextRun
+	if _, err := s.store.SaveSchedule(ctx, entry); err != nil {
+		s.logger.Error().String("job_id", entry.JobID).Err(err).Msg("scheduler: failed to update schedule")
+	}
+	s.cache.InvalidateSchedules()
+}
+
+// checkOrphanedRuns detects runs whose owning node has disappeared (no heartbeat)
+// or whose heartbeat has gone stale (>30s without update), and marks them as failed.
+// For standalone jobs, it also auto-redispatches if the retry policy permits.
+func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
+	runs, err := s.store.ListRuns(ctx)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("scheduler: failed to list runs for orphan check")
+		return
+	}
+
+	// Build set of live node IDs and their active run sets.
+	nodes, err := s.store.ListNodes(ctx)
+	if err != nil {
+		s.logger.Error().Err(err).Msg("scheduler: failed to list nodes for orphan check")
+		return
+	}
+	liveNodes := make(map[string]*types.NodeInfo, len(nodes))
+	activeRunSet := make(map[string]struct{})
+	for _, n := range nodes {
+		liveNodes[n.NodeID] = n
+		for _, rid := range n.ActiveRunIDs {
+			activeRunSet[rid] = struct{}{}
+		}
+	}
+
+	now := time.Now()
+	const defaultHeartbeatStaleThreshold = 30 * time.Second
+
+	// Pre-fetch per-job heartbeat timeouts to avoid N×GetJob calls.
+	jobTimeouts := make(map[string]time.Duration)
+
+	for _, run := range runs {
+		// Only check non-terminal runs.
+		if run.Status.IsTerminal() {
+			continue
+		}
+
+		// Determine heartbeat timeout for this run's job.
+		staleAge, seen := jobTimeouts[run.JobID]
+		if !seen {
+			staleAge = defaultHeartbeatStaleThreshold
+			if job, _, err := s.cache.GetJob(ctx, run.JobID); err == nil && job.HeartbeatTimeout != nil {
+				staleAge = job.HeartbeatTimeout.Std()
+			}
+			jobTimeouts[run.JobID] = staleAge
+		}
+
+		nodeInfo, alive := liveNodes[run.NodeID]
+		isOrphaned := !alive
+
+		// Check heartbeat staleness: node is alive but run's heartbeat is stale.
+		if alive && run.LastHeartbeatAt != nil {
+			if now.Sub(*run.LastHeartbeatAt) > staleAge {
+				// Also verify the node doesn't report this run as active.
+				if _, active := activeRunSet[run.ID]; !active {
+					isOrphaned = true
+				}
+			}
+		}
+
+		// If node is alive but hasn't been alive long enough (fresh restart), check active runs.
+		if alive && run.LastHeartbeatAt == nil && nodeInfo != nil {
+			if _, active := activeRunSet[run.ID]; !active {
+				// Run started before the node's last restart, treat as orphaned.
+				if run.StartedAt.Before(nodeInfo.StartedAt) {
+					isOrphaned = true
+				}
+			}
+		}
+
+		if !isOrphaned {
+			continue
+		}
+
+		// This run is orphaned.
+		errMsg := "node " + run.NodeID + " crashed or became unresponsive"
+		s.logger.Warn().String("run_id", run.ID).String("job_id", run.JobID).String("node_id", run.NodeID).Msg("scheduler: detected orphaned run")
+
+		run.Status = types.RunStatusFailed
+		run.Error = &errMsg
+		run.FinishedAt = &now
+		run.Duration = now.Sub(run.StartedAt)
+		s.store.SaveRun(ctx, run)
+
+		// Load the parent job.
+		job, rev, err := s.store.GetJob(ctx, run.JobID)
+		if err != nil {
+			s.store.DeleteRun(ctx, run.ID)
+			continue
+		}
+
+		// Publish crash detection event.
+		s.dispatcher.PublishEvent(types.JobEvent{
+			Type:           types.EventNodeCrashDetected,
+			JobID:          run.JobID,
+			RunID:          run.ID,
+			NodeID:         run.NodeID,
+			Error:          &errMsg,
+			Timestamp:      now,
+			AffectedRunIDs: []string{run.ID},
+		})
+
+		if job.WorkflowID != nil || job.BatchID != nil {
+			// Workflow/batch job: publish failure event so the orchestrator handles retry.
+			if job.Status == types.JobStatusRunning {
+				job.Status = types.JobStatusFailed
+				job.LastError = &errMsg
+				job.UpdatedAt = now
+				s.store.UpdateJob(ctx, job, rev)
+			}
+
+			s.dispatcher.PublishEvent(types.JobEvent{
+				Type:      types.EventJobFailed,
+				JobID:     run.JobID,
+				RunID:     run.ID,
+				NodeID:    run.NodeID,
+				Error:     &errMsg,
+				Timestamp: now,
+			})
+		} else {
+			// Standalone job: check retry policy and auto-redispatch.
+			retryPolicy := job.RetryPolicy
+			if retryPolicy == nil {
+				retryPolicy = types.DefaultRetryPolicy()
+			}
+
+			if job.Attempt < retryPolicy.MaxAttempts {
+				// Auto-recover: redispatch.
+				job.Status = types.JobStatusPending
+				job.LastError = &errMsg
+				job.UpdatedAt = now
+				s.store.UpdateJob(ctx, job, rev)
+				s.dispatcher.Dispatch(ctx, job, job.Attempt)
+
+				s.dispatcher.PublishEvent(types.JobEvent{
+					Type:      types.EventJobAutoRecovered,
+					JobID:     run.JobID,
+					RunID:     run.ID,
+					NodeID:    run.NodeID,
+					Error:     &errMsg,
+					Attempt:   job.Attempt,
+					Timestamp: now,
+				})
+
+				s.logger.Info().String("job_id", run.JobID).Int("attempt", job.Attempt).Msg("scheduler: auto-recovered orphaned job")
+			} else {
+				// Retries exhausted.
+				job.Status = types.JobStatusDead
+				job.LastError = &errMsg
+				job.UpdatedAt = now
+				s.store.UpdateJob(ctx, job, rev)
+
+				s.dispatcher.PublishEvent(types.JobEvent{
+					Type:      types.EventJobDead,
+					JobID:     run.JobID,
+					RunID:     run.ID,
+					NodeID:    run.NodeID,
+					Error:     &errMsg,
+					Timestamp: now,
+				})
+			}
+		}
+
+		// Clean up the orphaned run entry.
+		s.store.DeleteRun(ctx, run.ID)
+	}
+}
+
+func (s *Scheduler) expireSchedule(ctx context.Context, entry *types.ScheduleEntry) {
+	s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: schedule expired")
+
+	// Delete the schedule.
+	s.store.DeleteSchedule(ctx, entry.JobID)
+
+	// Mark the job as completed.
+	job, rev, err := s.store.GetJob(ctx, entry.JobID)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	job.Status = types.JobStatusCompleted
+	job.CompletedAt = &now
+	job.UpdatedAt = now
+	s.store.UpdateJob(ctx, job, rev)
+
+	s.dispatcher.PublishEvent(types.JobEvent{
+		Type:      types.EventScheduleRemoved,
+		JobID:     entry.JobID,
+		Timestamp: now,
+	})
+}

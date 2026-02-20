@@ -1,0 +1,770 @@
+package worker
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"math/rand/v2"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/FDK0901/dureq/internal/dispatcher"
+	"github.com/FDK0901/dureq/internal/lock"
+	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/pkg/types"
+	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
+	"github.com/panjf2000/ants/v2"
+	"github.com/redis/rueidis"
+)
+
+// HandlerRegistry is the interface for looking up handlers by task type.
+type HandlerRegistry interface {
+	Get(taskType types.TaskType) (*types.HandlerDefinition, bool)
+	TaskTypes() []string
+}
+
+// Config holds worker configuration.
+type Config struct {
+	NodeID            string
+	Store             *store.RedisStore
+	Registry          HandlerRegistry
+	Disp              *dispatcher.Dispatcher
+	Locker            *lock.Locker
+	MaxConcurrency    int
+	ShutdownTimeout   time.Duration // Grace period before aborting in-flight tasks. Default: 30s.
+	GlobalMiddlewares []types.MiddlewareFunc
+	Logger            gochainedlog.Logger
+}
+
+// streamMessage wraps a parsed work message with the stream metadata needed for ack/delay.
+type streamMessage struct {
+	Work         types.WorkMessage
+	StreamMsgID  string
+	TierName     string
+	Redeliveries int
+}
+
+// maxRedeliveries is the limit before a message with no handler is sent to DLQ.
+const maxRedeliveries = 50
+
+// Worker pulls work messages from Redis Streams and executes them
+// using a panjf2000/ants goroutine pool.
+type Worker struct {
+	nodeID            string
+	store             *store.RedisStore
+	registry          HandlerRegistry
+	disp              *dispatcher.Dispatcher
+	locker            *lock.Locker
+	pool              *ants.Pool                    // global pool for tasks without dedicated concurrency
+	subpools          map[types.TaskType]*ants.Pool // per-TaskType pools
+	globalMiddlewares []types.MiddlewareFunc
+	tiers             []store.TierConfig
+	logger            gochainedlog.Logger
+
+	activeRuns      sync.Map // runID → struct{} for heartbeat/crash detection
+	cancelations    sync.Map // runID → context.CancelFunc for per-task cancellation
+	quit            chan struct{}
+	abort           chan struct{}
+	shutdownTimeout time.Duration
+	syncer          *SyncRetrier
+	ctx             context.Context
+	cancel          context.CancelFunc
+}
+
+// New creates a new worker.
+func New(cfg Config) (*Worker, error) {
+	if cfg.Logger == nil {
+		cfg.Logger = chainedslog.NewSlog(chainedslog.NewSlogBase())
+	}
+	if cfg.MaxConcurrency == 0 {
+		cfg.MaxConcurrency = 100
+	}
+	if cfg.ShutdownTimeout == 0 {
+		cfg.ShutdownTimeout = 30 * time.Second
+	}
+
+	pool, err := ants.NewPool(cfg.MaxConcurrency, ants.WithNonblocking(false))
+	if err != nil {
+		return nil, err
+	}
+
+	// Create per-TaskType subpools for handlers that specify Concurrency > 0.
+	subpools := make(map[types.TaskType]*ants.Pool)
+	for _, tt := range cfg.Registry.TaskTypes() {
+		def, ok := cfg.Registry.Get(types.TaskType(tt))
+		if !ok || def.Concurrency <= 0 {
+			continue
+		}
+		sp, err := ants.NewPool(def.Concurrency, ants.WithNonblocking(false))
+		if err != nil {
+			return nil, err
+		}
+		subpools[types.TaskType(tt)] = sp
+		cfg.Logger.Info().String("task_type", tt).Int("concurrency", def.Concurrency).Msg("worker: created subpool")
+	}
+
+	return &Worker{
+		nodeID:            cfg.NodeID,
+		store:             cfg.Store,
+		registry:          cfg.Registry,
+		disp:              cfg.Disp,
+		locker:            cfg.Locker,
+		pool:              pool,
+		subpools:          subpools,
+		globalMiddlewares: cfg.GlobalMiddlewares,
+		tiers:             cfg.Store.Config().Tiers,
+		logger:            cfg.Logger,
+		quit:              make(chan struct{}),
+		abort:             make(chan struct{}),
+		shutdownTimeout:   cfg.ShutdownTimeout,
+	}, nil
+}
+
+// Start begins consuming work messages from Redis Streams.
+// Creates XREADGROUP consumers for each tier and runs a weighted fetch loop.
+func (w *Worker) Start(ctx context.Context) error {
+	w.ctx, w.cancel = context.WithCancel(ctx)
+	w.syncer = NewSyncRetrier(w.ctx, w.logger)
+
+	go w.priorityFetchLoop()
+	go w.claimStaleLoop()
+	go w.cancelSubscribeLoop()
+
+	w.logger.Info().String("node_id", w.nodeID).Int("pool_capacity", w.pool.Cap()).Int("tiers", len(w.tiers)).Msg("worker started with priority consumers")
+	return nil
+}
+
+// Stop gracefully stops the worker using a two-phase shutdown:
+//  1. Close quit channel → fetch loop stops accepting new messages.
+//  2. After ShutdownTimeout → close abort channel → in-flight handlers
+//     detect the signal and requeue their messages for other workers.
+//  3. ReleaseTimeout waits for all ants pool workers to return.
+func (w *Worker) Stop() {
+	close(w.quit)
+
+	time.AfterFunc(w.shutdownTimeout, func() {
+		close(w.abort)
+	})
+
+	releaseTimeout := w.shutdownTimeout + 5*time.Second
+	if w.pool != nil {
+		w.pool.ReleaseTimeout(releaseTimeout)
+	}
+	for _, sp := range w.subpools {
+		sp.ReleaseTimeout(releaseTimeout)
+	}
+
+	if w.cancel != nil {
+		w.cancel()
+	}
+}
+
+// Stats returns current worker pool statistics.
+func (w *Worker) Stats() *types.PoolStats {
+	if w.pool == nil {
+		return nil
+	}
+	return &types.PoolStats{
+		RunningWorkers: w.pool.Running(),
+		IdleWorkers:    w.pool.Free(),
+		MaxConcurrency: w.pool.Cap(),
+	}
+}
+
+// SyncerStats returns the current SyncRetrier stats for the monitoring API.
+func (w *Worker) SyncerStats() *SyncRetryStats {
+	if w.syncer == nil {
+		return nil
+	}
+	stats := w.syncer.Stats()
+	return &stats
+}
+
+// ActiveRunIDs returns the list of currently executing run IDs on this worker.
+func (w *Worker) ActiveRunIDs() []string {
+	var ids []string
+	w.activeRuns.Range(func(key, _ any) bool {
+		ids = append(ids, key.(string))
+		return true
+	})
+	return ids
+}
+
+// availableCapacity returns the total number of free worker slots across
+// the global pool and all per-TaskType subpools. The value is a best-effort
+// estimate (racy) but sufficient for throttling XREADGROUP batch sizes.
+func (w *Worker) availableCapacity() int {
+	avail := w.pool.Free()
+	for _, sp := range w.subpools {
+		avail += sp.Free()
+	}
+	return avail
+}
+
+// priorityFetchLoop polls tier streams in weight-descending order via XREADGROUP.
+// Higher-weight tiers are polled first and with larger batch sizes.
+// The batch size is dynamically capped by pool capacity to avoid dequeuing
+// more messages than can be immediately processed (backpressure).
+func (w *Worker) priorityFetchLoop() {
+	for {
+		select {
+		case <-w.quit:
+			return
+		default:
+		}
+		fetched := 0
+		for _, tier := range w.tiers {
+			// Skip paused queues.
+			if paused, _ := w.store.IsQueuePaused(w.ctx, tier.Name); paused {
+				continue
+			}
+
+			avail := w.availableCapacity()
+			if avail == 0 {
+				continue
+			}
+			batchSize := min(tier.FetchBatch, avail)
+
+			streamKey := store.WorkStreamKey(w.store.Prefix(), tier.Name)
+			cmd := w.store.Client().B().Xreadgroup().Group(store.ConsumerGroup, w.nodeID).Count(int64(batchSize)).Block(200).Streams().Key(streamKey).Id(">").Build()
+			xStreams, err := w.store.Client().Do(w.ctx, cmd).AsXRead()
+			if err != nil {
+				if !rueidis.IsRedisNil(err) && w.ctx.Err() == nil {
+					w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: XREADGROUP error")
+				}
+				continue
+			}
+
+			for _, entries := range xStreams {
+				for _, entry := range entries {
+					fetched++
+					sm := parseStreamMessage(entry, tier.Name)
+
+					pool := w.poolForTaskType(sm.Work.TaskType)
+					if err := pool.Submit(func() {
+						w.processMessage(sm)
+					}); err != nil {
+						w.logger.Error().Err(err).Msg("worker: pool submit failed")
+						// Don't ack — XAUTOCLAIM will reclaim it later.
+					}
+				}
+			}
+		}
+		if fetched == 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+}
+
+// claimStaleLoop periodically reclaims unacknowledged messages from crashed workers.
+func (w *Worker) claimStaleLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.quit:
+			return
+		case <-ticker.C:
+			for _, tier := range w.tiers {
+				msgs, err := w.store.ClaimStaleMessages(w.ctx, tier.Name, w.nodeID, 5*time.Minute, 10)
+				if err != nil {
+					if w.ctx.Err() == nil {
+						w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: XAUTOCLAIM error")
+					}
+					continue
+				}
+				for _, xmsg := range msgs {
+					sm := parseStreamMessage(xmsg, tier.Name)
+					pool := w.poolForTaskType(sm.Work.TaskType)
+					if err := pool.Submit(func() {
+						w.processMessage(sm)
+					}); err != nil {
+						w.logger.Error().Err(err).Msg("worker: pool submit for claimed message failed")
+					}
+				}
+				if len(msgs) > 0 {
+					w.logger.Info().String("tier", tier.Name).Int("claimed", len(msgs)).Msg("worker: reclaimed stale messages")
+				}
+			}
+		}
+	}
+}
+
+// poolForTaskType returns the subpool for the given task type if one exists,
+// otherwise falls back to the global pool.
+func (w *Worker) poolForTaskType(tt types.TaskType) *ants.Pool {
+	if sp, ok := w.subpools[tt]; ok {
+		return sp
+	}
+	return w.pool
+}
+
+// parseStreamMessage constructs a streamMessage from a rueidis XRangeEntry.
+func parseStreamMessage(entry rueidis.XRangeEntry, tierName string) *streamMessage {
+	sm := &streamMessage{
+		Work:        store.WorkMessageFromStreamValues(entry.FieldValues),
+		StreamMsgID: entry.ID,
+		TierName:    tierName,
+	}
+	if s, ok := entry.FieldValues["redeliveries"]; ok {
+		n, _ := strconv.Atoi(s)
+		sm.Redeliveries = n
+	}
+	return sm
+}
+
+// runHeartbeat periodically updates the run's LastHeartbeatAt field while the job executes.
+func (w *Worker) runHeartbeat(ctx context.Context, run *types.JobRun) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			run.LastHeartbeatAt = &now
+			w.store.SaveRun(w.ctx, run)
+		}
+	}
+}
+
+// executeResult carries the outcome of a handler execution from the
+// nested goroutine back to the monitoring select.
+type executeResult struct {
+	err    error
+	output json.RawMessage
+}
+
+// processMessage handles a single work message from a Redis Stream.
+// The handler is executed in an isolated goroutine while the ants pool
+// worker monitors abort, context cancellation, and normal completion
+// via select.
+func (w *Worker) processMessage(sm *streamMessage) {
+	work := sm.Work
+
+	if work.JobID == "" || work.RunID == "" {
+		w.logger.Error().Msg("worker: invalid work message (missing job_id or run_id)")
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		return
+	}
+
+	// ScheduleToStart timeout check.
+	if !work.DispatchedAt.IsZero() {
+		job, rev, jobErr := w.store.GetJob(w.ctx, work.JobID)
+		if jobErr == nil && job.ScheduleToStartTimeout != nil {
+			waited := time.Since(work.DispatchedAt)
+			if waited > job.ScheduleToStartTimeout.Std() {
+				w.logger.Warn().String("job_id", work.JobID).String("run_id", work.RunID).String("waited", waited.String()).Msg("worker: schedule-to-start timeout exceeded")
+
+				now := time.Now()
+				errStr := types.ErrScheduleToStartTimeout.Error()
+				job.Status = types.JobStatusFailed
+				job.LastError = &errStr
+				job.UpdatedAt = now
+				if _, err := w.store.UpdateJob(w.ctx, job, rev); err != nil {
+					w.logger.Error().String("job_id", work.JobID).Err(err).Msg("worker: schedule-to-start timeout: failed to update job")
+				}
+
+				w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+
+				w.disp.PublishEvent(types.JobEvent{
+					Type:      types.EventJobScheduleToStartTimeout,
+					JobID:     work.JobID,
+					RunID:     work.RunID,
+					NodeID:    w.nodeID,
+					TaskType:  work.TaskType,
+					Error:     &errStr,
+					Timestamp: now,
+				})
+				return
+			}
+		}
+	}
+
+	// Look up handler.
+	def, ok := w.registry.Get(work.TaskType)
+	if !ok {
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		if sm.Redeliveries >= maxRedeliveries {
+			if w.clusterHasTaskType(work.TaskType) {
+				w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0)
+				return
+			}
+			w.logger.Warn().String("task_type", string(work.TaskType)).Int("redeliveries", sm.Redeliveries).Msg("worker: no handler in cluster, sending to DLQ")
+			w.disp.DispatchToDLQ(w.ctx, &types.Job{ID: work.JobID, TaskType: work.TaskType, Payload: work.Payload}, "no handler registered for task type: "+string(work.TaskType))
+			return
+		}
+		w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1)
+		return
+	}
+
+	// --- Per-run lock (exactly-once guard) ---
+	// Prevents duplicate execution when XAUTOCLAIM reclaims a message
+	// while the original worker's handler is still running.
+	lockOwner := fmt.Sprintf("%s:%d", w.nodeID, time.Now().UnixNano())
+	rl, lockErr := w.locker.Lock(w.ctx, "run:"+work.RunID, lockOwner)
+	if lockErr != nil {
+		if errors.Is(lockErr, types.ErrLockFailed) {
+			w.logger.Info().String("run_id", work.RunID).Msg("worker: run already locked by another worker, skipping")
+			w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+			return
+		}
+		w.logger.Warn().String("run_id", work.RunID).Err(lockErr).Msg("worker: lock acquisition error")
+		// Don't ack — XAUTOCLAIM will retry later.
+		return
+	}
+	defer rl.Unlock(w.ctx)
+
+	now := time.Now()
+
+	// Track active run for heartbeat/crash detection.
+	w.activeRuns.Store(work.RunID, struct{}{})
+	defer w.activeRuns.Delete(work.RunID)
+
+	// Record the run.
+	run := &types.JobRun{
+		ID:        work.RunID,
+		JobID:     work.JobID,
+		NodeID:    w.nodeID,
+		Status:    types.RunStatusRunning,
+		Attempt:   work.Attempt,
+		StartedAt: now,
+	}
+	w.store.SaveRun(w.ctx, run)
+
+	// Start heartbeat goroutine for this run.
+	hbCtx, hbCancel := context.WithCancel(w.ctx)
+	defer hbCancel()
+	go w.runHeartbeat(hbCtx, run)
+
+	// Publish started event.
+	w.disp.PublishEvent(types.JobEvent{
+		Type:      types.EventJobStarted,
+		JobID:     work.JobID,
+		RunID:     work.RunID,
+		NodeID:    w.nodeID,
+		TaskType:  work.TaskType,
+		Attempt:   work.Attempt,
+		Timestamp: now,
+	})
+
+	// Set up execution context with deadline.
+	execCtx := w.ctx
+	var execCancel context.CancelFunc
+	if def.Timeout > 0 {
+		execCtx, execCancel = context.WithTimeout(w.ctx, def.Timeout)
+	} else if !work.Deadline.IsZero() {
+		execCtx, execCancel = context.WithDeadline(w.ctx, work.Deadline)
+	}
+	if execCancel == nil {
+		execCtx, execCancel = context.WithCancel(execCtx)
+	}
+	defer execCancel()
+
+	// Register cancel func for per-task cancellation (Phase 5).
+	w.cancelations.Store(work.RunID, execCancel)
+	defer w.cancelations.Delete(work.RunID)
+
+	// If auto-extend loses the run lock, cancel the handler immediately.
+	rl.SetOnLost(func() {
+		w.logger.Warn().String("run_id", work.RunID).Msg("worker: run lock lost, cancelling handler")
+		execCancel()
+	})
+
+	// Inject metadata into the execution context.
+	execCtx = types.WithJobID(execCtx, work.JobID)
+	execCtx = types.WithRunID(execCtx, work.RunID)
+	execCtx = types.WithAttempt(execCtx, work.Attempt)
+	execCtx = types.WithTaskType(execCtx, work.TaskType)
+	execCtx = types.WithPriority(execCtx, work.Priority)
+	execCtx = types.WithNodeID(execCtx, w.nodeID)
+	if work.Headers != nil {
+		execCtx = types.WithHeaders(execCtx, work.Headers)
+	}
+	if def.RetryPolicy != nil {
+		execCtx = types.WithMaxRetry(execCtx, def.RetryPolicy.MaxAttempts)
+	}
+
+	// Execute handler in an isolated goroutine.
+	resCh := make(chan executeResult, 1)
+	go func() {
+		var execErr error
+		var output json.RawMessage
+		defer func() {
+			if r := recover(); r != nil {
+				execErr = &types.PanicError{Value: r}
+			}
+			resCh <- executeResult{err: execErr, output: output}
+		}()
+		if def.HandlerWithResult != nil {
+			h := def.HandlerWithResult
+			for i := len(def.Middlewares) - 1; i >= 0; i-- {
+				h = types.AdaptMiddleware(def.Middlewares[i])(h)
+			}
+			for i := len(w.globalMiddlewares) - 1; i >= 0; i-- {
+				h = types.AdaptMiddleware(w.globalMiddlewares[i])(h)
+			}
+			output, execErr = h(execCtx, work.Payload)
+		} else {
+			h := def.Handler
+			if len(def.Middlewares) > 0 {
+				h = types.ChainMiddleware(h, def.Middlewares...)
+			}
+			if len(w.globalMiddlewares) > 0 {
+				h = types.ChainMiddleware(h, w.globalMiddlewares...)
+			}
+			execErr = h(execCtx, work.Payload)
+		}
+	}()
+
+	// Monitor multiple signals while the handler runs.
+	select {
+	case <-w.abort:
+		// Graceful shutdown: cancel the handler and requeue the message
+		// so another worker can pick it up immediately.
+		execCancel()
+		bgCtx := context.Background()
+		syncRetrySave(w.syncer, func() error { return w.store.ReenqueueWork(bgCtx, sm.TierName, &sm.Work, sm.Redeliveries) }, fmt.Sprintf("requeue %s", work.RunID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(bgCtx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: requeued on shutdown abort")
+
+		finishedAt := time.Now()
+		run.FinishedAt = &finishedAt
+		run.Duration = finishedAt.Sub(now)
+		run.Status = types.RunStatusFailed
+		abortErr := "worker shutdown: task requeued"
+		run.Error = &abortErr
+		syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(bgCtx, run); return err }, fmt.Sprintf("save run %s", run.ID))
+		syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(bgCtx, run) }, fmt.Sprintf("save job run %s", run.ID))
+		syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(bgCtx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
+		return
+
+	case <-execCtx.Done():
+		// Context cancelled: timeout, deadline, or per-task cancellation.
+		// Wait briefly for the handler goroutine to notice and return.
+		select {
+		case res := <-resCh:
+			w.finishProcessMessage(sm, work, run, now, res)
+		case <-time.After(5 * time.Second):
+			finishedAt := time.Now()
+			run.FinishedAt = &finishedAt
+			run.Duration = finishedAt.Sub(now)
+			run.Status = types.RunStatusFailed
+			ctxErr := execCtx.Err().Error()
+			run.Error = &ctxErr
+			syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(w.ctx, run); return err }, fmt.Sprintf("save run %s", run.ID))
+			w.onFailure(sm, work, run, execCtx.Err())
+			syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
+			syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
+		}
+		return
+
+	case res := <-resCh:
+		// Normal completion (success or handler error).
+		w.finishProcessMessage(sm, work, run, now, res)
+	}
+}
+
+// finishProcessMessage completes the run bookkeeping after handler execution.
+func (w *Worker) finishProcessMessage(sm *streamMessage, work types.WorkMessage, run *types.JobRun, startedAt time.Time, res executeResult) {
+	finishedAt := time.Now()
+	run.FinishedAt = &finishedAt
+	run.Duration = finishedAt.Sub(startedAt)
+
+	if res.err == nil {
+		run.Status = types.RunStatusSucceeded
+		syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(w.ctx, run); return err }, fmt.Sprintf("save run %s", run.ID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		w.onSuccess(work, run, res.output)
+	} else {
+		errStr := res.err.Error()
+		run.Status = types.RunStatusFailed
+		run.Error = &errStr
+		syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(w.ctx, run); return err }, fmt.Sprintf("save run %s", run.ID))
+		w.onFailure(sm, work, run, res.err)
+	}
+
+	syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
+	syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
+}
+
+func (w *Worker) onSuccess(work types.WorkMessage, run *types.JobRun, output json.RawMessage) {
+	w.store.IncrDailyStat(w.ctx, "processed")
+
+	w.disp.PublishEvent(types.JobEvent{
+		Type:      types.EventJobCompleted,
+		JobID:     work.JobID,
+		RunID:     work.RunID,
+		NodeID:    w.nodeID,
+		TaskType:  work.TaskType,
+		Attempt:   work.Attempt,
+		Timestamp: time.Now(),
+	})
+
+	w.disp.PublishResult(types.WorkResult{
+		RunID:   work.RunID,
+		JobID:   work.JobID,
+		Success: true,
+		Output:  output,
+	})
+
+	// Update job state.
+	job, rev, err := w.store.GetJob(w.ctx, work.JobID)
+	if err != nil {
+		w.logger.Warn().String("job_id", work.JobID).Err(err).Msg("worker: failed to get job for success update")
+		return
+	}
+
+	now := time.Now()
+	job.LastRunAt = &now
+	job.Attempt = work.Attempt + 1
+	job.LastError = nil
+	job.UpdatedAt = now
+
+	// Only mark as completed if there's no active schedule.
+	_, _, schedErr := w.store.GetSchedule(w.ctx, work.JobID)
+	if schedErr == types.ErrScheduleNotFound {
+		job.Status = types.JobStatusCompleted
+		job.CompletedAt = &now
+	} else {
+		job.Status = types.JobStatusScheduled
+	}
+
+	syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
+}
+
+func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types.JobRun, execErr error) {
+	w.store.IncrDailyStat(w.ctx, "failed")
+
+	errStr := execErr.Error()
+	errClass := types.ClassifyError(execErr)
+
+	w.logger.Warn().String("job_id", work.JobID).String("run_id", work.RunID).Int("attempt", work.Attempt).String("error_class", types.GetErrorClassString(errClass)).String("error", errStr).Msg("worker: job execution failed")
+
+	// Load job for retry policy check.
+	job, rev, err := w.store.GetJob(w.ctx, work.JobID)
+	if err != nil {
+		w.logger.Error().String("job_id", work.JobID).Err(err).Msg("worker: failed to get job for failure update")
+		// Don't ack — leave for XAUTOCLAIM.
+		return
+	}
+
+	retryPolicy := job.RetryPolicy
+	if retryPolicy == nil {
+		retryPolicy = types.DefaultRetryPolicy()
+	}
+
+	now := time.Now()
+	job.LastRunAt = &now
+	job.LastError = &errStr
+	job.Attempt = work.Attempt + 1
+	job.UpdatedAt = now
+
+	maxAttempts := retryPolicy.MaxAttempts
+	if job.DLQAfter != nil && *job.DLQAfter < maxAttempts {
+		maxAttempts = *job.DLQAfter
+	}
+
+	switch {
+	case errClass == types.ErrorClassNonRetryable:
+		job.Status = types.JobStatusDead
+		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		w.disp.DispatchToDLQ(w.ctx, job, errStr)
+
+	case job.Attempt >= maxAttempts:
+		job.Status = types.JobStatusDead
+		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		w.disp.DispatchToDLQ(w.ctx, job, errStr)
+
+	case errClass == types.ErrorClassRateLimited:
+		job.Status = types.JobStatusRetrying
+		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		retryAfter := types.GetRetryAfter(execErr)
+		if retryAfter == 0 {
+			retryAfter = retryPolicy.InitialDelay
+		}
+		w.store.AddDelayed(w.ctx, sm.TierName, &work, time.Now().Add(retryAfter))
+
+	default:
+		job.Status = types.JobStatusRetrying
+		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		delay := calculateBackoff(work.Attempt, retryPolicy)
+		w.store.AddDelayed(w.ctx, sm.TierName, &work, time.Now().Add(delay))
+	}
+
+	w.disp.PublishEvent(types.JobEvent{
+		Type:      types.EventJobFailed,
+		JobID:     work.JobID,
+		RunID:     work.RunID,
+		NodeID:    w.nodeID,
+		TaskType:  work.TaskType,
+		Attempt:   work.Attempt,
+		Error:     &errStr,
+		Timestamp: now,
+	})
+}
+
+// cancelSubscribeLoop subscribes to the Redis Pub/Sub cancel channel and cancels
+// the context for any matching in-flight run, enabling per-task cancellation.
+func (w *Worker) cancelSubscribeLoop() {
+	cancelCh := w.store.CancelChannel()
+	subscribeCmd := w.store.Client().B().Subscribe().Channel(cancelCh).Build()
+
+	err := w.store.Client().Receive(w.ctx, subscribeCmd, func(msg rueidis.PubSubMessage) {
+		runID := msg.Message
+		if cancel, loaded := w.cancelations.Load(runID); loaded {
+			cancel.(context.CancelFunc)()
+			w.logger.Info().String("run_id", runID).Msg("worker: task cancelled via pub/sub")
+		}
+	})
+	if err != nil && w.ctx.Err() == nil {
+		w.logger.Warn().Err(err).Msg("worker: cancel subscribe loop ended")
+	}
+}
+
+// clusterHasTaskType checks if any other live node in the cluster handles the given task type.
+func (w *Worker) clusterHasTaskType(tt types.TaskType) bool {
+	nodes, err := w.store.ListNodes(w.ctx)
+	if err != nil {
+		return false
+	}
+	for _, node := range nodes {
+		if node.NodeID == w.nodeID {
+			continue
+		}
+		for _, t := range node.TaskTypes {
+			if t == string(tt) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// calculateBackoff computes exponential backoff with jitter.
+func calculateBackoff(attempt int, policy *types.RetryPolicy) time.Duration {
+	delay := float64(policy.InitialDelay) * math.Pow(policy.Multiplier, float64(attempt))
+
+	if time.Duration(delay) > policy.MaxDelay {
+		delay = float64(policy.MaxDelay)
+	}
+
+	// Add jitter.
+	if policy.Jitter > 0 {
+		jitterRange := delay * policy.Jitter
+		delay = delay - jitterRange + (rand.Float64() * 2 * jitterRange)
+	}
+
+	return time.Duration(delay)
+}

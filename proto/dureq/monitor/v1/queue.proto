@@ -1,0 +1,51 @@
+syntax = "proto3";
+package dureq.monitor.v1;
+
+option go_package = "github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1";
+
+// QueueInfo describes the state of a single queue/tier.
+message QueueInfo {
+  string name = 1;
+  int32 weight = 2;
+  int32 fetch_batch = 3;
+  bool paused = 4;
+  int64 size = 5;
+}
+
+// GroupInfo describes an aggregation group.
+message GroupInfo {
+  string name = 1;
+  int64 size = 2;
+}
+
+// --- Queue RPC messages ---
+
+message ListQueuesRequest {}
+
+message ListQueuesResponse {
+  repeated QueueInfo queues = 1;
+}
+
+message PauseQueueRequest {
+  string tier_name = 1;
+}
+
+message PauseQueueResponse {
+  string tier_name = 1;
+}
+
+message ResumeQueueRequest {
+  string tier_name = 1;
+}
+
+message ResumeQueueResponse {
+  string tier_name = 1;
+}
+
+// --- Group RPC messages ---
+
+message ListGroupsRequest {}
+
+message ListGroupsResponse {
+  repeated GroupInfo groups = 1;
+}

@@ -1,0 +1,711 @@
+package client
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"time"
+
+	"github.com/FDK0901/dureq/internal/scheduler"
+	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/pkg/types"
+	"github.com/bytedance/sonic"
+	"github.com/redis/rueidis"
+	"github.com/rs/xid"
+)
+
+// Client is the dureq client SDK for enqueuing jobs and querying status.
+// Unlike v1 which dispatches via Redis Streams (XADD), v2 publishes a
+// lightweight Pub/Sub notification that the NotifierActor forwards to the
+// DispatcherActor for push-based dispatch.
+type Client struct {
+	store *store.RedisStore
+	rdb   rueidis.Client
+	owned bool // true if we created the redis client
+}
+
+// Option configures the client.
+type Option func(*clientConfig)
+
+type clientConfig struct {
+	redisURL      string
+	redisPassword string
+	redisDB       int
+	redisPoolSize int
+	tlsConfig     interface{} // *tls.Config
+	keyPrefix     string
+	tiers         []store.TierConfig
+	rdb           rueidis.Client    // pre-existing client
+	clusterAddrs  []string          // Redis Cluster addresses
+	redisStore    *store.RedisStore // pre-existing store
+}
+
+// WithRedisURL sets the Redis server URL.
+func WithRedisURL(url string) Option {
+	return func(c *clientConfig) { c.redisURL = url }
+}
+
+// WithRedisPassword sets the Redis password.
+func WithRedisPassword(password string) Option {
+	return func(c *clientConfig) { c.redisPassword = password }
+}
+
+// WithRedisDB sets the Redis database number.
+func WithRedisDB(db int) Option {
+	return func(c *clientConfig) { c.redisDB = db }
+}
+
+// WithRedisPoolSize sets the Redis connection pool size.
+func WithRedisPoolSize(n int) Option {
+	return func(c *clientConfig) { c.redisPoolSize = n }
+}
+
+// WithKeyPrefix sets the key prefix for multi-tenant isolation.
+func WithKeyPrefix(prefix string) Option {
+	return func(c *clientConfig) { c.keyPrefix = prefix }
+}
+
+// WithPriorityTiers sets the priority tier configuration.
+func WithPriorityTiers(tiers []store.TierConfig) Option {
+	return func(c *clientConfig) { c.tiers = tiers }
+}
+
+// WithRedisClient uses a pre-existing Redis client.
+func WithRedisClient(rdb rueidis.Client) Option {
+	return func(c *clientConfig) { c.rdb = rdb }
+}
+
+// WithClusterAddrs sets Redis Cluster node addresses for cluster mode.
+func WithClusterAddrs(addrs []string) Option {
+	return func(c *clientConfig) { c.clusterAddrs = addrs }
+}
+
+// WithStore uses a pre-existing RedisStore (for in-process use with the server).
+func WithStore(s *store.RedisStore) Option {
+	return func(c *clientConfig) { c.redisStore = s }
+}
+
+// New creates a new dureq client.
+func New(opts ...Option) (*Client, error) {
+	cfg := &clientConfig{}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	if cfg.redisStore != nil {
+		return &Client{
+			store: cfg.redisStore,
+			rdb:   cfg.redisStore.Client(),
+			owned: false,
+		}, nil
+	}
+
+	var rdb rueidis.Client
+	owned := false
+	if cfg.rdb != nil {
+		rdb = cfg.rdb
+	} else if len(cfg.clusterAddrs) > 0 {
+		opt := rueidis.ClientOption{
+			InitAddress:      cfg.clusterAddrs,
+			BlockingPoolSize: max(cfg.redisPoolSize, 10),
+		}
+		if cfg.redisPassword != "" {
+			opt.Password = cfg.redisPassword
+		}
+		var err error
+		rdb, err = rueidis.NewClient(opt)
+		if err != nil {
+			return nil, fmt.Errorf("redis cluster client: %w", err)
+		}
+		owned = true
+	} else if cfg.redisURL != "" {
+		u, err := url.Parse(cfg.redisURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse redis URL: %w", err)
+		}
+		addr := u.Host
+		if addr == "" {
+			addr = "localhost:6379"
+		}
+
+		opt := rueidis.ClientOption{
+			InitAddress:      []string{addr},
+			SelectDB:         cfg.redisDB,
+			BlockingPoolSize: max(cfg.redisPoolSize, 10),
+		}
+
+		if cfg.redisPassword != "" {
+			opt.Password = cfg.redisPassword
+		} else if u.User != nil {
+			if p, ok := u.User.Password(); ok {
+				opt.Password = p
+			}
+		}
+
+		if u.Scheme == "rediss" {
+			opt.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+
+		rdb, err = rueidis.NewClient(opt)
+		if err != nil {
+			return nil, fmt.Errorf("redis client: %w", err)
+		}
+		owned = true
+	} else {
+		return nil, fmt.Errorf("Redis URL, Redis client, or RedisStore is required")
+	}
+
+	ctx := context.Background()
+	if err := rdb.Do(ctx, rdb.B().Ping().Build()).Error(); err != nil {
+		if owned {
+			rdb.Close()
+		}
+		return nil, fmt.Errorf("redis ping: %w", err)
+	}
+
+	storeCfg := store.RedisStoreConfig{
+		KeyPrefix: cfg.keyPrefix,
+	}
+
+	s, err := store.NewRedisStore(rdb, storeCfg, nil)
+	if err != nil {
+		if owned {
+			rdb.Close()
+		}
+		return nil, fmt.Errorf("create store: %w", err)
+	}
+
+	return &Client{
+		store: s,
+		rdb:   rdb,
+		owned: owned,
+	}, nil
+}
+
+// Store returns the underlying RedisStore.
+func (c *Client) Store() *store.RedisStore { return c.store }
+
+// --- Job operations ---
+
+// EnqueueRequest describes a job to enqueue.
+type EnqueueRequest struct {
+	TaskType         types.TaskType     `json:"task_type"`
+	Payload          json.RawMessage    `json:"payload"`
+	Schedule         types.Schedule     `json:"schedule"`
+	RetryPolicy      *types.RetryPolicy `json:"retry_policy,omitempty"`
+	Tags             []string           `json:"tags,omitempty"`
+	UniqueKey        *string            `json:"unique_key,omitempty"`
+	DLQAfter         *int               `json:"dlq_after,omitempty"`
+	Priority         *types.Priority    `json:"priority,omitempty"`
+	HeartbeatTimeout *types.Duration    `json:"heartbeat_timeout,omitempty"`
+}
+
+// Enqueue submits a job for immediate execution.
+func (c *Client) Enqueue(ctx context.Context, taskType types.TaskType, payload any) (*types.Job, error) {
+	payloadBytes, err := sonic.ConfigFastest.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
+
+	return c.enqueue(ctx, &EnqueueRequest{
+		TaskType: taskType,
+		Payload:  payloadBytes,
+		Schedule: types.Schedule{Type: types.ScheduleImmediate},
+	})
+}
+
+// EnqueueScheduled submits a job with a schedule.
+func (c *Client) EnqueueScheduled(ctx context.Context, req *EnqueueRequest) (*types.Job, error) {
+	return c.enqueue(ctx, req)
+}
+
+func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, error) {
+	now := time.Now()
+	job := &types.Job{
+		ID:               xid.New().String(),
+		TaskType:         req.TaskType,
+		Payload:          req.Payload,
+		Schedule:         req.Schedule,
+		RetryPolicy:      req.RetryPolicy,
+		Tags:             req.Tags,
+		UniqueKey:        req.UniqueKey,
+		DLQAfter:         req.DLQAfter,
+		Priority:         req.Priority,
+		HeartbeatTimeout: req.HeartbeatTimeout,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+
+	if job.UniqueKey != nil && *job.UniqueKey != "" {
+		if err := c.store.SetUniqueKey(ctx, *job.UniqueKey, job.ID); err != nil {
+			return nil, fmt.Errorf("unique key: %w", err)
+		}
+	}
+
+	if job.Schedule.Type == types.ScheduleImmediate {
+		job.Status = types.JobStatusPending
+	} else {
+		job.Status = types.JobStatusScheduled
+	}
+
+	if _, err := c.store.CreateJob(ctx, job); err != nil {
+		if job.UniqueKey != nil && *job.UniqueKey != "" {
+			c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
+		}
+		return nil, fmt.Errorf("create job: %w", err)
+	}
+
+	switch job.Schedule.Type {
+	case types.ScheduleImmediate:
+		if err := c.dispatchJob(ctx, job); err != nil {
+			c.store.DeleteJob(ctx, job.ID)
+			if job.UniqueKey != nil && *job.UniqueKey != "" {
+				c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
+			}
+			return nil, fmt.Errorf("dispatch: %w", err)
+		}
+		c.publishEvent(ctx, types.JobEvent{
+			Type:      types.EventJobDispatched,
+			JobID:     job.ID,
+			TaskType:  job.TaskType,
+			Timestamp: now,
+		})
+
+	default:
+		nextRun, err := scheduler.NextRunTime(job.Schedule, now)
+		if err != nil {
+			return nil, fmt.Errorf("calculate next run: %w", err)
+		}
+		entry := &types.ScheduleEntry{
+			JobID:     job.ID,
+			Schedule:  job.Schedule,
+			NextRunAt: nextRun,
+		}
+		if _, err := c.store.SaveSchedule(ctx, entry); err != nil {
+			return nil, fmt.Errorf("save schedule: %w", err)
+		}
+		c.publishEvent(ctx, types.JobEvent{
+			Type:      types.EventScheduleCreated,
+			JobID:     job.ID,
+			TaskType:  job.TaskType,
+			Timestamp: now,
+		})
+	}
+
+	return job, nil
+}
+
+// Cancel cancels a job by ID.
+func (c *Client) Cancel(ctx context.Context, jobID string) error {
+	job, rev, err := c.store.GetJob(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("get job: %w", err)
+	}
+
+	now := time.Now()
+	job.Status = types.JobStatusCancelled
+	job.UpdatedAt = now
+
+	if _, err := c.store.UpdateJob(ctx, job, rev); err != nil {
+		return fmt.Errorf("update job: %w", err)
+	}
+
+	c.store.DeleteSchedule(ctx, jobID)
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventJobCancelled,
+		JobID:     jobID,
+		Timestamp: now,
+	})
+	return nil
+}
+
+// Retry re-enqueues a failed or dead job for another attempt.
+func (c *Client) Retry(ctx context.Context, jobID string) error {
+	job, rev, err := c.store.GetJob(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("get job: %w", err)
+	}
+
+	now := time.Now()
+	job.Status = types.JobStatusPending
+	job.Attempt = 0
+	job.LastError = nil
+	job.UpdatedAt = now
+
+	if _, err := c.store.UpdateJob(ctx, job, rev); err != nil {
+		return fmt.Errorf("update job: %w", err)
+	}
+
+	if err := c.dispatchJob(ctx, job); err != nil {
+		return fmt.Errorf("dispatch: %w", err)
+	}
+
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventJobRetrying,
+		JobID:     jobID,
+		Timestamp: now,
+	})
+	return nil
+}
+
+// Status queries the current status of a job.
+func (c *Client) Status(ctx context.Context, jobID string) (*types.Job, error) {
+	job, _, err := c.store.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// GetJob retrieves a job by ID.
+func (c *Client) GetJob(ctx context.Context, jobID string) (*types.Job, error) {
+	job, _, err := c.store.GetJob(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// --- Workflow operations ---
+
+// EnqueueWorkflow submits a workflow definition for execution.
+func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefinition, input any) (*types.WorkflowInstance, error) {
+	now := time.Now()
+
+	tasks := make(map[string]types.WorkflowTaskState, len(def.Tasks))
+	for _, t := range def.Tasks {
+		tasks[t.Name] = types.WorkflowTaskState{
+			Status: types.JobStatusPending,
+		}
+	}
+
+	wf := &types.WorkflowInstance{
+		ID:           xid.New().String(),
+		WorkflowName: def.Name,
+		Definition:   def,
+		Status:       types.WorkflowStatusRunning,
+		Tasks:        tasks,
+		Attempt:      1,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	if def.ExecutionTimeout != nil {
+		deadline := now.Add(def.ExecutionTimeout.Std())
+		wf.Deadline = &deadline
+	}
+
+	rev, err := c.store.SaveWorkflow(ctx, wf)
+	if err != nil {
+		return nil, fmt.Errorf("save workflow: %w", err)
+	}
+
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventWorkflowStarted,
+		JobID:     wf.ID,
+		Timestamp: now,
+	})
+
+	roots := rootTasks(&def)
+	for _, taskName := range roots {
+		c.dispatchWorkflowTask(ctx, wf, taskName, &now)
+	}
+
+	c.store.UpdateWorkflow(ctx, wf, rev)
+
+	return wf, nil
+}
+
+// GetWorkflow retrieves the current state of a workflow instance.
+func (c *Client) GetWorkflow(ctx context.Context, workflowID string) (*types.WorkflowInstance, error) {
+	wf, _, err := c.store.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	return wf, nil
+}
+
+// --- Batch operations ---
+
+// EnqueueBatch submits a batch definition for processing.
+func (c *Client) EnqueueBatch(ctx context.Context, def types.BatchDefinition) (*types.BatchInstance, error) {
+	now := time.Now()
+
+	itemStates := make(map[string]types.BatchItemState, len(def.Items))
+	for _, item := range def.Items {
+		itemStates[item.ID] = types.BatchItemState{
+			ItemID: item.ID,
+			Status: types.JobStatusPending,
+		}
+	}
+
+	batch := &types.BatchInstance{
+		ID:           xid.New().String(),
+		Name:         def.Name,
+		Definition:   def,
+		Status:       types.WorkflowStatusRunning,
+		ItemStates:   itemStates,
+		TotalItems:   len(def.Items),
+		PendingItems: len(def.Items),
+		Attempt:      1,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+
+	if def.ExecutionTimeout != nil {
+		deadline := now.Add(def.ExecutionTimeout.Std())
+		batch.Deadline = &deadline
+	}
+
+	batchRev, err := c.store.SaveBatch(ctx, batch)
+	if err != nil {
+		return nil, fmt.Errorf("save batch: %w", err)
+	}
+
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventBatchStarted,
+		JobID:     batch.ID,
+		Timestamp: now,
+	})
+
+	if def.OnetimeTaskType != nil && *def.OnetimeTaskType != "" {
+		c.dispatchBatchOnetime(ctx, batch, &now)
+		c.store.UpdateBatch(ctx, batch, batchRev)
+	} else {
+		c.dispatchBatchChunk(ctx, batch, &now)
+		c.store.UpdateBatch(ctx, batch, batchRev)
+	}
+
+	return batch, nil
+}
+
+// GetBatch retrieves the current state of a batch instance.
+func (c *Client) GetBatch(ctx context.Context, batchID string) (*types.BatchInstance, error) {
+	batch, _, err := c.store.GetBatch(ctx, batchID)
+	if err != nil {
+		return nil, err
+	}
+	return batch, nil
+}
+
+// --- Wait operations ---
+
+// EnqueueAndWait submits a job for immediate execution and waits for the result.
+func (c *Client) EnqueueAndWait(ctx context.Context, taskType types.TaskType, payload any, timeout time.Duration) (*types.WorkResult, error) {
+	job, err := c.Enqueue(ctx, taskType, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	resultCh := store.ResultNotifyChannel(c.store.Prefix(), job.ID)
+	subscribeCmd := c.rdb.B().Subscribe().Channel(resultCh).Build()
+
+	// Check if result already exists before subscribing.
+	if result, err := c.store.GetResult(waitCtx, job.ID); err == nil && result != nil {
+		return result, nil
+	}
+
+	resultOut := make(chan *types.WorkResult, 1)
+	errOut := make(chan error, 1)
+
+	go func() {
+		err := c.rdb.Receive(waitCtx, subscribeCmd, func(msg rueidis.PubSubMessage) {
+			var result types.WorkResult
+			if err := sonic.ConfigFastest.UnmarshalFromString(msg.Message, &result); err != nil {
+				return
+			}
+			if result.JobID == job.ID {
+				select {
+				case resultOut <- &result:
+				default:
+				}
+			}
+		})
+		if err != nil {
+			select {
+			case errOut <- err:
+			default:
+			}
+		}
+	}()
+
+	// Also check once more after subscribe to avoid race.
+	if result, err := c.store.GetResult(waitCtx, job.ID); err == nil && result != nil {
+		return result, nil
+	}
+
+	select {
+	case result := <-resultOut:
+		return result, nil
+	case err := <-errOut:
+		return nil, fmt.Errorf("wait for result: %w", err)
+	case <-waitCtx.Done():
+		return nil, fmt.Errorf("wait for result: %w", waitCtx.Err())
+	}
+}
+
+// GetBatchResults retrieves all item results for a completed batch.
+func (c *Client) GetBatchResults(ctx context.Context, batchID string) ([]*types.BatchItemResult, error) {
+	return c.store.ListBatchItemResults(ctx, batchID)
+}
+
+// Close closes the client connection (only if we created the Redis client).
+func (c *Client) Close() {
+	if c.owned && c.rdb != nil {
+		c.rdb.Close()
+	}
+}
+
+// --- Internal helpers ---
+
+// dispatchJob publishes a notification to the job:notify Pub/Sub channel.
+// The NotifierActor on each server node subscribes to this channel and
+// forwards it to the DispatcherActor for push-based dispatch.
+func (c *Client) dispatchJob(ctx context.Context, job *types.Job) error {
+	priority := int(types.PriorityNormal)
+	if job.Priority != nil {
+		priority = int(*job.Priority)
+	}
+	return c.store.PublishJobNotification(ctx, job.ID, string(job.TaskType), priority)
+}
+
+func (c *Client) publishEvent(ctx context.Context, event types.JobEvent) {
+	c.store.PublishEvent(ctx, event)
+}
+
+func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowInstance, taskName string, now *time.Time) {
+	var taskDef *types.WorkflowTask
+	for i := range wf.Definition.Tasks {
+		if wf.Definition.Tasks[i].Name == taskName {
+			taskDef = &wf.Definition.Tasks[i]
+			break
+		}
+	}
+	if taskDef == nil {
+		return
+	}
+
+	job := &types.Job{
+		ID:           xid.New().String(),
+		TaskType:     taskDef.TaskType,
+		Payload:      taskDef.Payload,
+		Schedule:     types.Schedule{Type: types.ScheduleImmediate},
+		Status:       types.JobStatusPending,
+		Priority:     wf.Definition.DefaultPriority,
+		WorkflowID:   &wf.ID,
+		WorkflowTask: &taskName,
+		CreatedAt:    *now,
+		UpdatedAt:    *now,
+	}
+
+	if _, err := c.store.CreateJob(ctx, job); err != nil {
+		return
+	}
+	if err := c.dispatchJob(ctx, job); err != nil {
+		return
+	}
+
+	if state, ok := wf.Tasks[taskName]; ok {
+		state.JobID = job.ID
+		state.Status = types.JobStatusRunning
+		state.StartedAt = now
+		wf.Tasks[taskName] = state
+	}
+}
+
+func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchInstance, now *time.Time) {
+	job := &types.Job{
+		ID:        xid.New().String(),
+		TaskType:  *batch.Definition.OnetimeTaskType,
+		Payload:   batch.Definition.OnetimePayload,
+		Schedule:  types.Schedule{Type: types.ScheduleImmediate},
+		Status:    types.JobStatusPending,
+		Priority:  batch.Definition.DefaultPriority,
+		BatchID:   &batch.ID,
+		BatchRole: strPtr("onetime"),
+		CreatedAt: *now,
+		UpdatedAt: *now,
+	}
+
+	if _, err := c.store.CreateJob(ctx, job); err != nil {
+		return
+	}
+	if err := c.dispatchJob(ctx, job); err != nil {
+		return
+	}
+
+	batch.OnetimeState = &types.BatchOnetimeState{
+		JobID:     job.ID,
+		Status:    types.JobStatusRunning,
+		StartedAt: now,
+	}
+}
+
+func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInstance, now *time.Time) {
+	chunkSize := batch.Definition.ChunkSize
+	if chunkSize <= 0 {
+		chunkSize = 100
+	}
+
+	items := batch.Definition.Items
+	dispatched := 0
+
+	for batch.NextChunkIndex < len(items) && dispatched < chunkSize && batch.RunningItems < chunkSize {
+		item := items[batch.NextChunkIndex]
+		batch.NextChunkIndex++
+
+		if state, ok := batch.ItemStates[item.ID]; ok && state.Status != types.JobStatusPending {
+			continue
+		}
+
+		job := &types.Job{
+			ID:          xid.New().String(),
+			TaskType:    batch.Definition.ItemTaskType,
+			Payload:     item.Payload,
+			Schedule:    types.Schedule{Type: types.ScheduleImmediate},
+			Status:      types.JobStatusPending,
+			Priority:    batch.Definition.DefaultPriority,
+			BatchID:     &batch.ID,
+			BatchItem:   &item.ID,
+			BatchRole:   strPtr("item"),
+			RetryPolicy: batch.Definition.ItemRetryPolicy,
+			CreatedAt:   *now,
+			UpdatedAt:   *now,
+		}
+
+		if _, err := c.store.CreateJob(ctx, job); err != nil {
+			continue
+		}
+		if err := c.dispatchJob(ctx, job); err != nil {
+			continue
+		}
+
+		batch.ItemStates[item.ID] = types.BatchItemState{
+			ItemID:    item.ID,
+			JobID:     job.ID,
+			Status:    types.JobStatusRunning,
+			StartedAt: now,
+		}
+		batch.RunningItems++
+		batch.PendingItems--
+		dispatched++
+	}
+}
+
+// rootTasks returns task names that have no dependencies (DAG roots).
+func rootTasks(def *types.WorkflowDefinition) []string {
+	var roots []string
+	for _, t := range def.Tasks {
+		if len(t.DependsOn) == 0 {
+			roots = append(roots, t.Name)
+		}
+	}
+	return roots
+}
+
+func strPtr(s string) *string { return &s }

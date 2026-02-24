@@ -33,7 +33,7 @@ Heavily inspired by [Asynq](https://github.com/hibiken/asynq), [gocron](https://
 
 ```
                     ┌─────────────────────┐
-                    │     duraqui (UI)    │
+                    │     durequi (UI)    │
                     │ React Web Dashboard │
                     └─────────┬───────────┘
                               │
@@ -214,7 +214,7 @@ go run ./cmd/dureqd
 
 ### Configuration
 
-`dureqd` reads configuration from a YAML file. Set the path via `DUREQ_CONFIG_PATH` environment variable (default: `cmd/dureqd/config.yaml`).
+`dureqd` reads configuration from a YAML file. Set the path via `DUREQ_CONFIG_PATH` environment variable (default: `configs/config.yaml`).
 
 ```yaml
 dureqd:

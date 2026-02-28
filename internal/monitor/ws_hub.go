@@ -10,65 +10,79 @@ import (
 
 const wsSendBufferSize = 64
 
-// wsClient represents a single WebSocket connection registered with the Hub.
-type wsClient struct {
-	send chan []byte
+// WSClient represents a single WebSocket connection registered with the Hub.
+type WSClient struct {
+	Send chan []byte
+}
+
+// NewWSClient creates a new WebSocket client with a buffered send channel.
+func NewWSClient() *WSClient {
+	return &WSClient{Send: make(chan []byte, wsSendBufferSize)}
 }
 
 // Hub manages WebSocket client connections and broadcasts Redis Pub/Sub events.
 // A single Redis subscription feeds all connected WebSocket clients (fan-out).
-type Hub struct {
+type Hub interface {
+	Register(c *WSClient)
+	Unregister(c *WSClient)
+
+	Broadcast(data []byte)
+	ClientCount() int
+	SubscribeRedis(ctx context.Context, rdb rueidis.Client, channel string)
+}
+
+type hub struct {
 	mu      sync.RWMutex
-	clients map[*wsClient]struct{}
+	clients map[*WSClient]struct{}
 	logger  gochainedlog.Logger
 }
 
-func newHub(logger gochainedlog.Logger) *Hub {
-	return &Hub{
-		clients: make(map[*wsClient]struct{}),
+func newHub(logger gochainedlog.Logger) Hub {
+	return &hub{
+		clients: make(map[*WSClient]struct{}),
 		logger:  logger,
 	}
 }
 
-func (h *Hub) register(c *wsClient) {
+func (h *hub) Register(c *WSClient) {
 	h.mu.Lock()
 	h.clients[c] = struct{}{}
 	h.mu.Unlock()
 }
 
-func (h *Hub) unregister(c *wsClient) {
+func (h *hub) Unregister(c *WSClient) {
 	h.mu.Lock()
 	delete(h.clients, c)
-	close(c.send)
+	close(c.Send)
 	h.mu.Unlock()
 }
 
-// broadcast sends a message to all connected clients.
+// Broadcast sends a message to all connected clients.
 // Drops the message for any client whose send buffer is full (slow consumer protection).
-func (h *Hub) broadcast(data []byte) {
+func (h *hub) Broadcast(data []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for c := range h.clients {
 		select {
-		case c.send <- data:
+		case c.Send <- data:
 		default:
 			// Slow consumer — drop this event.
 		}
 	}
 }
 
-func (h *Hub) clientCount() int {
+func (h *hub) ClientCount() int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return len(h.clients)
 }
 
-// subscribeRedis subscribes to the Redis Pub/Sub events channel and
+// SubscribeRedis subscribes to the Redis Pub/Sub events channel and
 // broadcasts every received message to all connected WebSocket clients.
-func (h *Hub) subscribeRedis(ctx context.Context, rdb rueidis.Client, channel string) {
+func (h *hub) SubscribeRedis(ctx context.Context, rdb rueidis.Client, channel string) {
 	err := rdb.Receive(ctx, rdb.B().Subscribe().Channel(channel).Build(),
 		func(msg rueidis.PubSubMessage) {
-			h.broadcast([]byte(msg.Message))
+			h.Broadcast([]byte(msg.Message))
 		})
 	if err != nil && ctx.Err() == nil {
 		h.logger.Warn().Err(err).Msg("ws hub: redis subscribe loop ended")

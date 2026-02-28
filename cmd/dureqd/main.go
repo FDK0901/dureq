@@ -77,10 +77,11 @@ func main() {
 	}
 
 	// Start monitoring API — HTTP (wired to server's store and dispatcher).
-	api := monitor.NewAPI(srv.Store(), srv.Dispatcher(), logger)
+	svc := monitor.NewAPIService(srv.Store(), srv.Dispatcher(), logger)
 	if w := srv.Worker(); w != nil {
-		api.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
+		svc.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
 	}
+	api := monitor.NewAPI(svc)
 	httpSrv := &http.Server{Addr: apiAddr, Handler: api.Handler()}
 	go func() {
 		logger.Info().String("addr", apiAddr).Msg("monitoring HTTP API listening")

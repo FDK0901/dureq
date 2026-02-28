@@ -1,72 +1,40 @@
 package monitor
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
-	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 )
 
-// Dispatcher abstracts job dispatch and event publishing for the monitor API.
-// v1server provides *dispatcher.Dispatcher; v2 actor server provides actorDispatcher.
-type Dispatcher interface {
-	Dispatch(ctx context.Context, job *types.Job, attempt int) error
-	PublishEvent(event types.JobEvent)
-}
-
-// SyncRetryStatsFunc is a function that returns the current SyncRetrier stats
-// as a JSON-serializable value. Set via SetSyncRetryStatsFunc.
-type SyncRetryStatsFunc func() any
-
 // API serves the monitoring HTTP endpoints for the React UI.
+// It is a thin wrapper around APIService that handles HTTP parameter parsing
+// and JSON response formatting.
 type API struct {
-	store      *store.RedisStore
-	dispatcher Dispatcher
-	logger     gochainedlog.Logger
-	mux        *http.ServeMux
-
-	hub       *Hub
-	hubCancel context.CancelFunc
-
-	syncRetryStats SyncRetryStatsFunc
+	svc    *APIService
+	mux    *http.ServeMux
 }
 
-// NewAPI creates a new monitoring API backed by Redis.
-func NewAPI(s *store.RedisStore, disp Dispatcher, logger gochainedlog.Logger) *API {
-	if logger == nil {
-		logger = chainedslog.NewSlog(chainedslog.NewSlogBase())
-	}
-
-	hubCtx, hubCancel := context.WithCancel(context.Background())
-	hub := newHub(logger)
-	go hub.subscribeRedis(hubCtx, s.Client(), store.EventsPubSubChannel(s.Prefix()))
-
+// NewAPI creates a new monitoring HTTP API backed by an APIService.
+func NewAPI(svc *APIService) *API {
 	api := &API{
-		store:      s,
-		dispatcher: disp,
-		logger:     logger,
-		mux:        http.NewServeMux(),
-		hub:        hub,
-		hubCancel:  hubCancel,
+		svc: svc,
+		mux: http.NewServeMux(),
 	}
 	api.registerRoutes()
 	return api
 }
 
-// SetSyncRetryStatsFunc sets the function used to retrieve SyncRetrier stats.
-func (a *API) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
-	a.syncRetryStats = fn
-}
-
 // Handler returns the HTTP handler for mounting in a server.
 func (a *API) Handler() http.Handler {
 	return corsMiddleware(a.mux)
+}
+
+// Shutdown stops the WebSocket hub's Redis subscription.
+func (a *API) Shutdown() {
+	a.svc.Shutdown()
 }
 
 func (a *API) registerRoutes() {
@@ -154,15 +122,12 @@ func (a *API) registerRoutes() {
 	a.mux.HandleFunc("GET /api/health", a.health)
 
 	// WebSocket (real-time events)
-	a.mux.HandleFunc("/api/ws", handleWebSocket(a.hub, a.logger))
+	a.mux.HandleFunc("/api/ws", HandleWebSocket(a.svc.Hub(), a.svc.Logger()))
 }
 
-// Shutdown stops the WebSocket hub's Redis subscription.
-func (a *API) Shutdown() {
-	a.hubCancel()
-}
-
-// --- Jobs ---
+// ---------------------------------------------------------------------------
+// Jobs
+// ---------------------------------------------------------------------------
 
 func (a *API) listJobs(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
@@ -187,238 +152,162 @@ func (a *API) listJobs(w http.ResponseWriter, r *http.Request) {
 		filter.Search = &search
 	}
 
-	jobs, total, err := a.store.ListJobsPaginated(r.Context(), filter)
+	jobs, total, err := a.svc.ListJobs(r.Context(), filter)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, paginatedResponse{Data: jobs, Total: total})
+	jsonOK(w, paginatedResponse{Data: jobs, Total: total})
 }
 
 func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobID")
-	job, _, err := a.store.GetJob(r.Context(), jobID)
+	job, _, err := a.svc.GetJob(r.Context(), r.PathValue("jobID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, job)
+	jsonOK(w, job)
 }
 
 func (a *API) cancelJob(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	jobID := r.PathValue("jobID")
-
-	job, rev, err := a.store.GetJob(ctx, jobID)
-	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+	if err := a.svc.CancelJob(r.Context(), jobID); err != nil {
+		writeServiceError(w, err)
 		return
 	}
-	if job.Status.IsTerminal() {
-		a.jsonError(w, &apiError{msg: "job is already in terminal state"}, http.StatusBadRequest)
-		return
-	}
-
-	now := time.Now()
-	job.Status = types.JobStatusCancelled
-	job.UpdatedAt = now
-
-	if _, err := a.store.UpdateJob(ctx, job, rev); err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
-		return
-	}
-
-	a.store.DeleteSchedule(ctx, jobID)
-
-	// Publish cancel signals to in-flight workers via Redis Pub/Sub.
-	runs, _ := a.store.ListActiveRunsByJobID(ctx, jobID)
-	for _, run := range runs {
-		a.store.Client().Do(ctx, a.store.Client().B().Publish().Channel(a.store.CancelChannel()).Message(run.ID).Build())
-	}
-
-	a.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventJobCancelled,
-		JobID:     jobID,
-		Timestamp: now,
-	})
-
-	a.jsonOK(w, map[string]string{"status": "cancelled", "job_id": jobID})
+	jsonOK(w, map[string]string{"status": "cancelled", "job_id": jobID})
 }
 
 func (a *API) retryJob(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	jobID := r.PathValue("jobID")
-
-	job, rev, err := a.store.GetJob(ctx, jobID)
-	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+	if err := a.svc.RetryJob(r.Context(), jobID); err != nil {
+		writeServiceError(w, err)
 		return
 	}
-
-	now := time.Now()
-	job.Status = types.JobStatusPending
-	job.Attempt = 0
-	job.LastError = nil
-	job.UpdatedAt = now
-
-	if _, err := a.store.UpdateJob(ctx, job, rev); err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
-		return
-	}
-
-	if err := a.dispatcher.Dispatch(ctx, job, 0); err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
-		return
-	}
-
-	a.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventJobRetrying,
-		JobID:     jobID,
-		Timestamp: now,
-	})
-
-	a.jsonOK(w, map[string]string{"status": "retried", "job_id": jobID})
+	jsonOK(w, map[string]string{"status": "retried", "job_id": jobID})
 }
 
 func (a *API) deleteJob(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	jobID := r.PathValue("jobID")
-
-	if err := a.store.DeleteJob(ctx, jobID); err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+	if err := a.svc.DeleteJob(r.Context(), jobID); err != nil {
+		writeServiceError(w, err)
 		return
 	}
-	a.store.DeleteSchedule(ctx, jobID)
-
-	a.jsonOK(w, map[string]string{"status": "deleted", "job_id": jobID})
+	jsonOK(w, map[string]string{"status": "deleted", "job_id": jobID})
 }
 
 func (a *API) listJobEvents(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobID")
-	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
-	if limit > maxPageLimit {
-		limit = maxPageLimit
-	}
-	events, _, err := a.store.ListJobEvents(r.Context(), store.EventFilter{
-		JobID: &jobID,
-		Limit: limit,
-	})
+	limit := parseIntQuery(r, "limit", 50, maxPageLimit)
+	events, err := a.svc.ListJobEvents(r.Context(), r.PathValue("jobID"), limit)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, events)
+	jsonOK(w, events)
 }
 
 func (a *API) listJobRuns(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobID")
-	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
-	if limit > maxPageLimit {
-		limit = maxPageLimit
-	}
-	runs, _, err := a.store.ListJobRuns(r.Context(), store.RunFilter{
-		JobID: &jobID,
-		Limit: limit,
-	})
+	limit := parseIntQuery(r, "limit", 50, maxPageLimit)
+	runs, err := a.svc.ListJobRuns(r.Context(), r.PathValue("jobID"), limit)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, runs)
+	jsonOK(w, runs)
 }
 
-// --- Schedules ---
+func (a *API) updateJobPayload(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobID")
+
+	var body struct {
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+
+	if err := a.svc.UpdateJobPayload(r.Context(), jobID, body.Payload); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "updated", "job_id": jobID})
+}
+
+// ---------------------------------------------------------------------------
+// Schedules
+// ---------------------------------------------------------------------------
 
 func (a *API) listSchedules(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
-
-	filter := store.ScheduleFilter{
-		Sort:   pp.Sort,
-		Limit:  pp.Limit,
-		Offset: pp.Offset,
-	}
-	schedules, total, err := a.store.ListSchedulesPaginated(r.Context(), filter)
+	schedules, total, err := a.svc.ListSchedules(r.Context(), pp.Sort, pp.Limit, pp.Offset)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, paginatedResponse{Data: schedules, Total: total})
+	jsonOK(w, paginatedResponse{Data: schedules, Total: total})
 }
 
 func (a *API) getSchedule(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobID")
-	sched, _, err := a.store.GetSchedule(r.Context(), jobID)
+	sched, err := a.svc.GetSchedule(r.Context(), r.PathValue("jobID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, sched)
+	jsonOK(w, sched)
 }
 
-// --- Nodes ---
+// ---------------------------------------------------------------------------
+// Nodes
+// ---------------------------------------------------------------------------
 
 func (a *API) listNodes(w http.ResponseWriter, r *http.Request) {
-	nodes, err := a.store.ListNodes(r.Context())
+	nodes, err := a.svc.ListNodes(r.Context())
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, nodes)
+	jsonOK(w, nodes)
 }
 
 func (a *API) getNode(w http.ResponseWriter, r *http.Request) {
-	nodeID := r.PathValue("nodeID")
-	node, err := a.store.GetNode(r.Context(), nodeID)
+	node, err := a.svc.GetNode(r.Context(), r.PathValue("nodeID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	if node == nil {
-		a.jsonError(w, types.ErrJobNotFound, http.StatusNotFound)
-		return
-	}
-	a.jsonOK(w, node)
+	jsonOK(w, node)
 }
 
-// --- Runs ---
+// ---------------------------------------------------------------------------
+// Runs
+// ---------------------------------------------------------------------------
 
 func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := a.store.ListRuns(r.Context())
+	runs, err := a.svc.ListActiveRuns(r.Context())
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, runs)
+	jsonOK(w, runs)
 }
 
 func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
-	runID := r.PathValue("runID")
-	run, _, err := a.store.GetRun(r.Context(), runID)
+	run, err := a.svc.GetRun(r.Context(), r.PathValue("runID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, run)
+	jsonOK(w, run)
 }
 
 func (a *API) getRunProgress(w http.ResponseWriter, r *http.Request) {
-	runID := r.PathValue("runID")
-	run, _, err := a.store.GetRun(r.Context(), runID)
+	run, err := a.svc.GetRun(r.Context(), r.PathValue("runID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, map[string]any{
+	jsonOK(w, map[string]any{
 		"run_id":            run.ID,
 		"status":            run.Status,
 		"progress":          run.Progress,
@@ -427,10 +316,9 @@ func (a *API) getRunProgress(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) getJobProgress(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobID")
-	runs, err := a.store.ListActiveRunsByJobID(r.Context(), jobID)
+	runs, err := a.svc.GetJobActiveRuns(r.Context(), r.PathValue("jobID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
 	result := make([]map[string]any, 0, len(runs))
@@ -442,14 +330,15 @@ func (a *API) getJobProgress(w http.ResponseWriter, r *http.Request) {
 			"last_heartbeat_at": run.LastHeartbeatAt,
 		})
 	}
-	a.jsonOK(w, result)
+	jsonOK(w, result)
 }
 
-// --- History ---
+// ---------------------------------------------------------------------------
+// History
+// ---------------------------------------------------------------------------
 
 func (a *API) listHistoryRuns(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
-
 	filter := store.RunFilter{
 		Sort:   pp.Sort,
 		Limit:  pp.Limit,
@@ -462,25 +351,17 @@ func (a *API) listHistoryRuns(w http.ResponseWriter, r *http.Request) {
 	if jid := r.URL.Query().Get("job_id"); jid != "" {
 		filter.JobID = &jid
 	}
-	runs, total, err := a.store.ListJobRuns(r.Context(), filter)
+	runs, total, err := a.svc.ListHistoryRuns(r.Context(), filter)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, paginatedResponse{Data: runs, Total: total})
+	jsonOK(w, paginatedResponse{Data: runs, Total: total})
 }
 
 func (a *API) listHistoryEvents(w http.ResponseWriter, r *http.Request) {
-	limit := 50
+	limit := parseIntQuery(r, "limit", 50, maxPageLimit)
 	offset := 0
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
-	if limit > maxPageLimit {
-		limit = maxPageLimit
-	}
 	if o := r.URL.Query().Get("offset"); o != "" {
 		if parsed, err := strconv.Atoi(o); err == nil && parsed >= 0 {
 			offset = parsed
@@ -490,40 +371,34 @@ func (a *API) listHistoryEvents(w http.ResponseWriter, r *http.Request) {
 	if jid := r.URL.Query().Get("job_id"); jid != "" {
 		filter.JobID = &jid
 	}
-	events, total, err := a.store.ListJobEvents(r.Context(), filter)
+	events, total, err := a.svc.ListHistoryEvents(r.Context(), filter)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, map[string]any{"data": events, "total": total})
+	jsonOK(w, map[string]any{"data": events, "total": total})
 }
 
-// --- DLQ ---
+// ---------------------------------------------------------------------------
+// DLQ
+// ---------------------------------------------------------------------------
 
 func (a *API) listDLQ(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
-	msgs, err := a.store.ListDLQ(r.Context(), 1000)
+	msgs, total, err := a.svc.ListDLQ(r.Context(), pp.Limit, pp.Offset)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	total := len(msgs)
-	if pp.Offset < len(msgs) {
-		msgs = msgs[pp.Offset:]
-	} else {
-		msgs = nil
-	}
-	if pp.Limit > 0 && len(msgs) > pp.Limit {
-		msgs = msgs[:pp.Limit]
-	}
-	a.jsonOK(w, paginatedResponse{Data: msgs, Total: total})
+	jsonOK(w, paginatedResponse{Data: msgs, Total: total})
 }
 
-// --- Workflows ---
+// ---------------------------------------------------------------------------
+// Workflows
+// ---------------------------------------------------------------------------
 
 func (a *API) listWorkflows(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
-
 	filter := store.WorkflowFilter{
 		Sort:   pp.Sort,
 		Limit:  pp.Limit,
@@ -533,123 +408,47 @@ func (a *API) listWorkflows(w http.ResponseWriter, r *http.Request) {
 		status := types.WorkflowStatus(s)
 		filter.Status = &status
 	}
-	workflows, total, err := a.store.ListWorkflowInstances(r.Context(), filter)
+	workflows, total, err := a.svc.ListWorkflows(r.Context(), filter)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, paginatedResponse{Data: workflows, Total: total})
+	jsonOK(w, paginatedResponse{Data: workflows, Total: total})
 }
 
 func (a *API) getWorkflow(w http.ResponseWriter, r *http.Request) {
-	wfID := r.PathValue("workflowID")
-	wf, _, err := a.store.GetWorkflow(r.Context(), wfID)
+	wf, err := a.svc.GetWorkflow(r.Context(), r.PathValue("workflowID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, wf)
+	jsonOK(w, wf)
 }
 
 func (a *API) cancelWorkflow(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	wfID := r.PathValue("workflowID")
-
-	wf, rev, err := a.store.GetWorkflow(ctx, wfID)
-	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+	if err := a.svc.CancelWorkflow(r.Context(), wfID); err != nil {
+		writeServiceError(w, err)
 		return
 	}
-	if wf.Status.IsTerminal() {
-		a.jsonError(w, &apiError{msg: "workflow is already in terminal state"}, http.StatusBadRequest)
-		return
-	}
-
-	now := time.Now()
-	wf.Status = types.WorkflowStatusCancelled
-	wf.CompletedAt = &now
-	wf.UpdatedAt = now
-
-	// Cancel non-terminal tasks.
-	for name, state := range wf.Tasks {
-		if !state.Status.IsTerminal() {
-			state.Status = types.JobStatusCancelled
-			state.FinishedAt = &now
-			wf.Tasks[name] = state
-
-			// Cancel the child job if it exists.
-			if state.JobID != "" {
-				if childJob, childRev, err := a.store.GetJob(ctx, state.JobID); err == nil {
-					if !childJob.Status.IsTerminal() {
-						childJob.Status = types.JobStatusCancelled
-						childJob.UpdatedAt = now
-						a.store.UpdateJob(ctx, childJob, childRev)
-					}
-				}
-			}
-		}
-	}
-
-	if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
-		return
-	}
-
-	a.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventWorkflowCancelled,
-		JobID:     wfID,
-		Timestamp: now,
-	})
-
-	a.jsonOK(w, map[string]string{"status": "cancelled", "workflow_id": wfID})
+	jsonOK(w, map[string]string{"status": "cancelled", "workflow_id": wfID})
 }
 
 func (a *API) retryWorkflow(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	wfID := r.PathValue("workflowID")
-
-	wf, rev, err := a.store.GetWorkflow(ctx, wfID)
-	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+	if err := a.svc.RetryWorkflow(r.Context(), wfID); err != nil {
+		writeServiceError(w, err)
 		return
 	}
-
-	now := time.Now()
-	wf.Attempt++
-	wf.Status = types.WorkflowStatusRunning
-	wf.UpdatedAt = now
-	wf.CompletedAt = nil
-
-	// Reset all tasks to pending.
-	for name, state := range wf.Tasks {
-		state.Status = types.JobStatusPending
-		state.JobID = ""
-		state.Error = nil
-		state.StartedAt = nil
-		state.FinishedAt = nil
-		wf.Tasks[name] = state
-	}
-
-	if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
-		return
-	}
-
-	a.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventWorkflowRetrying,
-		JobID:     wfID,
-		Attempt:   wf.Attempt,
-		Timestamp: now,
-	})
-
-	a.jsonOK(w, map[string]string{"status": "retried", "workflow_id": wfID})
+	jsonOK(w, map[string]string{"status": "retried", "workflow_id": wfID})
 }
 
-// --- Batches ---
+// ---------------------------------------------------------------------------
+// Batches
+// ---------------------------------------------------------------------------
 
 func (a *API) listBatches(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
-
 	filter := store.BatchFilter{
 		Sort:   pp.Sort,
 		Limit:  pp.Limit,
@@ -659,103 +458,51 @@ func (a *API) listBatches(w http.ResponseWriter, r *http.Request) {
 		status := types.WorkflowStatus(s)
 		filter.Status = &status
 	}
-	batches, total, err := a.store.ListBatchInstances(r.Context(), filter)
+	batches, total, err := a.svc.ListBatches(r.Context(), filter)
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, paginatedResponse{Data: batches, Total: total})
+	jsonOK(w, paginatedResponse{Data: batches, Total: total})
 }
 
 func (a *API) getBatch(w http.ResponseWriter, r *http.Request) {
-	batchID := r.PathValue("batchID")
-	batch, _, err := a.store.GetBatch(r.Context(), batchID)
+	batch, err := a.svc.GetBatch(r.Context(), r.PathValue("batchID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, batch)
+	jsonOK(w, batch)
 }
 
 func (a *API) getBatchResults(w http.ResponseWriter, r *http.Request) {
-	batchID := r.PathValue("batchID")
-	results, err := a.store.ListBatchItemResults(r.Context(), batchID)
+	results, err := a.svc.GetBatchResults(r.Context(), r.PathValue("batchID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	a.jsonOK(w, results)
+	jsonOK(w, results)
 }
 
 func (a *API) getBatchItemResult(w http.ResponseWriter, r *http.Request) {
-	batchID := r.PathValue("batchID")
-	itemID := r.PathValue("itemID")
-	result, err := a.store.GetBatchItemResult(r.Context(), batchID, itemID)
+	result, err := a.svc.GetBatchItemResult(r.Context(), r.PathValue("batchID"), r.PathValue("itemID"))
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-	if result == nil {
-		a.jsonError(w, types.ErrBatchNotFound, http.StatusNotFound)
-		return
-	}
-	a.jsonOK(w, result)
+	jsonOK(w, result)
 }
 
 func (a *API) cancelBatch(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	batchID := r.PathValue("batchID")
-
-	batch, rev, err := a.store.GetBatch(ctx, batchID)
-	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+	if err := a.svc.CancelBatch(r.Context(), batchID); err != nil {
+		writeServiceError(w, err)
 		return
 	}
-	if batch.Status.IsTerminal() {
-		a.jsonError(w, &apiError{msg: "batch is already in terminal state"}, http.StatusBadRequest)
-		return
-	}
-
-	now := time.Now()
-	batch.Status = types.WorkflowStatusCancelled
-	batch.CompletedAt = &now
-	batch.UpdatedAt = now
-
-	// Cancel in-flight child jobs.
-	for id, state := range batch.ItemStates {
-		if !state.Status.IsTerminal() {
-			state.Status = types.JobStatusCancelled
-			state.FinishedAt = &now
-			batch.ItemStates[id] = state
-
-			if state.JobID != "" {
-				if childJob, childRev, err := a.store.GetJob(ctx, state.JobID); err == nil {
-					if !childJob.Status.IsTerminal() {
-						childJob.Status = types.JobStatusCancelled
-						childJob.UpdatedAt = now
-						a.store.UpdateJob(ctx, childJob, childRev)
-					}
-				}
-			}
-		}
-	}
-
-	if _, err := a.store.UpdateBatch(ctx, batch, rev); err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
-		return
-	}
-
-	a.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventBatchCancelled,
-		JobID:     batchID,
-		Timestamp: now,
-	})
-
-	a.jsonOK(w, map[string]string{"status": "cancelled", "batch_id": batchID})
+	jsonOK(w, map[string]string{"status": "cancelled", "batch_id": batchID})
 }
 
 func (a *API) retryBatch(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	batchID := r.PathValue("batchID")
 
 	// Parse optional body for retry_failed_only flag.
@@ -769,103 +516,247 @@ func (a *API) retryBatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	batch, rev, err := a.store.GetBatch(ctx, batchID)
+	if err := a.svc.RetryBatch(r.Context(), batchID, retryFailedOnly); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "retried", "batch_id": batchID})
+}
+
+// ---------------------------------------------------------------------------
+// Groups
+// ---------------------------------------------------------------------------
+
+func (a *API) listGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := a.svc.ListGroups(r.Context())
 	if err != nil {
-		a.jsonError(w, err, http.StatusNotFound)
+		writeServiceError(w, err)
 		return
 	}
+	jsonOK(w, groups)
+}
 
-	now := time.Now()
-	batch.Attempt++
-	batch.Status = types.WorkflowStatusRunning
-	batch.UpdatedAt = now
-	batch.CompletedAt = nil
+// ---------------------------------------------------------------------------
+// Queues
+// ---------------------------------------------------------------------------
 
-	// Reset items.
-	batch.FailedItems = 0
-	batch.RunningItems = 0
-	batch.PendingItems = 0
-	batch.CompletedItems = 0
+func (a *API) listQueues(w http.ResponseWriter, r *http.Request) {
+	queues, err := a.svc.ListQueues(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, queues)
+}
 
-	for id, state := range batch.ItemStates {
-		if retryFailedOnly && state.Status != types.JobStatusFailed {
-			if state.Status == types.JobStatusCompleted {
-				batch.CompletedItems++
-			}
-			continue
+func (a *API) pauseQueue(w http.ResponseWriter, r *http.Request) {
+	tierName := r.PathValue("tierName")
+	if err := a.svc.PauseQueue(r.Context(), tierName); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "paused", "queue": tierName})
+}
+
+func (a *API) resumeQueue(w http.ResponseWriter, r *http.Request) {
+	tierName := r.PathValue("tierName")
+	if err := a.svc.ResumeQueue(r.Context(), tierName); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "resumed", "queue": tierName})
+}
+
+// ---------------------------------------------------------------------------
+// Bulk operations
+// ---------------------------------------------------------------------------
+
+func (a *API) parseBulkRequest(r *http.Request) (BulkRequest, error) {
+	var req BulkRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return req, err
 		}
-		state.Status = types.JobStatusPending
-		state.JobID = ""
-		state.Error = nil
-		state.StartedAt = nil
-		state.FinishedAt = nil
-		batch.ItemStates[id] = state
-		batch.PendingItems++
 	}
-	batch.NextChunkIndex = 0
+	if len(req.IDs) > maxPageLimit {
+		req.IDs = req.IDs[:maxPageLimit]
+	}
+	return req, nil
+}
 
-	if _, err := a.store.UpdateBatch(ctx, batch, rev); err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+func (a *API) bulkCancelJobs(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-
-	a.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventBatchRetrying,
-		JobID:     batchID,
-		Attempt:   batch.Attempt,
-		Timestamp: now,
-	})
-
-	a.jsonOK(w, map[string]string{"status": "retried", "batch_id": batchID})
+	affected, err := a.svc.BulkCancelJobs(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
 }
 
-// --- Stats ---
-
-type statsResponse struct {
-	JobCounts       map[types.JobStatus]int `json:"job_counts"`
-	ActiveSchedules int                     `json:"active_schedules"`
-	ActiveRuns      int                     `json:"active_runs"`
-	ActiveNodes     int                     `json:"active_nodes"`
+func (a *API) bulkRetryJobs(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	affected, err := a.svc.BulkRetryJobs(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
 }
+
+func (a *API) bulkDeleteJobs(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	affected, err := a.svc.BulkDeleteJobs(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
+}
+
+func (a *API) bulkCancelWorkflows(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	affected, err := a.svc.BulkCancelWorkflows(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
+}
+
+func (a *API) bulkRetryWorkflows(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	affected, err := a.svc.BulkRetryWorkflows(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
+}
+
+func (a *API) bulkDeleteWorkflows(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	affected, err := a.svc.BulkDeleteWorkflows(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
+}
+
+func (a *API) bulkCancelBatches(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	affected, err := a.svc.BulkCancelBatches(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
+}
+
+func (a *API) bulkRetryBatches(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	affected, err := a.svc.BulkRetryBatches(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
+}
+
+func (a *API) bulkDeleteBatches(w http.ResponseWriter, r *http.Request) {
+	req, err := a.parseBulkRequest(r)
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	affected, err := a.svc.BulkDeleteBatches(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int{"affected": affected})
+}
+
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
 
 func (a *API) getStats(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	jobCounts, err := a.store.GetActiveJobStats(ctx)
+	stats, err := a.svc.GetStats(r.Context())
 	if err != nil {
-		a.jsonError(w, err, http.StatusInternalServerError)
+		writeServiceError(w, err)
 		return
 	}
-
-	schedules, _ := a.store.ListSchedules(ctx)
-	runs, _ := a.store.ListRuns(ctx)
-	nodes, _ := a.store.ListNodes(ctx)
-
-	a.jsonOK(w, statsResponse{
-		JobCounts:       jobCounts,
-		ActiveSchedules: len(schedules),
-		ActiveRuns:      len(runs),
-		ActiveNodes:     len(nodes),
-	})
+	jsonOK(w, stats)
 }
 
-// --- Sync Retries ---
+func (a *API) getDailyStats(w http.ResponseWriter, r *http.Request) {
+	days := parseIntQuery(r, "days", 7, 90)
+	entries, err := a.svc.GetDailyStats(r.Context(), days)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, entries)
+}
+
+func (a *API) getRedisInfo(w http.ResponseWriter, r *http.Request) {
+	sections, err := a.svc.GetRedisInfo(r.Context(), r.URL.Query().Get("section"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, sections)
+}
 
 func (a *API) getSyncRetries(w http.ResponseWriter, _ *http.Request) {
-	if a.syncRetryStats == nil {
-		a.jsonOK(w, map[string]any{"pending": 0, "failed": 0, "recent": []any{}})
-		return
-	}
-	a.jsonOK(w, a.syncRetryStats())
+	jsonOK(w, a.svc.GetSyncRetries())
 }
 
-// --- Health ---
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
 
 func (a *API) health(w http.ResponseWriter, _ *http.Request) {
-	a.jsonOK(w, map[string]string{"status": "ok"})
+	jsonOK(w, map[string]string{"status": "ok"})
 }
 
-// --- Pagination ---
+// ---------------------------------------------------------------------------
+// Pagination & helpers
+// ---------------------------------------------------------------------------
 
 const maxPageLimit = 100
 
@@ -896,26 +787,49 @@ func parsePageParams(r *http.Request) pageParams {
 	return p
 }
 
+// parseIntQuery parses an integer query parameter with a default and max cap.
+func parseIntQuery(r *http.Request, key string, defaultVal, maxVal int) int {
+	v := defaultVal
+	if s := r.URL.Query().Get(key); s != "" {
+		if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
+			v = parsed
+		}
+	}
+	if v > maxVal {
+		v = maxVal
+	}
+	return v
+}
+
 type paginatedResponse struct {
 	Data  any `json:"data"`
 	Total int `json:"total"`
 }
 
-type apiError struct{ msg string }
-
-func (e *apiError) Error() string { return e.msg }
-
-// --- Helpers ---
-
-func (a *API) jsonOK(w http.ResponseWriter, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+// ApiError is a service-layer error that carries an HTTP status code.
+// Handlers can type-assert errors to *ApiError to extract the status code.
+type ApiError struct {
+	Msg        string `json:"error"`
+	StatusCode int    `json:"-"`
 }
 
-func (a *API) jsonError(w http.ResponseWriter, err error, code int) {
+func (e *ApiError) Error() string { return e.Msg }
+
+// writeServiceError writes a JSON error response, extracting the status code
+// from *ApiError if available.
+func writeServiceError(w http.ResponseWriter, err error) {
+	code := http.StatusInternalServerError
+	if apiErr, ok := err.(*ApiError); ok {
+		code = apiErr.StatusCode
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+}
+
+func jsonOK(w http.ResponseWriter, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

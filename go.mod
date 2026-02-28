@@ -9,6 +9,7 @@ require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/coder/websocket v1.8.14
 	github.com/knadh/koanf/parsers/yaml v1.1.0
 	github.com/knadh/koanf/providers/file v1.2.1
 	github.com/knadh/koanf/v2 v2.3.2
@@ -20,7 +21,6 @@ require (
 	github.com/rs/zerolog v1.34.0
 	google.golang.org/grpc v1.60.1
 	google.golang.org/protobuf v1.36.11
-	nhooyr.io/websocket v1.8.17
 )
 
 require (

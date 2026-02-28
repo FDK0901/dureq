@@ -155,6 +155,10 @@ func (eb *EventBridgeActor) onWorkerDone(ctx *actor.Context, msg *messages.Worke
 		eb.logger.Error().String("run_id", msg.RunID).String("job_id", msg.JobID).Err(err).Msg("event bridge: CompleteRun pipeline failed")
 	}
 
+	// Update the Job record's status to reflect the run outcome.
+	// Without this, jobs stay "pending" in the jobs tab even after completion.
+	eb.updateJobStatus(bgCtx, msg.JobID, msg.Success, msg.Error)
+
 	// Forward to OrchestratorActor if workflow/batch job.
 	if eb.orchestratorPID != nil && (msg.WorkflowID != "" || msg.BatchID != "") {
 		domainEvent := messages.JobEventToDomainEvent(event)
@@ -237,4 +241,31 @@ func (eb *EventBridgeActor) onDomainEvent(ctx *actor.Context, msg *pb.DomainEven
 	}
 
 	eb.logger.Debug().String("type", string(msg.Type)).String("job_id", msg.JobId).Msg("event bridge: forwarded domain event")
+}
+
+// updateJobStatus sets the Job record to completed or failed after its run finishes.
+// Uses best-effort CAS — a conflict means another update already happened, which is fine.
+func (eb *EventBridgeActor) updateJobStatus(ctx context.Context, jobID string, success bool, errMsg string) {
+	job, rev, err := eb.store.GetJob(ctx, jobID)
+	if err != nil {
+		return
+	}
+	if job.Status.IsTerminal() {
+		return // already in a terminal state
+	}
+
+	now := time.Now()
+	if success {
+		job.Status = types.JobStatusCompleted
+	} else {
+		job.Status = types.JobStatusFailed
+		if errMsg != "" {
+			job.LastError = &errMsg
+		}
+	}
+	job.UpdatedAt = now
+
+	if _, err := eb.store.UpdateJob(ctx, job, rev); err != nil {
+		eb.logger.Debug().String("job_id", jobID).Err(err).Msg("event bridge: best-effort job status update failed")
+	}
 }

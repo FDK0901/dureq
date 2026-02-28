@@ -6,7 +6,7 @@ import (
 	"time"
 
 	gochainedlog "github.com/FDK0901/go-chainedlog"
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 const (
@@ -14,7 +14,9 @@ const (
 	wsWriteTimeout = 10 * time.Second
 )
 
-func handleWebSocket(hub *Hub, logger gochainedlog.Logger) http.HandlerFunc {
+// HandleWebSocket returns an http.HandlerFunc that upgrades connections to
+// WebSocket and streams real-time events from the Hub.
+func HandleWebSocket(hub Hub, logger gochainedlog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,
@@ -25,13 +27,11 @@ func handleWebSocket(hub *Hub, logger gochainedlog.Logger) http.HandlerFunc {
 		}
 		defer conn.CloseNow()
 
-		client := &wsClient{
-			send: make(chan []byte, wsSendBufferSize),
-		}
-		hub.register(client)
-		defer hub.unregister(client)
+		client := NewWSClient()
+		hub.Register(client)
+		defer hub.Unregister(client)
 
-		logger.Debug().Int("total_clients", hub.clientCount()).Msg("ws: client connected")
+		logger.Debug().Int("total_clients", hub.ClientCount()).Msg("ws: client connected")
 
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
@@ -56,7 +56,7 @@ func handleWebSocket(hub *Hub, logger gochainedlog.Logger) http.HandlerFunc {
 			case <-ctx.Done():
 				conn.Close(websocket.StatusNormalClosure, "server shutting down")
 				return
-			case msg, ok := <-client.send:
+			case msg, ok := <-client.Send:
 				if !ok {
 					conn.Close(websocket.StatusNormalClosure, "")
 					return

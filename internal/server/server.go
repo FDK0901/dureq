@@ -312,6 +312,12 @@ func (s *Server) onSingletonsReady(scheduler, orchestrator, dispatcher *actor.PI
 		s.engine.Send(s.eventBridgePID, messages.WireOrchestratorPIDMsg{PID: orchestrator})
 	}
 
+	// Wire orchestrator PID to actorDispatcher so API-triggered events
+	// (batch retry, workflow retry) reach the orchestrator singleton.
+	if orchestrator != nil {
+		s.disp.SetOrchestratorPID(s.engine, orchestrator)
+	}
+
 	s.cfg.Logger.Info().String("scheduler", scheduler.String()).String("orchestrator", orchestrator.String()).String("dispatcher", dispatcher.String()).Msg("singletons ready")
 }
 

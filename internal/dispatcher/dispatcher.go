@@ -52,7 +52,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) 
 	}
 
 	// Resolve the tier name from priority.
-	tierName := resolveTier(d.store.Config().Tiers, priority)
+	tierName := store.ResolveTier(d.store.Config().Tiers, int(priority))
 
 	msgID, err := d.store.DispatchWork(ctx, tierName, &msg)
 	if err != nil {
@@ -121,36 +121,7 @@ func (d *Dispatcher) Store() *store.RedisStore {
 	return d.store
 }
 
-// resolveTier maps a numeric priority to a configured tier name.
-// Uses the tier list (sorted by weight descending): high priority → first tier, etc.
+// resolveTier delegates to store.ResolveTier for backward compatibility.
 func resolveTier(tiers []store.TierConfig, priority types.Priority) string {
-	if len(tiers) == 0 {
-		return "normal"
-	}
-	if len(tiers) == 1 {
-		return tiers[0].Name
-	}
-
-	// Map priority 1-10 into tier buckets based on weight distribution.
-	// Higher priority values → higher weight tiers.
-	p := int(priority)
-	if p <= 0 {
-		p = 5
-	}
-	if p > 10 {
-		p = 10
-	}
-
-	// Simple approach: divide the 1-10 range into N equal buckets.
-	// Priority 10 → first tier (highest weight), priority 1 → last tier (lowest weight).
-	bucketSize := 10 / len(tiers)
-	if bucketSize == 0 {
-		bucketSize = 1
-	}
-
-	idx := (10 - p) / bucketSize
-	if idx >= len(tiers) {
-		idx = len(tiers) - 1
-	}
-	return tiers[idx].Name
+	return store.ResolveTier(tiers, int(priority))
 }

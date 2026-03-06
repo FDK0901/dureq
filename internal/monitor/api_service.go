@@ -377,6 +377,13 @@ func (a *APIService) CancelWorkflow(ctx context.Context, wfID string) error {
 						childJob.Status = types.JobStatusCancelled
 						childJob.UpdatedAt = now
 						a.store.UpdateJob(ctx, childJob, childRev)
+
+						// Signal active runs for this child job.
+						if runs, _ := a.store.ListActiveRunsByJobID(ctx, state.JobID); len(runs) > 0 {
+							for _, run := range runs {
+								a.store.Client().Do(ctx, a.store.Client().B().Publish().Channel(a.store.CancelChannel()).Message(run.ID).Build())
+							}
+						}
 					}
 				}
 			}
@@ -496,6 +503,13 @@ func (a *APIService) CancelBatch(ctx context.Context, batchID string) error {
 						childJob.Status = types.JobStatusCancelled
 						childJob.UpdatedAt = now
 						a.store.UpdateJob(ctx, childJob, childRev)
+
+						// Signal active runs for this child job.
+						if runs, _ := a.store.ListActiveRunsByJobID(ctx, state.JobID); len(runs) > 0 {
+							for _, run := range runs {
+								a.store.Client().Do(ctx, a.store.Client().B().Publish().Channel(a.store.CancelChannel()).Message(run.ID).Build())
+							}
+						}
 					}
 				}
 			}

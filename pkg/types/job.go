@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand"
 	"time"
 )
 
@@ -80,6 +82,23 @@ func DefaultRetryPolicy() *RetryPolicy {
 		Multiplier:   2.0,
 		Jitter:       0.1,
 	}
+}
+
+// CalculateBackoff computes the retry delay for the given attempt using
+// exponential backoff with optional jitter.
+func CalculateBackoff(attempt int, policy *RetryPolicy) time.Duration {
+	delay := float64(policy.InitialDelay) * math.Pow(policy.Multiplier, float64(attempt))
+
+	if time.Duration(delay) > policy.MaxDelay {
+		delay = float64(policy.MaxDelay)
+	}
+
+	if policy.Jitter > 0 {
+		jitterRange := delay * policy.Jitter
+		delay = delay - jitterRange + (rand.Float64() * 2 * jitterRange)
+	}
+
+	return time.Duration(delay)
 }
 
 // ScheduleType defines how a job is scheduled.

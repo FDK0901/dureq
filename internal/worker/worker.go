@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"math/rand/v2"
 	"strconv"
 	"sync"
 	"time"
@@ -699,7 +697,7 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		job.Status = types.JobStatusRetrying
 		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
 		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
-		delay := calculateBackoff(work.Attempt, retryPolicy)
+		delay := types.CalculateBackoff(work.Attempt, retryPolicy)
 		w.store.AddDelayed(w.ctx, sm.TierName, &work, time.Now().Add(delay))
 	}
 
@@ -752,19 +750,3 @@ func (w *Worker) clusterHasTaskType(tt types.TaskType) bool {
 	return false
 }
 
-// calculateBackoff computes exponential backoff with jitter.
-func calculateBackoff(attempt int, policy *types.RetryPolicy) time.Duration {
-	delay := float64(policy.InitialDelay) * math.Pow(policy.Multiplier, float64(attempt))
-
-	if time.Duration(delay) > policy.MaxDelay {
-		delay = float64(policy.MaxDelay)
-	}
-
-	// Add jitter.
-	if policy.Jitter > 0 {
-		jitterRange := delay * policy.Jitter
-		delay = delay - jitterRange + (rand.Float64() * 2 * jitterRange)
-	}
-
-	return time.Duration(delay)
-}

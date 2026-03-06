@@ -260,10 +260,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 	switch job.Schedule.Type {
 	case types.ScheduleImmediate:
 		if err := c.dispatchJob(ctx, job); err != nil {
-			c.store.DeleteJob(ctx, job.ID)
-			if job.UniqueKey != nil && *job.UniqueKey != "" {
-				c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
-			}
+			c.rollbackEnqueue(ctx, job)
 			return nil, fmt.Errorf("dispatch: %w", err)
 		}
 		c.publishEvent(ctx, types.JobEvent{
@@ -276,6 +273,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 	default:
 		nextRun, err := scheduler.NextRunTime(job.Schedule, now)
 		if err != nil {
+			c.rollbackEnqueue(ctx, job)
 			return nil, fmt.Errorf("calculate next run: %w", err)
 		}
 		entry := &types.ScheduleEntry{
@@ -284,6 +282,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 			NextRunAt: nextRun,
 		}
 		if _, err := c.store.SaveSchedule(ctx, entry); err != nil {
+			c.rollbackEnqueue(ctx, job)
 			return nil, fmt.Errorf("save schedule: %w", err)
 		}
 		c.publishEvent(ctx, types.JobEvent{
@@ -297,7 +296,9 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 	return job, nil
 }
 
-// Cancel cancels a job by ID.
+// Cancel cancels a job by ID. This updates the job status and removes its
+// schedule, but does NOT signal in-flight worker runs via Pub/Sub. To cancel
+// active runs as well, use the monitor API's CancelJob endpoint instead.
 func (c *Client) Cancel(ctx context.Context, jobID string) error {
 	job, rev, err := c.store.GetJob(ctx, jobID)
 	if err != nil {
@@ -562,6 +563,14 @@ func (c *Client) Close() {
 }
 
 // --- Internal helpers ---
+
+// rollbackEnqueue cleans up a job and its unique key on enqueue failure.
+func (c *Client) rollbackEnqueue(ctx context.Context, job *types.Job) {
+	c.store.DeleteJob(ctx, job.ID)
+	if job.UniqueKey != nil && *job.UniqueKey != "" {
+		c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
+	}
+}
 
 // dispatchJob publishes a notification to the job:notify Pub/Sub channel.
 // The NotifierActor on each server node subscribes to this channel and

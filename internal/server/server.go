@@ -199,6 +199,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// 7b. Start cancel bridge: Redis Pub/Sub → actor CancelRunMsg.
 	go s.cancelSubscribeLoop()
 
+	// 7c. Start delayed retry poller (actor path — re-notifies instead of XADD).
+	delayedPoller := store.NewDelayedNotifyPoller(s.store, s.cfg.Logger)
+	go delayedPoller.Start(s.ctx)
+
 	// 8. Activate singletons via ClusterGuard.
 	s.clusterGuardPID = s.engine.Spawn(
 		actors.NewClusterGuardActor(s.cluster, s.onSingletonsReady, s.cfg.Logger),

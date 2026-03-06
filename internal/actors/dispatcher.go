@@ -107,7 +107,9 @@ func (d *DispatcherActor) onDispatchJob(ctx *actor.Context, msg *pb.DispatchJobM
 	target := d.selectNode(msg.TaskType)
 	if target == nil {
 		d.logger.Warn().String("job_id", msg.JobId).String("task_type", string(msg.TaskType)).Msg("dispatcher: no node with capacity for task type")
-		// No node available — the NotifierActor will re-trigger later.
+		// No node available — the job stays in "pending" and will be picked up
+		// on a future dispatch attempt (e.g., scheduler tick, delayed retry poller,
+		// or manual retry).
 		return
 	}
 

@@ -179,8 +179,9 @@ func (s *SchedulerActor) processSchedule(ctx *actor.Context, entry *types.Schedu
 
 	if len(missedFirings) > 1 {
 		s.logger.Info().String("job_id", entry.JobID).Int("missed_count", len(missedFirings)).Msg("scheduler: backfilling missed firings")
+		currentRev := rev
 		for _, firingTime := range missedFirings {
-			s.dispatchFiring(ctx, bgCtx, job, rev, entry, firingTime)
+			currentRev = s.dispatchFiring(ctx, bgCtx, job, currentRev, entry, firingTime)
 		}
 		lastFiring := missedFirings[len(missedFirings)-1]
 		entry.LastProcessedAt = &lastFiring
@@ -194,15 +195,18 @@ func (s *SchedulerActor) processSchedule(ctx *actor.Context, entry *types.Schedu
 }
 
 // dispatchFiring dispatches a single firing of a scheduled job via the DispatcherActor.
-func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time) {
+// Returns the new CAS revision so callers can chain updates in a backfill loop.
+func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time) uint64 {
 	job.Status = types.JobStatusPending
 	job.LastRunAt = &firingTime
 	job.UpdatedAt = time.Now()
 
-	if _, err := s.store.UpdateJob(bgCtx, job, rev); err != nil {
+	newRev, err := s.store.UpdateJob(bgCtx, job, rev)
+	if err != nil {
 		s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: CAS update failed")
-		return
+		return rev
 	}
+	rev = newRev
 
 	// Add backfill headers if applicable.
 	if entry.Schedule.CatchupWindow != nil {
@@ -224,6 +228,8 @@ func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.C
 		TaskType:  job.TaskType,
 		Timestamp: firingTime,
 	})
+
+	return rev
 }
 
 // advanceSchedule calculates and saves the next run time for a schedule.

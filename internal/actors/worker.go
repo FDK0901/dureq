@@ -140,6 +140,18 @@ func (w *WorkerActor) onStarted(ctx *actor.Context) {
 		w.logger.Error().String("run_id", w.run.ID).Err(err).Msg("worker: failed to save initial run")
 	}
 
+	// 3b. Transition the parent job row to "running" so it is no longer
+	// mutable via payload-update APIs and correctly reflects execution state.
+	if job, rev, err := w.store.GetJob(bgCtx, w.work.JobId); err == nil {
+		if job.Status != types.JobStatusRunning && !job.Status.IsTerminal() {
+			job.Status = types.JobStatusRunning
+			job.UpdatedAt = now
+			if _, err := w.store.UpdateJob(bgCtx, job, rev); err != nil {
+				w.logger.Warn().String("job_id", w.work.JobId).Err(err).Msg("worker: failed to set job status to running")
+			}
+		}
+	}
+
 	// 4. Start heartbeat repeater for this run.
 	w.repeater = ctx.SendRepeat(ctx.PID(), heartbeatTickMsg{}, workerHeartbeatInterval)
 

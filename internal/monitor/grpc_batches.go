@@ -141,14 +141,13 @@ func (g *GRPCServer) RetryBatch(ctx context.Context, req *pb.RetryBatchRequest) 
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "batch not found: %v", err)
 	}
+	if batch.Status == types.WorkflowStatusRunning {
+		return nil, status.Errorf(codes.FailedPrecondition, "batch is still running; cancel it first")
+	}
 
 	retryFailedOnly := req.RetryFailedOnly
 
 	now := time.Now()
-	batch.Attempt++
-	batch.Status = types.WorkflowStatusRunning
-	batch.UpdatedAt = now
-	batch.CompletedAt = nil
 
 	// Reset counters.
 	batch.FailedItems = 0
@@ -157,6 +156,18 @@ func (g *GRPCServer) RetryBatch(ctx context.Context, req *pb.RetryBatchRequest) 
 	batch.CompletedItems = 0
 
 	for id, state := range batch.ItemStates {
+		// Cancel in-flight child jobs from the previous attempt.
+		if state.JobID != "" && !state.Status.IsTerminal() {
+			if childJob, childRev, err := g.store.GetJob(ctx, state.JobID); err == nil {
+				if !childJob.Status.IsTerminal() {
+					childJob.Status = types.JobStatusCancelled
+					childJob.UpdatedAt = now
+					g.store.UpdateJob(ctx, childJob, childRev)
+					g.store.SignalCancelActiveRuns(ctx, state.JobID)
+				}
+			}
+		}
+
 		if retryFailedOnly && state.Status != types.JobStatusFailed {
 			if state.Status == types.JobStatusCompleted {
 				batch.CompletedItems++
@@ -171,6 +182,11 @@ func (g *GRPCServer) RetryBatch(ctx context.Context, req *pb.RetryBatchRequest) 
 		batch.ItemStates[id] = state
 		batch.PendingItems++
 	}
+
+	batch.Attempt++
+	batch.Status = types.WorkflowStatusRunning
+	batch.UpdatedAt = now
+	batch.CompletedAt = nil
 	batch.NextChunkIndex = 0
 
 	if _, err := g.store.UpdateBatch(ctx, batch, rev); err != nil {

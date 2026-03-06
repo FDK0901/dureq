@@ -112,7 +112,8 @@ func (d *DispatcherActor) onStopped() {
 // ---------------------------------------------------------------------------
 
 // onDispatchJob selects a target node and sends an ExecuteJobMsg.
-func (d *DispatcherActor) onDispatchJob(ctx *actor.Context, msg *pb.DispatchJobMsg) {
+// Returns true if a node was found and the message was sent.
+func (d *DispatcherActor) onDispatchJob(ctx *actor.Context, msg *pb.DispatchJobMsg) bool {
 	runID := xid.New().String()
 
 	target := d.selectNode(msg.TaskType)
@@ -121,13 +122,14 @@ func (d *DispatcherActor) onDispatchJob(ctx *actor.Context, msg *pb.DispatchJobM
 		// No node available — the job stays in "pending" and will be picked up
 		// on a future dispatch attempt (e.g., scheduler tick, delayed retry poller,
 		// or manual retry).
-		return
+		return false
 	}
 
 	execMsg := messages.DispatchToExecuteMsg(msg, runID)
 	ctx.Send(target.pid, execMsg)
 
 	d.logger.Debug().String("job_id", msg.JobId).String("run_id", runID).String("task_type", string(msg.TaskType)).Msg("dispatcher: dispatched job")
+	return true
 }
 
 // onNewJobNotification loads a job from the store and dispatches it.
@@ -156,10 +158,12 @@ func (d *DispatcherActor) onNewJobNotification(ctx *actor.Context, msg *pb.NewJo
 		return
 	}
 
-	d.recentDispatches[msg.JobId] = time.Now()
-
 	dispatchMsg := messages.JobToDispatchMsg(job, job.Attempt)
-	d.onDispatchJob(ctx, dispatchMsg)
+	if d.onDispatchJob(ctx, dispatchMsg) {
+		// Only record dedup after successful dispatch so that retry
+		// notifications are not suppressed when no node had capacity.
+		d.recentDispatches[msg.JobId] = time.Now()
+	}
 }
 
 // onWorkerStatus updates the node capacity table.

@@ -457,7 +457,8 @@ func (s *SchedulerActor) handleOrphanedRun(actorCtx *actor.Context, bgCtx contex
 // Helpers
 // ---------------------------------------------------------------------------
 
-// resolveDispatcherPID lazily looks up the DispatcherActor PID via the cluster.
+// resolveDispatcherPID looks up the DispatcherActor PID via the cluster.
+// Always performs a fresh lookup to handle dispatcher singleton migration.
 func (s *SchedulerActor) resolveDispatcherPID() *actor.PID {
 	if s.dispatcherPID != nil {
 		return s.dispatcherPID
@@ -467,9 +468,9 @@ func (s *SchedulerActor) resolveDispatcherPID() *actor.PID {
 	}
 	pids := s.cluster.GetActiveByKind(KindDispatcher)
 	if len(pids) > 0 && pids[0] != nil {
-		s.dispatcherPID = pids[0]
+		return pids[0]
 	}
-	return s.dispatcherPID
+	return nil
 }
 
 // publishEvent publishes a domain event directly to the Redis store.

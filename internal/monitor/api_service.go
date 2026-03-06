@@ -401,15 +401,24 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 	if err != nil {
 		return &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
 	}
+	if wf.Status == types.WorkflowStatusRunning {
+		return &ApiError{Msg: "workflow is still running; cancel it first", StatusCode: http.StatusBadRequest}
+	}
 
 	now := time.Now()
-	wf.Attempt++
-	wf.Status = types.WorkflowStatusRunning
-	wf.UpdatedAt = now
-	wf.CompletedAt = nil
 
-	// Reset all tasks to pending.
+	// Cancel in-flight child jobs from the previous attempt.
 	for name, state := range wf.Tasks {
+		if state.JobID != "" && !state.Status.IsTerminal() {
+			if childJob, childRev, err := a.store.GetJob(ctx, state.JobID); err == nil {
+				if !childJob.Status.IsTerminal() {
+					childJob.Status = types.JobStatusCancelled
+					childJob.UpdatedAt = now
+					a.store.UpdateJob(ctx, childJob, childRev)
+					a.store.SignalCancelActiveRuns(ctx, state.JobID)
+				}
+			}
+		}
 		state.Status = types.JobStatusPending
 		state.JobID = ""
 		state.Error = nil
@@ -417,6 +426,11 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 		state.FinishedAt = nil
 		wf.Tasks[name] = state
 	}
+
+	wf.Attempt++
+	wf.Status = types.WorkflowStatusRunning
+	wf.UpdatedAt = now
+	wf.CompletedAt = nil
 
 	if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
 		return &ApiError{Msg: err.Error(), StatusCode: http.StatusInternalServerError}
@@ -521,20 +535,31 @@ func (a *APIService) RetryBatch(ctx context.Context, batchID string, retryFailed
 	if err != nil {
 		return &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
 	}
+	if batch.Status == types.WorkflowStatusRunning {
+		return &ApiError{Msg: "batch is still running; cancel it first", StatusCode: http.StatusBadRequest}
+	}
 
 	now := time.Now()
-	batch.Attempt++
-	batch.Status = types.WorkflowStatusRunning
-	batch.UpdatedAt = now
-	batch.CompletedAt = nil
 
-	// Reset items.
+	// Reset items and cancel in-flight child jobs.
 	batch.FailedItems = 0
 	batch.RunningItems = 0
 	batch.PendingItems = 0
 	batch.CompletedItems = 0
 
 	for id, state := range batch.ItemStates {
+		// Cancel in-flight child jobs from the previous attempt.
+		if state.JobID != "" && !state.Status.IsTerminal() {
+			if childJob, childRev, err := a.store.GetJob(ctx, state.JobID); err == nil {
+				if !childJob.Status.IsTerminal() {
+					childJob.Status = types.JobStatusCancelled
+					childJob.UpdatedAt = now
+					a.store.UpdateJob(ctx, childJob, childRev)
+					a.store.SignalCancelActiveRuns(ctx, state.JobID)
+				}
+			}
+		}
+
 		if retryFailedOnly && state.Status != types.JobStatusFailed {
 			if state.Status == types.JobStatusCompleted {
 				batch.CompletedItems++
@@ -549,6 +574,11 @@ func (a *APIService) RetryBatch(ctx context.Context, batchID string, retryFailed
 		batch.ItemStates[id] = state
 		batch.PendingItems++
 	}
+
+	batch.Attempt++
+	batch.Status = types.WorkflowStatusRunning
+	batch.UpdatedAt = now
+	batch.CompletedAt = nil
 	batch.NextChunkIndex = 0
 
 	if _, err := a.store.UpdateBatch(ctx, batch, rev); err != nil {

@@ -110,15 +110,24 @@ func (g *GRPCServer) RetryWorkflow(ctx context.Context, req *pb.RetryWorkflowReq
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "workflow not found: %v", err)
 	}
+	if wf.Status == types.WorkflowStatusRunning {
+		return nil, status.Errorf(codes.FailedPrecondition, "workflow is still running; cancel it first")
+	}
 
 	now := time.Now()
-	wf.Attempt++
-	wf.Status = types.WorkflowStatusRunning
-	wf.UpdatedAt = now
-	wf.CompletedAt = nil
 
-	// Reset all tasks to pending.
+	// Cancel in-flight child jobs from the previous attempt, then reset.
 	for name, state := range wf.Tasks {
+		if state.JobID != "" && !state.Status.IsTerminal() {
+			if childJob, childRev, err := g.store.GetJob(ctx, state.JobID); err == nil {
+				if !childJob.Status.IsTerminal() {
+					childJob.Status = types.JobStatusCancelled
+					childJob.UpdatedAt = now
+					g.store.UpdateJob(ctx, childJob, childRev)
+					g.store.SignalCancelActiveRuns(ctx, state.JobID)
+				}
+			}
+		}
 		state.Status = types.JobStatusPending
 		state.JobID = ""
 		state.Error = nil
@@ -126,6 +135,11 @@ func (g *GRPCServer) RetryWorkflow(ctx context.Context, req *pb.RetryWorkflowReq
 		state.FinishedAt = nil
 		wf.Tasks[name] = state
 	}
+
+	wf.Attempt++
+	wf.Status = types.WorkflowStatusRunning
+	wf.UpdatedAt = now
+	wf.CompletedAt = nil
 
 	if _, err := g.store.UpdateWorkflow(ctx, wf, rev); err != nil {
 		return nil, status.Errorf(codes.Internal, "update workflow: %v", err)

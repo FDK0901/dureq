@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/bytedance/sonic"
 	gochainedlog "github.com/FDK0901/go-chainedlog"
 )
@@ -84,10 +85,18 @@ func (s *RedisStore) MoveDelayedToNotify(ctx context.Context, tierName string, m
 	}
 
 	var moved int64
+	now := time.Now()
 	for _, raw := range members {
 		var entry delayedEntry
 		if err := sonic.ConfigFastest.Unmarshal([]byte(raw), &entry); err != nil {
 			continue // already removed from set by Lua
+		}
+
+		// Transition job from "retrying" back to "pending" so the dispatcher
+		// will accept it. Without this the dispatcher's pending-only check
+		// rejects the notification and the job stays stuck in "retrying".
+		if err := s.transitionRetryingToPending(ctx, entry.JobID, now); err != nil {
+			continue
 		}
 
 		if err := s.PublishJobNotification(ctx, entry.JobID, entry.TaskType, entry.Priority); err != nil {
@@ -100,4 +109,21 @@ func (s *RedisStore) MoveDelayedToNotify(ctx context.Context, tierName string, m
 	}
 
 	return moved, nil
+}
+
+// transitionRetryingToPending sets a job's status from "retrying" back to
+// "pending" using a CAS update. This is required before publishing a delayed
+// retry notification because the dispatcher only accepts pending jobs.
+func (s *RedisStore) transitionRetryingToPending(ctx context.Context, jobID string, now time.Time) error {
+	job, rev, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if job.Status != types.JobStatusRetrying {
+		return nil // already transitioned or in another state
+	}
+	job.Status = types.JobStatusPending
+	job.UpdatedAt = now
+	_, err = s.UpdateJob(ctx, job, rev)
+	return err
 }

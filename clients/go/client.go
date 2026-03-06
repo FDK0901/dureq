@@ -728,6 +728,15 @@ func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInsta
 			if firstErr == nil {
 				firstErr = fmt.Errorf("create batch item job %s: %w", item.ID, err)
 			}
+			errStr := err.Error()
+			batch.ItemStates[item.ID] = types.BatchItemState{
+				ItemID:     item.ID,
+				Status:     types.JobStatusFailed,
+				Error:      &errStr,
+				FinishedAt: now,
+			}
+			batch.FailedItems++
+			batch.PendingItems--
 			continue
 		}
 		if err := c.dispatchJob(ctx, job); err != nil {
@@ -735,6 +744,15 @@ func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInsta
 			if firstErr == nil {
 				firstErr = fmt.Errorf("dispatch batch item %s: %w", item.ID, err)
 			}
+			errStr := err.Error()
+			batch.ItemStates[item.ID] = types.BatchItemState{
+				ItemID:     item.ID,
+				Status:     types.JobStatusFailed,
+				Error:      &errStr,
+				FinishedAt: now,
+			}
+			batch.FailedItems++
+			batch.PendingItems--
 			continue
 		}
 

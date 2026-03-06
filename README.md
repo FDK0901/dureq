@@ -13,6 +13,7 @@ Heavily inspired by [Asynq](https://github.com/hibiken/asynq), [gocron](https://
 - **Workflow Orchestration** — DAG-based task dependencies with automatic state advancement
 - **Batch Processing** — Concurrent item execution with optional preprocessing, chunking, and failure policies
 - **Actor Model** — Cluster-wide singleton actors (scheduler, dispatcher, orchestrator) with per-node workers
+- **Mux Handler** — Pattern-based task type routing (`festival.*`), global and per-handler middleware
 - **Monitoring APIs** — HTTP REST and gRPC APIs for full cluster observability and management
 - **Web Dashboard** — React-based UI ([durequi](https://github.com/FDK0901/durequi)) for visual monitoring
 - **Terminal UI** — Interactive TUI (`dureqctl`) for real-time cluster monitoring
@@ -22,10 +23,12 @@ Heavily inspired by [Asynq](https://github.com/hibiken/asynq), [gocron](https://
 - **Retry Policies** — Exponential backoff with jitter, error classification (retryable, non-retryable, rate-limited)
 - **Overlap Policies** — Control concurrent runs for recurring jobs (allow all, skip, buffer one, buffer all)
 - **Catchup / Backfill** — Recover missed executions within a configurable window
-- **Middleware** — Composable handler middleware chains
+- **Middleware** — Composable handler middleware chains (global + per-handler)
 - **Progress Reporting** — In-flight progress updates from workers
 - **WebSocket Live Updates** — Real-time event push to web dashboard via WebSocket, with automatic polling fallback
 - **Event Streaming** — Real-time lifecycle events via Redis Pub/Sub and Streams
+- **Payload Search** — JSONPath-based payload search across jobs, workflows, and batches
+- **Unique Keys** — Deduplication via unique keys with lookup and manual deletion
 - **Multi-Tenancy** — Key prefix isolation per tenant
 - **Client SDKs** — Go
 
@@ -169,7 +172,7 @@ import (
     "log"
     "time"
 
-    "github.com/FDK0901/dureq/client"
+    client "github.com/FDK0901/dureq/clients/go"
     "github.com/FDK0901/dureq/pkg/types"
 )
 
@@ -191,12 +194,13 @@ func main() {
     // Recurring job (every 30 seconds)
     start := time.Now().Add(time.Minute)
     end := start.Add(24 * time.Hour)
+    interval := types.Duration(30 * time.Second)
     cli.EnqueueScheduled(ctx, &client.EnqueueRequest{
         TaskType: "report.generate",
         Payload:  []byte(`{}`),
         Schedule: types.Schedule{
             Type:     types.ScheduleDuration,
-            Interval: &types.Duration{Duration: 30 * time.Second},
+            Interval: &interval,
             StartsAt: &start,
             EndsAt:   &end,
         },
@@ -339,16 +343,16 @@ Both HTTP and gRPC APIs expose the same set of operations. The HTTP API serves t
 
 **History:**
 
-| Method | Path                  | Description               |
-| ------ | --------------------- | ------------------------- |
-| `GET`  | `/api/history/runs`   | Paginated historical runs |
-| `GET`  | `/api/history/events` | Paginated job events      |
+| Method | Path                  | Description                                                           |
+| ------ | --------------------- | --------------------------------------------------------------------- |
+| `GET`  | `/api/history/runs`   | Paginated historical runs (filterable by status/job_id/node_id/task_type/since/until) |
+| `GET`  | `/api/history/events` | Paginated job events (filterable by job_id)                           |
 
 **Workflows:**
 
 | Method | Path                                 | Description                   |
 | ------ | ------------------------------------ | ----------------------------- |
-| `GET`  | `/api/workflows`                     | List workflow instances       |
+| `GET`  | `/api/workflows`                     | List workflow instances        |
 | `GET`  | `/api/workflows/{workflowID}`        | Get workflow details          |
 | `POST` | `/api/workflows/{workflowID}/cancel` | Cancel workflow and all tasks |
 | `POST` | `/api/workflows/{workflowID}/retry`  | Retry entire workflow         |
@@ -389,14 +393,36 @@ Bulk request body: `{"ids": ["id1", "id2"]}` or `{"status": "failed"}`
 | `POST` | `/api/queues/{tierName}/resume` | Resume a queue                                |
 | `GET`  | `/api/groups`                   | List active aggregation groups                |
 
+**Payload Search (JSONPath):**
+
+| Method | Path                      | Description                                          |
+| ------ | ------------------------- | ---------------------------------------------------- |
+| `GET`  | `/api/search/jobs`        | Search jobs by payload JSONPath (`?path=&value=`)    |
+| `GET`  | `/api/search/workflows`   | Search workflows by payload JSONPath                 |
+| `GET`  | `/api/search/batches`     | Search batches by payload JSONPath                   |
+
+**Unique Keys:**
+
+| Method   | Path                      | Description                              |
+| -------- | ------------------------- | ---------------------------------------- |
+| `GET`    | `/api/unique-keys/{key}`  | Check if unique key exists (returns job_id) |
+| `DELETE` | `/api/unique-keys/{key}`  | Delete a unique key                      |
+
 **Statistics & Health:**
 
-| Method | Path               | Description                                        |
-| ------ | ------------------ | -------------------------------------------------- |
-| `GET`  | `/api/stats`       | Cluster stats (job counts, nodes, runs, schedules) |
-| `GET`  | `/api/stats/daily` | Daily aggregated statistics                        |
-| `GET`  | `/api/redis/info`  | Redis server info                                  |
-| `GET`  | `/api/health`      | Health check                                       |
+| Method | Path                  | Description                                        |
+| ------ | --------------------- | -------------------------------------------------- |
+| `GET`  | `/api/stats`          | Cluster stats (job counts, nodes, runs, schedules) |
+| `GET`  | `/api/stats/daily`    | Daily aggregated statistics                        |
+| `GET`  | `/api/redis/info`     | Redis server info                                  |
+| `GET`  | `/api/sync-retries`   | Pending sync retry entries                         |
+| `GET`  | `/api/health`         | Health check                                       |
+
+**DLQ (Dead Letter Queue):**
+
+| Method | Path       | Description               |
+| ------ | ---------- | ------------------------- |
+| `GET`  | `/api/dlq` | List dead letter messages |
 
 **WebSocket (Real-time Events):**
 
@@ -524,42 +550,62 @@ func handler(ctx context.Context, payload json.RawMessage) error {
 
 ## Middleware
 
+Middleware can be applied globally via `srv.Use()` or per-handler via `HandlerDefinition.Middlewares`. Global middleware runs first, then per-handler middleware, forming a chain around the handler.
+
 ```go
-func loggingMiddleware(next types.HandlerFunc) types.HandlerFunc {
+// Global middleware — applies to ALL handlers.
+srv.Use(func(next types.HandlerFunc) types.HandlerFunc {
     return func(ctx context.Context, payload json.RawMessage) error {
         log.Printf("Starting job %s", types.GetJobID(ctx))
         err := next(ctx, payload)
         log.Printf("Finished job %s (err=%v)", types.GetJobID(ctx), err)
         return err
     }
-}
+})
 
+// Per-handler middleware — applied after global middleware.
 srv.RegisterHandler(types.HandlerDefinition{
     TaskType:    "email.send",
     Handler:     emailHandler,
-    Middlewares: []types.MiddlewareFunc{loggingMiddleware},
+    Middlewares: []types.MiddlewareFunc{retryAwareMiddleware},
 })
 ```
+
+### Pattern-Based Routing (Mux)
+
+Register a single handler for multiple task types using glob patterns:
+
+```go
+srv.RegisterHandler(types.HandlerDefinition{
+    TaskType: "festival.*",  // matches festival.query_wait_time, festival.send_alert, etc.
+    Handler:  festivalHandler,
+})
+```
+
+Inside the handler, use `types.GetTaskType(ctx)` to distinguish the actual task type and dispatch accordingly.
 
 ## Configuration
 
 ### Server Options
 
-| Option                      | Default        | Description                        |
-| --------------------------- | -------------- | ---------------------------------- |
-| `WithRedisURL(url)`         | —              | Redis connection URL               |
-| `WithRedisDB(db)`           | `0`            | Redis database number              |
-| `WithRedisPassword(pw)`     | —              | Redis password                     |
-| `WithRedisPoolSize(n)`      | —              | Connection pool size               |
-| `WithNodeID(id)`            | auto-generated | Unique node identifier             |
-| `WithListenAddr(addr)`      | —              | Address for remote actor RPC       |
-| `WithClusterRegion(region)` | —              | Region for multi-region deployment |
-| `WithMaxConcurrency(n)`     | `100`          | Maximum concurrent workers         |
-| `WithShutdownTimeout(d)`    | `30s`          | Graceful shutdown timeout          |
-| `WithLockTTL(d)`            | `30s`          | Distributed lock TTL               |
-| `WithLockAutoExtend(d)`     | `LockTTL/3`    | Lock auto-extension interval       |
-| `WithKeyPrefix(prefix)`     | —              | Redis key prefix (multi-tenancy)   |
-| `WithLogger(logger)`        | —              | Custom logger                      |
+| Option                          | Default        | Description                        |
+| ------------------------------- | -------------- | ---------------------------------- |
+| `WithRedisURL(url)`             | —              | Redis connection URL               |
+| `WithRedisDB(db)`               | `0`            | Redis database number              |
+| `WithRedisPassword(pw)`         | —              | Redis password                     |
+| `WithRedisPoolSize(n)`          | —              | Connection pool size               |
+| `WithRedisSentinel(...)`        | —              | Redis Sentinel failover config     |
+| `WithRedisCluster(addrs)`       | —              | Redis Cluster mode addresses       |
+| `WithNodeID(id)`                | auto-generated | Unique node identifier             |
+| `WithListenAddr(addr)`          | —              | Address for remote actor RPC       |
+| `WithClusterRegion(region)`     | `"default"`    | Region for multi-region deployment |
+| `WithMaxConcurrency(n)`         | `100`          | Maximum concurrent workers         |
+| `WithShutdownTimeout(d)`        | `30s`          | Graceful shutdown timeout          |
+| `WithLockTTL(d)`                | `30s`          | Distributed lock TTL               |
+| `WithLockAutoExtend(d)`         | `LockTTL/3`    | Lock auto-extension interval       |
+| `WithKeyPrefix(prefix)`         | —              | Redis key prefix (multi-tenancy)   |
+| `WithPriorityTiers(tiers)`      | —              | Custom priority tier mapping       |
+| `WithLogger(logger)`            | —              | Custom logger                      |
 
 ### Client Options
 
@@ -599,23 +645,23 @@ dureq/
 │   └── dureqctl/           # Interactive terminal UI (Bubble Tea)
 │       ├── main.go
 │       └── teamodel/       # TUI model, views, and key handling
-├── client/                 # Go client SDK
-├── pkg/types/              # Public domain types (Job, Schedule, Workflow, Batch, etc.)
+├── clients/
+│   └── go/                 # Go client SDK
+├── pkg/
+│   ├── types/              # Public domain types (Job, Schedule, Workflow, Batch, etc.)
+│   └── dureq/              # Package-level convenience API
 ├── internal/
-│   ├── server/             # v2 actor-based server entry point
-│   ├── v1server/           # v1 pull-based server (legacy)
+│   ├── server/             # Actor-based server entry point and options
 │   ├── actors/             # All actor implementations
-│   ├── monitor/            # HTTP REST + gRPC monitoring APIs
+│   ├── handler/            # Handler registry (task type → handler mapping)
+│   ├── monitor/            # HTTP REST + gRPC monitoring APIs, WebSocket hub
 │   ├── api/                # HTTP client for dureqctl
 │   ├── store/              # Redis persistence layer (Lua scripts, streams, pagination)
 │   ├── messages/           # Internal message types
 │   ├── scheduler/          # Standalone scheduler component
-│   ├── dispatcher/         # Standalone dispatcher component
-│   ├── worker/             # Standalone worker component
 │   ├── workflow/           # DAG validation & topological sort
 │   ├── lock/               # Distributed locking
 │   ├── cache/              # In-memory schedule cache
-│   ├── election/           # Leader election
 │   └── provider/           # Service providers (Redis client factory)
 ├── proto/
 │   └── dureq/
@@ -641,16 +687,19 @@ dureq/
 
 The [examples/](examples/) directory contains runnable demos:
 
-| Example               | Description                     |
-| --------------------- | ------------------------------- |
-| `festival/`           | Recurring scheduled jobs        |
-| `batch/`              | Batch item processing           |
-| `batch_with_mux/`     | Batch with HTTP server          |
-| `workflow/`           | DAG workflow execution          |
-| `workflow_with_mux/`  | Workflow with HTTP server       |
-| `onetimeat/`          | One-time scheduled execution    |
-| `heartbeat_progress/` | Progress reporting from workers |
-| `overlap_policy/`     | Overlap policy demonstration    |
+| Example                  | Description                                                 |
+| ------------------------ | ----------------------------------------------------------- |
+| `festival/`              | Recurring scheduled jobs                                    |
+| `festival_with_mux/`     | Recurring jobs with pattern-based mux routing and middleware |
+| `festival_mux_just_server/` | Server-only mux example (no client)                      |
+| `batch/`                 | Batch item processing                                       |
+| `batch_with_mux/`        | Batch with mux handler                                      |
+| `workflow/`              | DAG workflow execution                                      |
+| `workflow_with_mux/`     | Workflow with mux handler                                   |
+| `onetimeat/`             | One-time scheduled execution                                |
+| `onetimeat_with_mux/`    | One-time execution with mux handler                         |
+| `heartbeat_progress/`    | Progress reporting from workers                             |
+| `overlap_policy/`        | Overlap policy demonstration                                |
 
 ```bash
 cd examples/festival
@@ -688,11 +737,9 @@ make genproto
 | [robfig/cron](https://github.com/robfig/cron)             | Cron expression parsing           |
 | [vtprotobuf](https://github.com/planetscale/vtprotobuf)   | Optimized protobuf marshaling     |
 | [sonic](https://github.com/bytedance/sonic)               | Fast JSON serialization           |
-| [ants](https://github.com/panjf2000/ants)                 | Goroutine pool                    |
 | [xid](https://github.com/rs/xid)                          | Globally unique ID generation     |
 | [go-chainedlog](https://github.com/FDK0901/go-chainedlog) | Structured logging                |
 | [bubbletea](https://github.com/charmbracelet/bubbletea)   | Terminal UI framework (dureqctl)  |
 | [koanf](https://github.com/knadh/koanf)                   | Configuration management (dureqd) |
 | [grpc-go](https://google.golang.org/grpc)                 | gRPC server and reflection        |
 | [websocket](https://nhooyr.io/websocket)                  | WebSocket server (real-time push) |
-

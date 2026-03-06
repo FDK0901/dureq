@@ -161,6 +161,9 @@ func (s *SchedulerActor) processSchedule(ctx *actor.Context, entry *types.Schedu
 				s.advanceSchedule(bgCtx, entry, now)
 				return
 			}
+		} else {
+			// No active run — drain any buffered overlap dispatches.
+			s.drainOverlapBuffer(ctx, bgCtx, job, rev, entry, policy)
 		}
 	}
 
@@ -271,6 +274,26 @@ func (s *SchedulerActor) expireSchedule(ctx context.Context, entry *types.Schedu
 	job.CompletedAt = &now
 	job.UpdatedAt = now
 	s.store.UpdateJob(ctx, job, rev)
+}
+
+// drainOverlapBuffer pops buffered overlap entries and dispatches them now that
+// no active run exists for the job.
+func (s *SchedulerActor) drainOverlapBuffer(actorCtx *actor.Context, bgCtx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, policy types.OverlapPolicy) {
+	switch policy {
+	case types.OverlapBufferOne:
+		if _, ok, err := s.store.PopOverlapBuffer(bgCtx, entry.JobID); err == nil && ok {
+			s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: draining buffered overlap (one)")
+			s.dispatchFiring(actorCtx, bgCtx, job, rev, entry, time.Now())
+		}
+	case types.OverlapBufferAll:
+		for {
+			if _, ok, err := s.store.PopOverlapBufferAll(bgCtx, entry.JobID); err != nil || !ok {
+				break
+			}
+			s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: draining buffered overlap (all)")
+			rev = s.dispatchFiring(actorCtx, bgCtx, job, rev, entry, time.Now())
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------

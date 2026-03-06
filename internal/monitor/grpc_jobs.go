@@ -118,8 +118,15 @@ func (g *GRPCServer) RetryJob(ctx context.Context, req *pb.RetryJobRequest) (*pb
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "job not found: %v", err)
 	}
+	if job.Status == types.JobStatusRunning {
+		return nil, status.Errorf(codes.FailedPrecondition, "job is still running; cancel it first")
+	}
 
 	now := time.Now()
+
+	// Cancel any in-flight runs from the previous attempt.
+	g.store.SignalCancelActiveRuns(ctx, jobID)
+
 	job.Status = types.JobStatusPending
 	job.Attempt = 0
 	job.LastError = nil

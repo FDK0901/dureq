@@ -129,8 +129,15 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 	if err != nil {
 		return &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
 	}
+	if job.Status == types.JobStatusRunning {
+		return &ApiError{Msg: "job is still running; cancel it first", StatusCode: http.StatusBadRequest}
+	}
 
 	now := time.Now()
+
+	// Cancel any in-flight runs from the previous attempt.
+	a.store.SignalCancelActiveRuns(ctx, jobID)
+
 	job.Status = types.JobStatusPending
 	job.Attempt = 0
 	job.LastError = nil
@@ -789,6 +796,7 @@ func (a *APIService) BulkCancelJobs(ctx context.Context, req BulkRequest) (int, 
 		job.UpdatedAt = now
 		if _, err := a.store.UpdateJob(ctx, job, rev); err == nil {
 			a.store.DeleteSchedule(ctx, id)
+			a.store.SignalCancelActiveRuns(ctx, id)
 			a.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventJobCancelled, JobID: id, Timestamp: now,
 			})
@@ -814,9 +822,12 @@ func (a *APIService) BulkRetryJobs(ctx context.Context, req BulkRequest) (int, e
 	now := time.Now()
 	for _, id := range ids {
 		job, rev, err := a.store.GetJob(ctx, id)
-		if err != nil {
+		if err != nil || job.Status == types.JobStatusRunning {
 			continue
 		}
+		// Cancel any in-flight runs from the previous attempt.
+		a.store.SignalCancelActiveRuns(ctx, id)
+
 		job.Status = types.JobStatusPending
 		job.Attempt = 0
 		job.LastError = nil
@@ -964,7 +975,23 @@ func (a *APIService) BulkDeleteWorkflows(ctx context.Context, req BulkRequest) (
 	}
 
 	affected := 0
+	now := time.Now()
 	for _, id := range ids {
+		// Cancel running children before deleting the parent.
+		if wf, _, err := a.store.GetWorkflow(ctx, id); err == nil {
+			for _, state := range wf.Tasks {
+				if state.JobID != "" && !state.Status.IsTerminal() {
+					if childJob, childRev, err := a.store.GetJob(ctx, state.JobID); err == nil {
+						if !childJob.Status.IsTerminal() {
+							childJob.Status = types.JobStatusCancelled
+							childJob.UpdatedAt = now
+							a.store.UpdateJob(ctx, childJob, childRev)
+							a.store.SignalCancelActiveRuns(ctx, state.JobID)
+						}
+					}
+				}
+			}
+		}
 		if err := a.store.DeleteWorkflow(ctx, id); err == nil {
 			affected++
 		}
@@ -1086,7 +1113,33 @@ func (a *APIService) BulkDeleteBatches(ctx context.Context, req BulkRequest) (in
 	}
 
 	affected := 0
+	now := time.Now()
 	for _, id := range ids {
+		// Cancel running children before deleting the parent.
+		if batch, _, err := a.store.GetBatch(ctx, id); err == nil {
+			for _, state := range batch.ItemStates {
+				if state.JobID != "" && !state.Status.IsTerminal() {
+					if childJob, childRev, err := a.store.GetJob(ctx, state.JobID); err == nil {
+						if !childJob.Status.IsTerminal() {
+							childJob.Status = types.JobStatusCancelled
+							childJob.UpdatedAt = now
+							a.store.UpdateJob(ctx, childJob, childRev)
+							a.store.SignalCancelActiveRuns(ctx, state.JobID)
+						}
+					}
+				}
+			}
+			if batch.OnetimeState != nil && batch.OnetimeState.JobID != "" && !batch.OnetimeState.Status.IsTerminal() {
+				if childJob, childRev, err := a.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+					if !childJob.Status.IsTerminal() {
+						childJob.Status = types.JobStatusCancelled
+						childJob.UpdatedAt = now
+						a.store.UpdateJob(ctx, childJob, childRev)
+						a.store.SignalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+					}
+				}
+			}
+		}
 		if err := a.store.DeleteBatch(ctx, id); err == nil {
 			affected++
 		}

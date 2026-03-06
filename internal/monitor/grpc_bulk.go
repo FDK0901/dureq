@@ -39,6 +39,7 @@ func (g *GRPCServer) BulkCancelJobs(ctx context.Context, req *pb.BulkCancelJobsR
 		job.UpdatedAt = now
 		if _, err := g.store.UpdateJob(ctx, job, rev); err == nil {
 			g.store.DeleteSchedule(ctx, id)
+			g.store.SignalCancelActiveRuns(ctx, id)
 			g.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventJobCancelled, JobID: id, Timestamp: now,
 			})
@@ -68,9 +69,12 @@ func (g *GRPCServer) BulkRetryJobs(ctx context.Context, req *pb.BulkRetryJobsReq
 	now := time.Now()
 	for _, id := range ids {
 		job, rev, err := g.store.GetJob(ctx, id)
-		if err != nil {
+		if err != nil || job.Status == types.JobStatusRunning {
 			continue
 		}
+		// Cancel any in-flight runs from the previous attempt.
+		g.store.SignalCancelActiveRuns(ctx, id)
+
 		job.Status = types.JobStatusPending
 		job.Attempt = 0
 		job.LastError = nil
@@ -236,7 +240,23 @@ func (g *GRPCServer) BulkDeleteWorkflows(ctx context.Context, req *pb.BulkDelete
 	}
 
 	var affected int32
+	now := time.Now()
 	for _, id := range ids {
+		// Cancel running children before deleting the parent.
+		if wf, _, err := g.store.GetWorkflow(ctx, id); err == nil {
+			for _, state := range wf.Tasks {
+				if state.JobID != "" && !state.Status.IsTerminal() {
+					if childJob, childRev, err := g.store.GetJob(ctx, state.JobID); err == nil {
+						if !childJob.Status.IsTerminal() {
+							childJob.Status = types.JobStatusCancelled
+							childJob.UpdatedAt = now
+							g.store.UpdateJob(ctx, childJob, childRev)
+							g.store.SignalCancelActiveRuns(ctx, state.JobID)
+						}
+					}
+				}
+			}
+		}
 		if err := g.store.DeleteWorkflow(ctx, id); err == nil {
 			affected++
 		}
@@ -373,7 +393,33 @@ func (g *GRPCServer) BulkDeleteBatches(ctx context.Context, req *pb.BulkDeleteBa
 	}
 
 	var affected int32
+	now := time.Now()
 	for _, id := range ids {
+		// Cancel running children before deleting the parent.
+		if batch, _, err := g.store.GetBatch(ctx, id); err == nil {
+			for _, state := range batch.ItemStates {
+				if state.JobID != "" && !state.Status.IsTerminal() {
+					if childJob, childRev, err := g.store.GetJob(ctx, state.JobID); err == nil {
+						if !childJob.Status.IsTerminal() {
+							childJob.Status = types.JobStatusCancelled
+							childJob.UpdatedAt = now
+							g.store.UpdateJob(ctx, childJob, childRev)
+							g.store.SignalCancelActiveRuns(ctx, state.JobID)
+						}
+					}
+				}
+			}
+			if batch.OnetimeState != nil && batch.OnetimeState.JobID != "" && !batch.OnetimeState.Status.IsTerminal() {
+				if childJob, childRev, err := g.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+					if !childJob.Status.IsTerminal() {
+						childJob.Status = types.JobStatusCancelled
+						childJob.UpdatedAt = now
+						g.store.UpdateJob(ctx, childJob, childRev)
+						g.store.SignalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+					}
+				}
+			}
+		}
 		if err := g.store.DeleteBatch(ctx, id); err == nil {
 			affected++
 		}

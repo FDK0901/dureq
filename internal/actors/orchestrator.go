@@ -206,7 +206,22 @@ func (o *OrchestratorActor) handleJobCompleted(ctx *actor.Context, event types.J
 				o.dispatchWorkflowTask(ctx, bgCtx, wf, name, &now)
 			}
 			if _, err := o.store.UpdateWorkflow(bgCtx, wf, newRev); err != nil {
-				o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save dispatched task states (non-critical)")
+				// CAS conflict — re-read and apply task state changes.
+				if err == store.ErrCASConflict {
+					if freshWf, freshRev, rerr := o.store.GetWorkflow(bgCtx, wfID); rerr == nil {
+						for _, name := range ready {
+							if state, ok := wf.Tasks[name]; ok {
+								freshWf.Tasks[name] = state
+							}
+						}
+						freshWf.UpdatedAt = now
+						if _, err2 := o.store.UpdateWorkflow(bgCtx, freshWf, freshRev); err2 != nil {
+							o.logger.Warn().String("workflow_id", wfID).Err(err2).Msg("orchestrator: retry save dispatched task states failed")
+						}
+					}
+				} else {
+					o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save dispatched task states")
+				}
 			}
 		}
 		return
@@ -510,7 +525,9 @@ func (o *OrchestratorActor) handleBatchJobCompleted(actorCtx *actor.Context, eve
 		batch.Status = types.WorkflowStatusRunning
 		batch.UpdatedAt = now
 		o.dispatchBatchChunk(actorCtx, bgCtx, batch, &now)
-		o.store.UpdateBatch(bgCtx, batch, rev)
+		if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+			o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after onetime dispatch")
+		}
 
 	case "item":
 		// Individual item completed.
@@ -556,7 +573,9 @@ func (o *OrchestratorActor) handleBatchJobCompleted(actorCtx *actor.Context, eve
 		} else {
 			o.dispatchBatchChunk(actorCtx, bgCtx, batch, &now)
 			batch.UpdatedAt = now
-			o.store.UpdateBatch(bgCtx, batch, rev)
+			if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+				o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after item chunk dispatch")
+			}
 		}
 	}
 }

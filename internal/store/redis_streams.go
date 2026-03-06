@@ -319,20 +319,6 @@ func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.
 	return s.rdb.Do(ctx, s.rdb.B().Zadd().Key(DelayedKey(s.prefix, tierName)).ScoreMember().ScoreMember(float64(executeAt.UnixNano()), string(data)).Build()).Error()
 }
 
-// MoveDelayedToStream atomically moves ripe delayed messages back to the work stream.
-// Returns the number of messages moved.
-func (s *RedisStore) MoveDelayedToStream(ctx context.Context, tierName string, maxMove int) (int64, error) {
-	now := strconv.FormatFloat(float64(time.Now().UnixNano()), 'f', 0, 64)
-	result, err := s.scriptMoveDelayed.Exec(ctx, s.rdb,
-		[]string{DelayedKey(s.prefix, tierName), WorkStreamKey(s.prefix, tierName)},
-		[]string{now, strconv.Itoa(maxMove)},
-	).AsInt64()
-	if err != nil {
-		return 0, err
-	}
-	return result, nil
-}
-
 // ReenqueueWork re-adds a work message to the stream without dedup.
 // Used when a worker picks up a message for a task type it doesn't handle.
 func (s *RedisStore) ReenqueueWork(ctx context.Context, tierName string, wm *types.WorkMessage, redeliveries int) error {

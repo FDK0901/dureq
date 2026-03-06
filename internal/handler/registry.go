@@ -1,4 +1,4 @@
-package v1server
+package handler
 
 import (
 	"fmt"
@@ -8,11 +8,11 @@ import (
 	"github.com/FDK0901/dureq/pkg/types"
 )
 
-// HandlerRegistry stores registered task type handlers.
+// Registry stores registered task type handlers.
 // It supports exact matches and pattern-based routing (e.g., "email:*").
 // Longest matching pattern wins, similar to net/http.ServeMux.
 // It is safe for concurrent use.
-type HandlerRegistry struct {
+type Registry struct {
 	mu       sync.RWMutex
 	handlers map[types.TaskType]*types.HandlerDefinition
 	patterns []patternEntry // sorted by specificity (longest prefix first)
@@ -24,9 +24,9 @@ type patternEntry struct {
 	def    *types.HandlerDefinition
 }
 
-// NewHandlerRegistry creates a new empty handler registry.
-func NewHandlerRegistry() *HandlerRegistry {
-	return &HandlerRegistry{
+// NewRegistry creates a new empty handler registry.
+func NewRegistry() *Registry {
+	return &Registry{
 		handlers: make(map[types.TaskType]*types.HandlerDefinition),
 	}
 }
@@ -34,7 +34,7 @@ func NewHandlerRegistry() *HandlerRegistry {
 // Register adds a handler definition to the registry.
 // TaskType can be an exact name ("email.send") or a pattern ("email:*", "email.*").
 // Patterns ending with "*" match any task type sharing that prefix.
-func (r *HandlerRegistry) Register(def types.HandlerDefinition) error {
+func (r *Registry) Register(def types.HandlerDefinition) error {
 	if def.TaskType == "" {
 		return fmt.Errorf("task type is required")
 	}
@@ -74,7 +74,7 @@ func (r *HandlerRegistry) Register(def types.HandlerDefinition) error {
 // Get returns the handler definition for a task type.
 // It first checks exact matches, then falls back to pattern matching
 // (longest prefix wins).
-func (r *HandlerRegistry) Get(taskType types.TaskType) (*types.HandlerDefinition, bool) {
+func (r *Registry) Get(taskType types.TaskType) (*types.HandlerDefinition, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -95,7 +95,7 @@ func (r *HandlerRegistry) Get(taskType types.TaskType) (*types.HandlerDefinition
 }
 
 // TaskTypes returns all registered task type names (exact + pattern).
-func (r *HandlerRegistry) TaskTypes() []string {
+func (r *Registry) TaskTypes() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -110,7 +110,7 @@ func (r *HandlerRegistry) TaskTypes() []string {
 }
 
 // Len returns the number of registered handlers (exact + pattern).
-func (r *HandlerRegistry) Len() int {
+func (r *Registry) Len() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return len(r.handlers) + len(r.patterns)

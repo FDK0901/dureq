@@ -116,8 +116,6 @@ type RedisStore struct {
 	scriptCASJob        *rueidis.Lua
 	scriptCASUpdate     *rueidis.Lua
 	scriptCreateNX      *rueidis.Lua
-	scriptLeaderRefresh *rueidis.Lua
-	scriptMoveDelayed   *rueidis.Lua
 }
 
 // NewRedisStore creates a new Redis store and registers tier configuration.
@@ -135,8 +133,6 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog
 		scriptCASJob:        rueidis.NewLuaScript(luaCASUpdateJobSingleKey),
 		scriptCASUpdate:     rueidis.NewLuaScript(luaCASUpdate),
 		scriptCreateNX:      rueidis.NewLuaScript(luaCreateIfNotExists),
-		scriptLeaderRefresh: rueidis.NewLuaScript(luaLeaderRefresh),
-		scriptMoveDelayed:   rueidis.NewLuaScript(luaMoveDelayedToStream),
 	}
 
 	// Register tiers in sorted set so workers can discover them.

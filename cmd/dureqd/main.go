@@ -78,9 +78,6 @@ func main() {
 
 	// Start monitoring API — HTTP (wired to server's store and dispatcher).
 	svc := monitor.NewAPIService(srv.Store(), srv.Dispatcher(), logger)
-	if w := srv.Worker(); w != nil {
-		svc.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
-	}
 	api := monitor.NewAPI(svc)
 	httpSrv := &http.Server{Addr: apiAddr, Handler: api.Handler()}
 	go func() {
@@ -93,9 +90,6 @@ func main() {
 	// Start monitoring API — gRPC.
 	grpcSrv := grpc.NewServer()
 	grpcMonitor := monitor.NewGRPCServer(srv.Store(), srv.Dispatcher(), logger)
-	if w := srv.Worker(); w != nil {
-		grpcMonitor.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
-	}
 	grpcMonitor.RegisterServer(grpcSrv)
 	reflection.Register(grpcSrv)
 	go func() {

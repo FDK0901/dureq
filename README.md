@@ -595,7 +595,6 @@ dureq/
 ├── cmd/
 │   ├── dureqd/             # Server daemon (actor engine + HTTP/gRPC APIs)
 │   │   ├── main.go
-│   │   ├── config.yaml     # Default configuration
 │   │   └── config/         # YAML config loading (Koanf)
 │   └── dureqctl/           # Interactive terminal UI (Bubble Tea)
 │       ├── main.go

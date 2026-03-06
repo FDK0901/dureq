@@ -182,8 +182,12 @@ func (d *DispatcherActor) onWorkerStatus(ctx *actor.Context, msg *pb.WorkerStatu
 	}
 
 	// Use the sender PID as the WorkerSupervisor PID for this node.
+	// Fall back to the explicit PID fields if ctx.Sender() is nil
+	// (can happen when messages traverse cluster singleton routing).
 	if sender := ctx.Sender(); sender != nil {
 		ns.pid = sender
+	} else if msg.SenderAddress != "" && msg.SenderId != "" {
+		ns.pid = actor.NewPID(msg.SenderAddress, msg.SenderId)
 	}
 
 	ns.runningWorkers = int(msg.RunningWorkers)

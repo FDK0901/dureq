@@ -906,13 +906,20 @@ func (o *OrchestratorActor) handleBatchRetry(actorCtx *actor.Context, event type
 	}
 
 	now := time.Now()
+	prevRunning := batch.RunningItems
 	o.dispatchBatchChunk(actorCtx, bgCtx, batch, &now)
+
+	dispatched := batch.RunningItems - prevRunning
+	if dispatched <= 0 {
+		o.logger.Warn().String("batch_id", batchID).Msg("orchestrator: batch retry triggered but no items to dispatch")
+		return
+	}
 
 	if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
 		o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after retry dispatch")
 	}
 
-	o.logger.Info().String("batch_id", batchID).Msg("orchestrator: dispatched chunk for batch retry")
+	o.logger.Info().String("batch_id", batchID).Int("dispatched", dispatched).Msg("orchestrator: dispatched chunk for batch retry")
 }
 
 // ---------------------------------------------------------------------------

@@ -192,12 +192,17 @@ func (ws *WorkerSupervisorActor) onCapacityTick(ctx *actor.Context) {
 		idle = 0
 	}
 
+	// Include explicit PID so the dispatcher can route ExecuteJobMsg back
+	// even if ctx.Sender() is not preserved through cluster singleton routing.
+	myPID := ctx.PID()
 	ctx.Send(ws.dispatcherPID, &pb.WorkerStatusMsg{
 		NodeId:         ws.nodeID,
 		RunningWorkers: int32(ws.running),
 		IdleWorkers:    int32(idle),
 		MaxConcurrency: int32(ws.maxConcurrency),
 		TaskTypes:      ws.registry.TaskTypes(),
+		SenderAddress:  myPID.Address,
+		SenderId:       myPID.ID,
 	})
 }
 

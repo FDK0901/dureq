@@ -259,6 +259,14 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 		return nil, fmt.Errorf("create job: %w", err)
 	}
 
+	// Publish job.enqueued so real-time subscribers (WS, UI) see the new job immediately.
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventJobEnqueued,
+		JobID:     job.ID,
+		TaskType:  job.TaskType,
+		Timestamp: now,
+	})
+
 	switch job.Schedule.Type {
 	case types.ScheduleImmediate:
 		if err := c.dispatchJob(ctx, job); err != nil {

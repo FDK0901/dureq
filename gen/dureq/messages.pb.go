@@ -468,8 +468,12 @@ type WorkerStatusMsg struct {
 	IdleWorkers    int32                  `protobuf:"varint,3,opt,name=idle_workers,json=idleWorkers,proto3" json:"idle_workers,omitempty"`
 	MaxConcurrency int32                  `protobuf:"varint,4,opt,name=max_concurrency,json=maxConcurrency,proto3" json:"max_concurrency,omitempty"`
 	TaskTypes      []string               `protobuf:"bytes,5,rep,name=task_types,json=taskTypes,proto3" json:"task_types,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// Explicit sender PID for cases where ctx.Sender() is not preserved
+	// through cluster singleton routing.
+	SenderAddress string `protobuf:"bytes,6,opt,name=sender_address,json=senderAddress,proto3" json:"sender_address,omitempty"`
+	SenderId      string `protobuf:"bytes,7,opt,name=sender_id,json=senderId,proto3" json:"sender_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *WorkerStatusMsg) Reset() {
@@ -535,6 +539,20 @@ func (x *WorkerStatusMsg) GetTaskTypes() []string {
 		return x.TaskTypes
 	}
 	return nil
+}
+
+func (x *WorkerStatusMsg) GetSenderAddress() string {
+	if x != nil {
+		return x.SenderAddress
+	}
+	return ""
+}
+
+func (x *WorkerStatusMsg) GetSenderId() string {
+	if x != nil {
+		return x.SenderId
+	}
+	return ""
 }
 
 // DomainEventMsg: domain event bridged between actors and Redis
@@ -938,14 +956,16 @@ const file_dureq_messages_proto_rawDesc = "" +
 	" \x01(\x03R\x10finishedAtUnixMs\x12\x1f\n" +
 	"\vworkflow_id\x18\v \x01(\tR\n" +
 	"workflowId\x12\x19\n" +
-	"\bbatch_id\x18\f \x01(\tR\abatchId\"\xbe\x01\n" +
+	"\bbatch_id\x18\f \x01(\tR\abatchId\"\x82\x02\n" +
 	"\x0fWorkerStatusMsg\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12'\n" +
 	"\x0frunning_workers\x18\x02 \x01(\x05R\x0erunningWorkers\x12!\n" +
 	"\fidle_workers\x18\x03 \x01(\x05R\vidleWorkers\x12'\n" +
 	"\x0fmax_concurrency\x18\x04 \x01(\x05R\x0emaxConcurrency\x12\x1d\n" +
 	"\n" +
-	"task_types\x18\x05 \x03(\tR\ttaskTypes\"\xe2\x02\n" +
+	"task_types\x18\x05 \x03(\tR\ttaskTypes\x12%\n" +
+	"\x0esender_address\x18\x06 \x01(\tR\rsenderAddress\x12\x1b\n" +
+	"\tsender_id\x18\a \x01(\tR\bsenderId\"\xe2\x02\n" +
 	"\x0eDomainEventMsg\x12\x12\n" +
 	"\x04type\x18\x01 \x01(\tR\x04type\x12\x15\n" +
 	"\x06job_id\x18\x02 \x01(\tR\x05jobId\x12\x15\n" +

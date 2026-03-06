@@ -62,6 +62,10 @@ message WorkerStatusMsg {
   int32  idle_workers = 3;
   int32  max_concurrency = 4;
   repeated string task_types = 5;
+  // Explicit sender PID for cases where ctx.Sender() is not preserved
+  // through cluster singleton routing.
+  string sender_address = 6;
+  string sender_id = 7;
 }
 
 // DomainEventMsg: domain event bridged between actors and Redis

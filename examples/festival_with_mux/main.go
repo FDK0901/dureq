@@ -29,6 +29,7 @@ import (
 	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
 	"github.com/bytedance/sonic"
 	"github.com/rs/xid"
+	"github.com/rs/zerolog"
 )
 
 // FestivalPayload is the input for the festival wait time query handler.
@@ -105,6 +106,7 @@ func main() {
 	defer cancel()
 
 	zl := chainedzerolog.NewZerologBase()
+	zl.WithLevel(zerolog.InfoLevel)
 	logger := chainedzerolog.NewZerolog(zl)
 
 	// --- Server Side ---
@@ -174,17 +176,17 @@ func main() {
 	}{
 		{
 			ID:        xid.New().String(),
-			OpenDate:  time.Now().Add(1 * time.Minute),
-			CloseDate: time.Now().Add(10 * time.Minute),
+			OpenDate:  time.Now().Add(5 * time.Second),
+			CloseDate: time.Now().Add(30 * time.Second),
 		},
 		{
 			ID:        xid.New().String(),
-			OpenDate:  time.Now().Add(2 * time.Minute),
-			CloseDate: time.Now().Add(15 * time.Minute),
+			OpenDate:  time.Now().Add(10 * time.Second),
+			CloseDate: time.Now().Add(40 * time.Second),
 		},
 	}
 
-	interval := types.Duration(30 * time.Second)
+	interval := types.Duration(2 * time.Second)
 
 	for _, fest := range festivals {
 		payload, _ := sonic.ConfigFastest.Marshal(FestivalPayload{FestivalID: fest.ID})

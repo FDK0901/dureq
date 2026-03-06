@@ -155,11 +155,12 @@ func (eb *EventBridgeActor) onWorkerDone(ctx *actor.Context, msg *messages.Worke
 		eb.logger.Error().String("run_id", msg.RunID).String("job_id", msg.JobID).Err(err).Msg("event bridge: CompleteRun pipeline failed")
 	}
 
-	// Evaluate retry policy for standalone jobs, or just update status for batch/workflow.
-	eb.handleRetryOrFinalize(bgCtx, msg)
+	// Evaluate retry policy — returns true if the job was scheduled for retry.
+	retried := eb.handleRetryOrFinalize(bgCtx, msg)
 
-	// Forward to OrchestratorActor if workflow/batch job.
-	if eb.orchestratorPID != nil && (msg.WorkflowID != "" || msg.BatchID != "") {
+	// Forward to OrchestratorActor if workflow/batch job, but only if not retrying.
+	// During retry the item is still "in progress" from the batch/workflow perspective.
+	if !retried && eb.orchestratorPID != nil && (msg.WorkflowID != "" || msg.BatchID != "") {
 		domainEvent := messages.JobEventToDomainEvent(event)
 		ctx.Send(eb.orchestratorPID, domainEvent)
 	}
@@ -242,28 +243,32 @@ func (eb *EventBridgeActor) onDomainEvent(ctx *actor.Context, msg *pb.DomainEven
 	eb.logger.Debug().String("type", string(msg.Type)).String("job_id", msg.JobId).Msg("event bridge: forwarded domain event")
 }
 
-// handleRetryOrFinalize evaluates whether a failed standalone job should be retried
-// (with exponential backoff via the delayed sorted set) or moved to the DLQ.
-// Batch/workflow jobs delegate to the orchestrator — we only update their status here.
-func (eb *EventBridgeActor) handleRetryOrFinalize(ctx context.Context, msg *messages.WorkerDoneMsg) {
-	// Batch/workflow jobs: orchestrator handles retry logic.
-	if msg.BatchID != "" || msg.WorkflowID != "" {
-		eb.updateJobStatus(ctx, msg.JobID, msg.Success, msg.Error)
-		return
-	}
+// handleRetryOrFinalize evaluates whether a failed job should be retried
+// (with exponential backoff via the delayed sorted set) or finalized.
+// Returns true if the job was scheduled for retry — callers should suppress
+// orchestrator forwarding in that case so the batch/workflow doesn't count
+// the item as failed while it still has retry attempts remaining.
+func (eb *EventBridgeActor) handleRetryOrFinalize(ctx context.Context, msg *messages.WorkerDoneMsg) bool {
+	isBatchOrWorkflow := msg.BatchID != "" || msg.WorkflowID != ""
+
 	if msg.Success {
 		eb.updateJobStatus(ctx, msg.JobID, true, "")
-		return
+		return false
 	}
 
-	// Failed standalone job — check retry policy.
+	// Load job to inspect retry policy.
 	job, rev, err := eb.store.GetJob(ctx, msg.JobID)
 	if err != nil || job.Status.IsTerminal() {
-		return
+		return false
 	}
 
 	retryPolicy := job.RetryPolicy
 	if retryPolicy == nil {
+		if isBatchOrWorkflow {
+			// No per-item retry policy — just mark failed, let orchestrator handle it.
+			eb.updateJobStatus(ctx, msg.JobID, false, msg.Error)
+			return false
+		}
 		retryPolicy = types.DefaultRetryPolicy()
 	}
 
@@ -275,12 +280,25 @@ func (eb *EventBridgeActor) handleRetryOrFinalize(ctx context.Context, msg *mess
 	job.UpdatedAt = now
 
 	maxAttempts := retryPolicy.MaxAttempts
-	if job.DLQAfter != nil && *job.DLQAfter > 0 && *job.DLQAfter < maxAttempts {
-		maxAttempts = *job.DLQAfter
+	// DLQ-after threshold only applies to standalone jobs.
+	if !isBatchOrWorkflow {
+		if job.DLQAfter != nil && *job.DLQAfter > 0 && *job.DLQAfter < maxAttempts {
+			maxAttempts = *job.DLQAfter
+		}
 	}
 
 	if job.Attempt >= maxAttempts {
-		// Exhausted retries — move to DLQ.
+		if isBatchOrWorkflow {
+			// Batch/workflow item exhausted retries — mark failed.
+			// The orchestrator will handle batch/workflow-level completion.
+			job.Status = types.JobStatusFailed
+			if _, err := eb.store.UpdateJob(ctx, job, rev); err != nil {
+				eb.logger.Debug().String("job_id", job.ID).Err(err).Msg("event bridge: failed to update batch/workflow job to failed")
+			}
+			return false
+		}
+
+		// Standalone job exhausted retries — move to DLQ.
 		job.Status = types.JobStatusDead
 		if _, err := eb.store.UpdateJob(ctx, job, rev); err != nil {
 			eb.logger.Debug().String("job_id", job.ID).Err(err).Msg("event bridge: failed to update job to dead")
@@ -293,7 +311,7 @@ func (eb *EventBridgeActor) handleRetryOrFinalize(ctx context.Context, msg *mess
 		if err := eb.store.DispatchToDLQ(ctx, wm); err != nil {
 			eb.logger.Error().String("job_id", job.ID).Err(err).Msg("event bridge: failed to dispatch to DLQ")
 		}
-		return
+		return false
 	}
 
 	// Schedule retry with backoff via delayed sorted set.
@@ -320,6 +338,7 @@ func (eb *EventBridgeActor) handleRetryOrFinalize(ctx context.Context, msg *mess
 	}
 
 	eb.logger.Debug().String("job_id", job.ID).Int("attempt", job.Attempt).Int("max", maxAttempts).Msg("event bridge: scheduled retry")
+	return true
 }
 
 // updateJobStatus sets the Job record to completed or failed after its run finishes.

@@ -183,13 +183,25 @@ func (s *SchedulerActor) processSchedule(ctx *actor.Context, entry *types.Schedu
 	if len(missedFirings) > 1 {
 		s.logger.Info().String("job_id", entry.JobID).Int("missed_count", len(missedFirings)).Msg("scheduler: backfilling missed firings")
 		currentRev := rev
+		anyDispatched := false
 		for _, firingTime := range missedFirings {
-			currentRev = s.dispatchFiring(ctx, bgCtx, job, currentRev, entry, firingTime)
+			newRev, ok := s.dispatchFiring(ctx, bgCtx, job, currentRev, entry, firingTime)
+			if !ok {
+				break // dispatcher unavailable — stop and retry next tick
+			}
+			currentRev = newRev
+			anyDispatched = true
+			lastFiring := firingTime
+			entry.LastProcessedAt = &lastFiring
 		}
-		lastFiring := missedFirings[len(missedFirings)-1]
-		entry.LastProcessedAt = &lastFiring
+		if !anyDispatched {
+			return // leave schedule untouched for next tick
+		}
 	} else {
-		s.dispatchFiring(ctx, bgCtx, job, rev, entry, now)
+		_, ok := s.dispatchFiring(ctx, bgCtx, job, rev, entry, now)
+		if !ok {
+			return // leave schedule untouched for next tick
+		}
 		entry.LastProcessedAt = &now
 	}
 
@@ -198,8 +210,17 @@ func (s *SchedulerActor) processSchedule(ctx *actor.Context, entry *types.Schedu
 }
 
 // dispatchFiring dispatches a single firing of a scheduled job via the DispatcherActor.
-// Returns the new CAS revision so callers can chain updates in a backfill loop.
-func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time) uint64 {
+// Returns (new CAS revision, true) on success. If the dispatcher PID cannot be
+// resolved the job and schedule are left untouched so the next tick retries.
+func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time) (uint64, bool) {
+	// Resolve dispatcher PID first — if unavailable, bail out without
+	// modifying the job or schedule so the next tick retries.
+	pid := s.resolveDispatcherPID()
+	if pid == nil {
+		s.logger.Warn().String("job_id", job.ID).Msg("scheduler: dispatcher PID not resolved, will retry next tick")
+		return rev, false
+	}
+
 	job.Status = types.JobStatusPending
 	job.LastRunAt = &firingTime
 	job.UpdatedAt = time.Now()
@@ -207,7 +228,7 @@ func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.C
 	newRev, err := s.store.UpdateJob(bgCtx, job, rev)
 	if err != nil {
 		s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: CAS update failed")
-		return rev
+		return rev, false
 	}
 	rev = newRev
 
@@ -220,10 +241,8 @@ func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.C
 		job.Headers["x-dureq-scheduled-at"] = firingTime.Format(time.RFC3339Nano)
 	}
 
-	if pid := s.resolveDispatcherPID(); pid != nil {
-		dispatchMsg := messages.JobToDispatchMsg(job, job.Attempt)
-		actorCtx.Send(pid, dispatchMsg)
-	}
+	dispatchMsg := messages.JobToDispatchMsg(job, job.Attempt)
+	actorCtx.Send(pid, dispatchMsg)
 
 	s.publishEvent(actorCtx, types.JobEvent{
 		Type:      types.EventJobDispatched,
@@ -232,7 +251,7 @@ func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.C
 		Timestamp: firingTime,
 	})
 
-	return rev
+	return rev, true
 }
 
 // advanceSchedule calculates and saves the next run time for a schedule.
@@ -291,7 +310,8 @@ func (s *SchedulerActor) drainOverlapBuffer(actorCtx *actor.Context, bgCtx conte
 				break
 			}
 			s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: draining buffered overlap (all)")
-			rev = s.dispatchFiring(actorCtx, bgCtx, job, rev, entry, time.Now())
+			newRev, _ := s.dispatchFiring(actorCtx, bgCtx, job, rev, entry, time.Now())
+			rev = newRev
 		}
 	}
 }

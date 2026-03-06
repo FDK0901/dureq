@@ -771,6 +771,53 @@ func (a *APIService) GetSyncRetries() any {
 }
 
 // ---------------------------------------------------------------------------
+// Payload search (JSONPath)
+// ---------------------------------------------------------------------------
+
+func (a *APIService) SearchJobsByPayload(ctx context.Context, jsonPath, value string) (*types.Job, error) {
+	job, _, err := a.store.FindJobByPayloadPath(ctx, jsonPath, value)
+	if err != nil {
+		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+	}
+	return job, nil
+}
+
+func (a *APIService) SearchWorkflowsByPayload(ctx context.Context, jsonPath, value string) (*types.WorkflowInstance, error) {
+	wf, _, err := a.store.FindWorkflowByTaskPayloadPath(ctx, jsonPath, value)
+	if err != nil {
+		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+	}
+	return wf, nil
+}
+
+func (a *APIService) SearchBatchesByPayload(ctx context.Context, jsonPath, value string) (*types.BatchInstance, error) {
+	batch, _, err := a.store.FindBatchByPayloadPath(ctx, jsonPath, value)
+	if err != nil {
+		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+	}
+	return batch, nil
+}
+
+// ---------------------------------------------------------------------------
+// Unique keys
+// ---------------------------------------------------------------------------
+
+func (a *APIService) CheckUniqueKey(ctx context.Context, uniqueKey string) (string, bool, error) {
+	jobID, exists, err := a.store.CheckUniqueKey(ctx, uniqueKey)
+	if err != nil {
+		return "", false, &ApiError{Msg: err.Error(), StatusCode: http.StatusInternalServerError}
+	}
+	return jobID, exists, nil
+}
+
+func (a *APIService) DeleteUniqueKey(ctx context.Context, uniqueKey string) error {
+	if err := a.store.DeleteUniqueKey(ctx, uniqueKey); err != nil {
+		return &ApiError{Msg: err.Error(), StatusCode: http.StatusInternalServerError}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // Bulk operations
 // ---------------------------------------------------------------------------
 

@@ -82,6 +82,7 @@ func (g *GRPCServer) CancelWorkflow(ctx context.Context, req *pb.CancelWorkflowR
 						childJob.Status = types.JobStatusCancelled
 						childJob.UpdatedAt = now
 						g.store.UpdateJob(ctx, childJob, childRev)
+						g.store.SignalCancelActiveRuns(ctx, state.JobID)
 					}
 				}
 			}

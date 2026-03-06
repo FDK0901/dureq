@@ -63,18 +63,21 @@ type delayedEntry struct {
 	Priority int    `json:"priority"`
 }
 
-// MoveDelayedToNotify reads ripe entries from the delayed sorted set and
-// re-dispatches them via PublishJobNotification (actor push path).
-// Entries are removed from the set after successful notification.
+// MoveDelayedToNotify atomically pops ripe entries from the delayed sorted set
+// and re-dispatches them via PublishJobNotification (actor push path).
+// Uses a Lua script for atomic ZRANGEBYSCORE+ZREM to prevent duplicate
+// processing across multiple poller instances on different nodes.
 func (s *RedisStore) MoveDelayedToNotify(ctx context.Context, tierName string, maxMove int) (int64, error) {
 	key := DelayedKey(s.prefix, tierName)
 	nowScore := strconv.FormatFloat(float64(time.Now().UnixNano()), 'f', 0, 64)
 
-	// Fetch ripe entries (score <= now).
-	cmd := s.rdb.B().Zrangebyscore().Key(key).Min("-inf").Max(nowScore).Limit(0, int64(maxMove)).Build()
-	members, err := s.rdb.Do(ctx, cmd).AsStrSlice()
+	// Atomically pop ripe entries (read + remove in one Lua call).
+	members, err := s.scriptPopDelayed.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{nowScore, strconv.Itoa(maxMove)},
+	).AsStrSlice()
 	if err != nil {
-		return 0, err
+		return 0, nil // empty result or redis nil
 	}
 	if len(members) == 0 {
 		return 0, nil
@@ -84,16 +87,15 @@ func (s *RedisStore) MoveDelayedToNotify(ctx context.Context, tierName string, m
 	for _, raw := range members {
 		var entry delayedEntry
 		if err := sonic.ConfigFastest.Unmarshal([]byte(raw), &entry); err != nil {
-			// Remove unparseable entries to avoid infinite retry.
-			s.rdb.Do(ctx, s.rdb.B().Zrem().Key(key).Member(raw).Build())
-			continue
+			continue // already removed from set by Lua
 		}
 
 		if err := s.PublishJobNotification(ctx, entry.JobID, entry.TaskType, entry.Priority); err != nil {
-			continue // leave in set for next poll
+			// Entry already removed from sorted set. The job remains in store
+			// with "pending" status and can be retried manually or picked up
+			// by the scheduler on the next tick.
+			continue
 		}
-
-		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(key).Member(raw).Build())
 		moved++
 	}
 

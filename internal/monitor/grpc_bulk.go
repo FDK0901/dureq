@@ -156,6 +156,7 @@ func (g *GRPCServer) BulkCancelWorkflows(ctx context.Context, req *pb.BulkCancel
 							childJob.Status = types.JobStatusCancelled
 							childJob.UpdatedAt = now
 							g.store.UpdateJob(ctx, childJob, childRev)
+							g.store.SignalCancelActiveRuns(ctx, state.JobID)
 						}
 					}
 				}
@@ -286,6 +287,7 @@ func (g *GRPCServer) BulkCancelBatches(ctx context.Context, req *pb.BulkCancelBa
 							childJob.Status = types.JobStatusCancelled
 							childJob.UpdatedAt = now
 							g.store.UpdateJob(ctx, childJob, childRev)
+							g.store.SignalCancelActiveRuns(ctx, state.JobID)
 						}
 					}
 				}

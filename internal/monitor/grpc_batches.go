@@ -113,6 +113,7 @@ func (g *GRPCServer) CancelBatch(ctx context.Context, req *pb.CancelBatchRequest
 						childJob.Status = types.JobStatusCancelled
 						childJob.UpdatedAt = now
 						g.store.UpdateJob(ctx, childJob, childRev)
+						g.store.SignalCancelActiveRuns(ctx, state.JobID)
 					}
 				}
 			}

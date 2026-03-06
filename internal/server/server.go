@@ -249,7 +249,9 @@ func (s *Server) Stop() error {
 	}
 
 	// 5. Cancel context and close Redis.
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.rdb != nil {
 		s.rdb.Close()
 	}

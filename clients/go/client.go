@@ -10,6 +10,7 @@ import (
 
 	"github.com/FDK0901/dureq/internal/scheduler"
 	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/internal/workflow"
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/bytedance/sonic"
 	"github.com/redis/rueidis"
@@ -373,6 +374,10 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*types.Job, error) {
 
 // EnqueueWorkflow submits a workflow definition for execution.
 func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefinition, input any) (*types.WorkflowInstance, error) {
+	if err := workflow.ValidateDAG(&def); err != nil {
+		return nil, fmt.Errorf("validate workflow: %w", err)
+	}
+
 	now := time.Now()
 
 	tasks := make(map[string]types.WorkflowTaskState, len(def.Tasks))
@@ -411,10 +416,15 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 
 	roots := rootTasks(&def)
 	for _, taskName := range roots {
-		c.dispatchWorkflowTask(ctx, wf, taskName, &now)
+		if err := c.dispatchWorkflowTask(ctx, wf, taskName, &now); err != nil {
+			c.store.DeleteWorkflow(ctx, wf.ID)
+			return nil, fmt.Errorf("dispatch root task: %w", err)
+		}
 	}
 
-	c.store.UpdateWorkflow(ctx, wf, rev)
+	if _, err := c.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+		return nil, fmt.Errorf("update workflow after dispatch: %w", err)
+	}
 
 	return wf, nil
 }
@@ -432,6 +442,20 @@ func (c *Client) GetWorkflow(ctx context.Context, workflowID string) (*types.Wor
 
 // EnqueueBatch submits a batch definition for processing.
 func (c *Client) EnqueueBatch(ctx context.Context, def types.BatchDefinition) (*types.BatchInstance, error) {
+	if len(def.Items) == 0 && (def.OnetimeTaskType == nil || *def.OnetimeTaskType == "") {
+		return nil, fmt.Errorf("batch has no items and no onetime task type")
+	}
+
+	// Validate no duplicate item IDs — duplicates would cause TotalItems
+	// to exceed len(itemStates), making completion impossible.
+	seen := make(map[string]struct{}, len(def.Items))
+	for _, item := range def.Items {
+		if _, dup := seen[item.ID]; dup {
+			return nil, fmt.Errorf("duplicate batch item ID: %q", item.ID)
+		}
+		seen[item.ID] = struct{}{}
+	}
+
 	now := time.Now()
 
 	itemStates := make(map[string]types.BatchItemState, len(def.Items))
@@ -472,11 +496,19 @@ func (c *Client) EnqueueBatch(ctx context.Context, def types.BatchDefinition) (*
 	})
 
 	if def.OnetimeTaskType != nil && *def.OnetimeTaskType != "" {
-		c.dispatchBatchOnetime(ctx, batch, &now)
-		c.store.UpdateBatch(ctx, batch, batchRev)
+		if err := c.dispatchBatchOnetime(ctx, batch, &now); err != nil {
+			c.store.DeleteBatch(ctx, batch.ID)
+			return nil, fmt.Errorf("dispatch batch onetime: %w", err)
+		}
 	} else {
-		c.dispatchBatchChunk(ctx, batch, &now)
-		c.store.UpdateBatch(ctx, batch, batchRev)
+		if err := c.dispatchBatchChunk(ctx, batch, &now); err != nil {
+			c.store.DeleteBatch(ctx, batch.ID)
+			return nil, fmt.Errorf("dispatch batch chunk: %w", err)
+		}
+	}
+
+	if _, err := c.store.UpdateBatch(ctx, batch, batchRev); err != nil {
+		return nil, fmt.Errorf("update batch after dispatch: %w", err)
 	}
 
 	return batch, nil
@@ -587,7 +619,7 @@ func (c *Client) publishEvent(ctx context.Context, event types.JobEvent) {
 	c.store.PublishEvent(ctx, event)
 }
 
-func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowInstance, taskName string, now *time.Time) {
+func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowInstance, taskName string, now *time.Time) error {
 	var taskDef *types.WorkflowTask
 	for i := range wf.Definition.Tasks {
 		if wf.Definition.Tasks[i].Name == taskName {
@@ -596,7 +628,7 @@ func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowIns
 		}
 	}
 	if taskDef == nil {
-		return
+		return fmt.Errorf("task definition not found: %s", taskName)
 	}
 
 	job := &types.Job{
@@ -613,10 +645,11 @@ func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowIns
 	}
 
 	if _, err := c.store.CreateJob(ctx, job); err != nil {
-		return
+		return fmt.Errorf("create job for task %s: %w", taskName, err)
 	}
 	if err := c.dispatchJob(ctx, job); err != nil {
-		return
+		c.store.DeleteJob(ctx, job.ID)
+		return fmt.Errorf("dispatch task %s: %w", taskName, err)
 	}
 
 	if state, ok := wf.Tasks[taskName]; ok {
@@ -625,9 +658,10 @@ func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowIns
 		state.StartedAt = now
 		wf.Tasks[taskName] = state
 	}
+	return nil
 }
 
-func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchInstance, now *time.Time) {
+func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchInstance, now *time.Time) error {
 	job := &types.Job{
 		ID:        xid.New().String(),
 		TaskType:  *batch.Definition.OnetimeTaskType,
@@ -642,10 +676,11 @@ func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchIns
 	}
 
 	if _, err := c.store.CreateJob(ctx, job); err != nil {
-		return
+		return fmt.Errorf("create onetime job: %w", err)
 	}
 	if err := c.dispatchJob(ctx, job); err != nil {
-		return
+		c.store.DeleteJob(ctx, job.ID)
+		return fmt.Errorf("dispatch onetime job: %w", err)
 	}
 
 	batch.OnetimeState = &types.BatchOnetimeState{
@@ -653,9 +688,10 @@ func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchIns
 		Status:    types.JobStatusRunning,
 		StartedAt: now,
 	}
+	return nil
 }
 
-func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInstance, now *time.Time) {
+func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInstance, now *time.Time) error {
 	chunkSize := batch.Definition.ChunkSize
 	if chunkSize <= 0 {
 		chunkSize = 100
@@ -663,6 +699,7 @@ func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInsta
 
 	items := batch.Definition.Items
 	dispatched := 0
+	var firstErr error
 
 	for batch.NextChunkIndex < len(items) && dispatched < chunkSize && batch.RunningItems < chunkSize {
 		item := items[batch.NextChunkIndex]
@@ -688,9 +725,16 @@ func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInsta
 		}
 
 		if _, err := c.store.CreateJob(ctx, job); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("create batch item job %s: %w", item.ID, err)
+			}
 			continue
 		}
 		if err := c.dispatchJob(ctx, job); err != nil {
+			c.store.DeleteJob(ctx, job.ID)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("dispatch batch item %s: %w", item.ID, err)
+			}
 			continue
 		}
 
@@ -704,6 +748,11 @@ func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInsta
 		batch.PendingItems--
 		dispatched++
 	}
+
+	if dispatched == 0 && firstErr != nil {
+		return firstErr
+	}
+	return nil
 }
 
 // rootTasks returns task names that have no dependencies (DAG roots).

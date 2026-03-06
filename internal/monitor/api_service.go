@@ -377,13 +377,7 @@ func (a *APIService) CancelWorkflow(ctx context.Context, wfID string) error {
 						childJob.Status = types.JobStatusCancelled
 						childJob.UpdatedAt = now
 						a.store.UpdateJob(ctx, childJob, childRev)
-
-						// Signal active runs for this child job.
-						if runs, _ := a.store.ListActiveRunsByJobID(ctx, state.JobID); len(runs) > 0 {
-							for _, run := range runs {
-								a.store.Client().Do(ctx, a.store.Client().B().Publish().Channel(a.store.CancelChannel()).Message(run.ID).Build())
-							}
-						}
+						a.store.SignalCancelActiveRuns(ctx, state.JobID)
 					}
 				}
 			}
@@ -503,13 +497,7 @@ func (a *APIService) CancelBatch(ctx context.Context, batchID string) error {
 						childJob.Status = types.JobStatusCancelled
 						childJob.UpdatedAt = now
 						a.store.UpdateJob(ctx, childJob, childRev)
-
-						// Signal active runs for this child job.
-						if runs, _ := a.store.ListActiveRunsByJobID(ctx, state.JobID); len(runs) > 0 {
-							for _, run := range runs {
-								a.store.Client().Do(ctx, a.store.Client().B().Publish().Channel(a.store.CancelChannel()).Message(run.ID).Build())
-							}
-						}
+						a.store.SignalCancelActiveRuns(ctx, state.JobID)
 					}
 				}
 			}
@@ -874,6 +862,7 @@ func (a *APIService) BulkCancelWorkflows(ctx context.Context, req BulkRequest) (
 							childJob.Status = types.JobStatusCancelled
 							childJob.UpdatedAt = now
 							a.store.UpdateJob(ctx, childJob, childRev)
+							a.store.SignalCancelActiveRuns(ctx, state.JobID)
 						}
 					}
 				}
@@ -989,6 +978,7 @@ func (a *APIService) BulkCancelBatches(ctx context.Context, req BulkRequest) (in
 							childJob.Status = types.JobStatusCancelled
 							childJob.UpdatedAt = now
 							a.store.UpdateJob(ctx, childJob, childRev)
+							a.store.SignalCancelActiveRuns(ctx, state.JobID)
 						}
 					}
 				}

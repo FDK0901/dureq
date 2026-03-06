@@ -116,6 +116,7 @@ type RedisStore struct {
 	scriptCASJob        *rueidis.Lua
 	scriptCASUpdate     *rueidis.Lua
 	scriptCreateNX      *rueidis.Lua
+	scriptPopDelayed    *rueidis.Lua
 }
 
 // NewRedisStore creates a new Redis store and registers tier configuration.
@@ -133,6 +134,7 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog
 		scriptCASJob:        rueidis.NewLuaScript(luaCASUpdateJobSingleKey),
 		scriptCASUpdate:     rueidis.NewLuaScript(luaCASUpdate),
 		scriptCreateNX:      rueidis.NewLuaScript(luaCreateIfNotExists),
+		scriptPopDelayed:    rueidis.NewLuaScript(luaPopDelayed),
 	}
 
 	// Register tiers in sorted set so workers can discover them.
@@ -558,6 +560,19 @@ func (s *RedisStore) ListActiveRunsByJobID(ctx context.Context, jobID string) ([
 // CancelChannel returns the Redis Pub/Sub channel name used for task cancellation signals.
 func (s *RedisStore) CancelChannel() string {
 	return CancelChannelKey(s.prefix)
+}
+
+// SignalCancelActiveRuns publishes cancel signals to all active runs for a job.
+// This stops in-flight workers via the cancel Pub/Sub bridge.
+func (s *RedisStore) SignalCancelActiveRuns(ctx context.Context, jobID string) {
+	runs, err := s.ListActiveRunsByJobID(ctx, jobID)
+	if err != nil || len(runs) == 0 {
+		return
+	}
+	ch := s.CancelChannel()
+	for _, run := range runs {
+		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ch).Message(run.ID).Build())
+	}
 }
 
 // HasActiveRunForJob returns true if any non-terminal run exists for the given jobID.

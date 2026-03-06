@@ -98,6 +98,22 @@ redis.call('HSET', key, 'data', ARGV[2], '_version', tostring(nv))
 return oldData .. '\n' .. tostring(nv)
 `
 
+// luaPopDelayed atomically reads and removes ripe entries from a delayed sorted set.
+// Single-key for Redis Cluster compatibility.
+// KEYS[1] = delayed sorted set key
+// ARGV[1] = max score (now as nanoseconds string)
+// ARGV[2] = max count
+// Returns the removed members as an array.
+const luaPopDelayed = `
+local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+if #members > 0 then
+  for _, m in ipairs(members) do
+    redis.call('ZREM', KEYS[1], m)
+  end
+end
+return members
+`
+
 // Public accessors for Lua scripts needed by external packages (lock).
 
 func LuaUnlockIfOwnerScript() string { return luaUnlockIfOwner }

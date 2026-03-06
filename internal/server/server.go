@@ -14,8 +14,7 @@ import (
 	"github.com/FDK0901/dureq/internal/monitor"
 	"github.com/FDK0901/dureq/internal/provider"
 	"github.com/FDK0901/dureq/internal/store"
-	"github.com/FDK0901/dureq/internal/v1server"
-	"github.com/FDK0901/dureq/internal/worker"
+	"github.com/FDK0901/dureq/internal/handler"
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/anthdm/hollywood/actor"
@@ -33,7 +32,7 @@ type Server struct {
 	store    *store.RedisStore
 	locker   *lock.Locker
 	disp     *actorDispatcher
-	registry *v1server.HandlerRegistry
+	registry *handler.Registry
 
 	engine  *actor.Engine
 	rem     *remote.Remote
@@ -79,7 +78,7 @@ func New(opts ...Option) (*Server, error) {
 
 	return &Server{
 		cfg:      cfg,
-		registry: v1server.NewHandlerRegistry(),
+		registry: handler.NewRegistry(),
 	}, nil
 }
 
@@ -109,10 +108,6 @@ func (s *Server) RedisClient() rueidis.Client { return s.rdb }
 // Dispatcher returns the actor-model Dispatcher that satisfies monitor.Dispatcher.
 // Available after Start().
 func (s *Server) Dispatcher() monitor.Dispatcher { return s.disp }
-
-// Worker returns nil for the actor-model server (no v1 Worker).
-// dureqd checks `if w := srv.Worker(); w != nil` before using it.
-func (s *Server) Worker() *worker.Worker { return nil }
 
 // Start connects to Redis, initializes the actor system, and begins operation.
 func (s *Server) Start(ctx context.Context) error {
@@ -199,6 +194,10 @@ func (s *Server) Start(ctx context.Context) error {
 	// 7b. Start cancel bridge: Redis Pub/Sub → actor CancelRunMsg.
 	go s.cancelSubscribeLoop()
 
+	// 7c. Start delayed retry poller (actor path — re-notifies instead of XADD).
+	delayedPoller := store.NewDelayedNotifyPoller(s.store, s.cfg.Logger)
+	go delayedPoller.Start(s.ctx)
+
 	// 8. Activate singletons via ClusterGuard.
 	s.clusterGuardPID = s.engine.Spawn(
 		actors.NewClusterGuardActor(s.cluster, s.onSingletonsReady, s.cfg.Logger),
@@ -250,7 +249,9 @@ func (s *Server) Stop() error {
 	}
 
 	// 5. Cancel context and close Redis.
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.rdb != nil {
 		s.rdb.Close()
 	}

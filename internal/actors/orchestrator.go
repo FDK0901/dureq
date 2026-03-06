@@ -206,7 +206,22 @@ func (o *OrchestratorActor) handleJobCompleted(ctx *actor.Context, event types.J
 				o.dispatchWorkflowTask(ctx, bgCtx, wf, name, &now)
 			}
 			if _, err := o.store.UpdateWorkflow(bgCtx, wf, newRev); err != nil {
-				o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save dispatched task states (non-critical)")
+				// CAS conflict — re-read and apply task state changes.
+				if err == store.ErrCASConflict {
+					if freshWf, freshRev, rerr := o.store.GetWorkflow(bgCtx, wfID); rerr == nil {
+						for _, name := range ready {
+							if state, ok := wf.Tasks[name]; ok {
+								freshWf.Tasks[name] = state
+							}
+						}
+						freshWf.UpdatedAt = now
+						if _, err2 := o.store.UpdateWorkflow(bgCtx, freshWf, freshRev); err2 != nil {
+							o.logger.Warn().String("workflow_id", wfID).Err(err2).Msg("orchestrator: retry save dispatched task states failed")
+						}
+					}
+				} else {
+					o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save dispatched task states")
+				}
 			}
 		}
 		return
@@ -341,6 +356,14 @@ func (o *OrchestratorActor) dispatchWorkflowTask(actorCtx *actor.Context, bgCtx 
 
 	if _, err := o.store.CreateJob(bgCtx, job); err != nil {
 		o.logger.Error().String("workflow_id", wf.ID).String("task", taskName).Err(err).Msg("orchestrator: failed to create job for workflow task")
+		// Mark task as failed so the workflow doesn't stall silently.
+		if state, ok := wf.Tasks[taskName]; ok {
+			errStr := err.Error()
+			state.Status = types.JobStatusFailed
+			state.Error = &errStr
+			state.FinishedAt = now
+			wf.Tasks[taskName] = state
+		}
 		return
 	}
 
@@ -407,7 +430,9 @@ func (o *OrchestratorActor) retryWorkflow(actorCtx *actor.Context, bgCtx context
 	}
 
 	// Save again after dispatch updates task states.
-	o.store.UpdateWorkflow(bgCtx, wf, newRev)
+	if _, err := o.store.UpdateWorkflow(bgCtx, wf, newRev); err != nil {
+		o.logger.Warn().String("workflow_id", wf.ID).Err(err).Msg("orchestrator: failed to save workflow after retry dispatch")
+	}
 
 	o.publishEvent(actorCtx, types.JobEvent{
 		Type:      types.EventWorkflowRetrying,
@@ -502,7 +527,9 @@ func (o *OrchestratorActor) handleBatchJobCompleted(actorCtx *actor.Context, eve
 		batch.Status = types.WorkflowStatusRunning
 		batch.UpdatedAt = now
 		o.dispatchBatchChunk(actorCtx, bgCtx, batch, &now)
-		o.store.UpdateBatch(bgCtx, batch, rev)
+		if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+			o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after onetime dispatch")
+		}
 
 	case "item":
 		// Individual item completed.
@@ -548,7 +575,9 @@ func (o *OrchestratorActor) handleBatchJobCompleted(actorCtx *actor.Context, eve
 		} else {
 			o.dispatchBatchChunk(actorCtx, bgCtx, batch, &now)
 			batch.UpdatedAt = now
-			o.store.UpdateBatch(bgCtx, batch, rev)
+			if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+				o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after item chunk dispatch")
+			}
 		}
 	}
 }
@@ -596,7 +625,9 @@ func (o *OrchestratorActor) handleBatchJobFailed(actorCtx *actor.Context, event 
 		batch.Status = types.WorkflowStatusFailed
 		batch.UpdatedAt = now
 		batch.CompletedAt = &now
-		o.store.UpdateBatch(bgCtx, batch, rev)
+		if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+			o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after onetime failure")
+		}
 
 		o.publishEvent(actorCtx, types.JobEvent{
 			Type:      types.EventBatchOnetimeFailed,
@@ -649,7 +680,9 @@ func (o *OrchestratorActor) handleBatchJobFailed(actorCtx *actor.Context, event 
 			batch.Status = types.WorkflowStatusFailed
 			batch.UpdatedAt = now
 			batch.CompletedAt = &now
-			o.store.UpdateBatch(bgCtx, batch, rev)
+			if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+				o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after fail_fast")
+			}
 
 			o.publishEvent(actorCtx, types.JobEvent{
 				Type:      types.EventBatchFailed,
@@ -666,7 +699,9 @@ func (o *OrchestratorActor) handleBatchJobFailed(actorCtx *actor.Context, event 
 		} else {
 			o.dispatchBatchChunk(actorCtx, bgCtx, batch, &now)
 			batch.UpdatedAt = now
-			o.store.UpdateBatch(bgCtx, batch, rev)
+			if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+				o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after item failure chunk dispatch")
+			}
 		}
 	}
 }
@@ -711,6 +746,15 @@ func (o *OrchestratorActor) dispatchBatchChunk(actorCtx *actor.Context, bgCtx co
 
 		if _, err := o.store.CreateJob(bgCtx, job); err != nil {
 			o.logger.Error().String("batch_id", batch.ID).String("item_id", item.ID).Err(err).Msg("orchestrator: failed to create batch item job")
+			errStr := err.Error()
+			batch.ItemStates[item.ID] = types.BatchItemState{
+				ItemID:     item.ID,
+				Status:     types.JobStatusFailed,
+				Error:      &errStr,
+				FinishedAt: now,
+			}
+			batch.FailedItems++
+			batch.PendingItems--
 			continue
 		}
 
@@ -774,7 +818,9 @@ func (o *OrchestratorActor) finalizeBatch(actorCtx *actor.Context, bgCtx context
 		o.logger.Info().String("batch_id", batch.ID).Int("completed", batch.CompletedItems).Msg("orchestrator: batch completed successfully")
 	}
 
-	o.store.UpdateBatch(bgCtx, batch, rev)
+	if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+		o.logger.Warn().String("batch_id", batch.ID).Err(err).Msg("orchestrator: failed to save finalized batch")
+	}
 	o.publishBatchProgress(actorCtx, batch)
 }
 
@@ -827,7 +873,9 @@ func (o *OrchestratorActor) retryBatch(actorCtx *actor.Context, bgCtx context.Co
 
 	// Re-dispatch chunks.
 	o.dispatchBatchChunk(actorCtx, bgCtx, batch, now)
-	o.store.UpdateBatch(bgCtx, batch, newRev)
+	if _, err := o.store.UpdateBatch(bgCtx, batch, newRev); err != nil {
+		o.logger.Warn().String("batch_id", batch.ID).Err(err).Msg("orchestrator: failed to save batch after retry dispatch")
+	}
 
 	o.publishEvent(actorCtx, types.JobEvent{
 		Type:      types.EventBatchRetrying,
@@ -858,13 +906,20 @@ func (o *OrchestratorActor) handleBatchRetry(actorCtx *actor.Context, event type
 	}
 
 	now := time.Now()
+	prevRunning := batch.RunningItems
 	o.dispatchBatchChunk(actorCtx, bgCtx, batch, &now)
+
+	dispatched := batch.RunningItems - prevRunning
+	if dispatched <= 0 {
+		o.logger.Warn().String("batch_id", batchID).Msg("orchestrator: batch retry triggered but no items to dispatch")
+		return
+	}
 
 	if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
 		o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after retry dispatch")
 	}
 
-	o.logger.Info().String("batch_id", batchID).Msg("orchestrator: dispatched chunk for batch retry")
+	o.logger.Info().String("batch_id", batchID).Int("dispatched", dispatched).Msg("orchestrator: dispatched chunk for batch retry")
 }
 
 // ---------------------------------------------------------------------------
@@ -947,7 +1002,9 @@ func (o *OrchestratorActor) timeoutWorkflow(actorCtx *actor.Context, bgCtx conte
 		}
 	}
 
-	o.store.UpdateWorkflow(bgCtx, wf, rev)
+	if _, err := o.store.UpdateWorkflow(bgCtx, wf, rev); err != nil {
+		o.logger.Warn().String("workflow_id", wf.ID).Err(err).Msg("orchestrator: failed to save timed-out workflow")
+	}
 
 	o.publishEvent(actorCtx, types.JobEvent{
 		Type:      types.EventWorkflowTimedOut,
@@ -986,7 +1043,9 @@ func (o *OrchestratorActor) timeoutBatch(actorCtx *actor.Context, bgCtx context.
 	batch.CompletedAt = &now
 	batch.UpdatedAt = now
 
-	o.store.UpdateBatch(bgCtx, batch, rev)
+	if _, err := o.store.UpdateBatch(bgCtx, batch, rev); err != nil {
+		o.logger.Warn().String("batch_id", batch.ID).Err(err).Msg("orchestrator: failed to save timed-out batch")
+	}
 
 	o.publishEvent(actorCtx, types.JobEvent{
 		Type:      types.EventBatchTimedOut,
@@ -1062,7 +1121,8 @@ func (o *OrchestratorActor) processStreamEvent(actorCtx *actor.Context, bgCtx co
 // Helpers
 // ---------------------------------------------------------------------------
 
-// resolveDispatcherPID lazily looks up the DispatcherActor PID via the cluster.
+// resolveDispatcherPID looks up the DispatcherActor PID via the cluster.
+// Always performs a fresh lookup to handle dispatcher singleton migration.
 func (o *OrchestratorActor) resolveDispatcherPID() *actor.PID {
 	if o.dispatcherPID != nil {
 		return o.dispatcherPID
@@ -1072,9 +1132,9 @@ func (o *OrchestratorActor) resolveDispatcherPID() *actor.PID {
 	}
 	pids := o.cluster.GetActiveByKind(KindDispatcher)
 	if len(pids) > 0 && pids[0] != nil {
-		o.dispatcherPID = pids[0]
+		return pids[0]
 	}
-	return o.dispatcherPID
+	return nil
 }
 
 // publishEvent publishes a domain event directly to the Redis store.

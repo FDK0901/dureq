@@ -215,7 +215,10 @@ func (g *GRPCServer) ListGroups(ctx context.Context, _ *pb.ListGroupsRequest) (*
 
 	out := make([]*pb.GroupInfo, 0, len(groups))
 	for _, name := range groups {
-		size, _ := g.store.GetGroupSize(ctx, name)
+		size, err := g.store.GetGroupSize(ctx, name)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "get group size for %q: %v", name, err)
+		}
 		out = append(out, &pb.GroupInfo{Name: name, Size: size})
 	}
 
@@ -227,21 +230,30 @@ func (g *GRPCServer) ListGroups(ctx context.Context, _ *pb.ListGroupsRequest) (*
 // ListQueues returns queue/tier information including pause state and size.
 func (g *GRPCServer) ListQueues(ctx context.Context, _ *pb.ListQueuesRequest) (*pb.ListQueuesResponse, error) {
 	tiers := g.store.Config().Tiers
-	paused, _ := g.store.ListPausedQueues(ctx)
+	paused, err := g.store.ListPausedQueues(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list paused queues: %v", err)
+	}
 	pausedSet := make(map[string]bool, len(paused))
 	for _, p := range paused {
 		pausedSet[p] = true
 	}
 
+	// Use pending job count instead of legacy XLEN (streams are unused in v2 actor path).
+	jobCounts, err := g.store.GetActiveJobStats(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "get job stats for queue size: %v", err)
+	}
+	pendingCount := int64(jobCounts[types.JobStatusPending])
+
 	queues := make([]*pb.QueueInfo, 0, len(tiers))
 	for _, tier := range tiers {
-		size, _ := g.store.Client().Do(ctx, g.store.Client().B().Xlen().Key(store.WorkStreamKey(g.store.Prefix(), tier.Name)).Build()).AsInt64()
 		queues = append(queues, &pb.QueueInfo{
 			Name:       tier.Name,
 			Weight:     int32(tier.Weight),
 			FetchBatch: int32(tier.FetchBatch),
 			Paused:     pausedSet[tier.Name],
-			Size:       size,
+			Size:       pendingCount,
 		})
 	}
 
@@ -274,9 +286,18 @@ func (g *GRPCServer) GetStats(ctx context.Context, _ *pb.GetStatsRequest) (*pb.G
 		return nil, status.Errorf(codes.Internal, "get job stats: %v", err)
 	}
 
-	schedules, _ := g.store.ListSchedules(ctx)
-	runs, _ := g.store.ListRuns(ctx)
-	nodes, _ := g.store.ListNodes(ctx)
+	schedules, err := g.store.ListSchedules(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list schedules: %v", err)
+	}
+	runs, err := g.store.ListRuns(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list runs: %v", err)
+	}
+	nodes, err := g.store.ListNodes(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list nodes: %v", err)
+	}
 
 	counts := make(map[string]int32, len(jobCounts))
 	for s, c := range jobCounts {

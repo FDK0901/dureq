@@ -8,6 +8,7 @@ import (
 	pb "github.com/FDK0901/dureq/gen/dureq"
 	"github.com/FDK0901/dureq/internal/messages"
 	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/pkg/types"
 	gochainedlog "github.com/FDK0901/go-chainedlog"
 	chainedslog "github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/anthdm/hollywood/actor"
@@ -17,6 +18,10 @@ import (
 const (
 	staleCheckInterval = 15 * time.Second
 	nodeStaleThreshold = 30 * time.Second
+
+	// dispatchDedupTTL is how long a job ID stays in the dedup map after dispatch.
+	// Must be long enough to cover the window between notification and worker start.
+	dispatchDedupTTL = 30 * time.Second
 )
 
 // nodeStatus tracks the capacity and health of a remote WorkerSupervisorActor.
@@ -38,6 +43,11 @@ type DispatcherActor struct {
 	eventBridgePID *actor.PID
 	repeater       actor.SendRepeater
 	logger         gochainedlog.Logger
+
+	// recentDispatches tracks recently dispatched job IDs to prevent
+	// duplicate dispatches from multiple NotifierActors forwarding the
+	// same Pub/Sub notification.
+	recentDispatches map[string]time.Time
 }
 
 // NewDispatcherActor returns a Hollywood Producer that creates a DispatcherActor.
@@ -47,9 +57,10 @@ func NewDispatcherActor(s *store.RedisStore, logger gochainedlog.Logger) actor.P
 	}
 	return func() actor.Receiver {
 		return &DispatcherActor{
-			store:        s,
-			nodeCapacity: make(map[string]*nodeStatus),
-			logger:       logger,
+			store:            s,
+			nodeCapacity:     make(map[string]*nodeStatus),
+			recentDispatches: make(map[string]time.Time),
+			logger:           logger,
 		}
 	}
 }
@@ -101,26 +112,46 @@ func (d *DispatcherActor) onStopped() {
 // ---------------------------------------------------------------------------
 
 // onDispatchJob selects a target node and sends an ExecuteJobMsg.
-func (d *DispatcherActor) onDispatchJob(ctx *actor.Context, msg *pb.DispatchJobMsg) {
+// Returns true if a node was found and the message was sent.
+func (d *DispatcherActor) onDispatchJob(ctx *actor.Context, msg *pb.DispatchJobMsg) bool {
 	runID := xid.New().String()
 
 	target := d.selectNode(msg.TaskType)
 	if target == nil {
 		d.logger.Warn().String("job_id", msg.JobId).String("task_type", string(msg.TaskType)).Msg("dispatcher: no node with capacity for task type")
-		// No node available — the NotifierActor will re-trigger later.
-		return
+		// No node available — the job stays in "pending" and will be picked up
+		// on a future dispatch attempt (e.g., scheduler tick, delayed retry poller,
+		// or manual retry).
+		return false
 	}
 
 	execMsg := messages.DispatchToExecuteMsg(msg, runID)
 	ctx.Send(target.pid, execMsg)
 
 	d.logger.Debug().String("job_id", msg.JobId).String("run_id", runID).String("task_type", string(msg.TaskType)).Msg("dispatcher: dispatched job")
+	return true
 }
 
 // onNewJobNotification loads a job from the store and dispatches it.
+// Deduplicates notifications from multiple NotifierActors on different nodes.
 func (d *DispatcherActor) onNewJobNotification(ctx *actor.Context, msg *pb.NewJobNotification) {
+	// Dedup: skip if this job was recently dispatched.
+	if dispatchedAt, ok := d.recentDispatches[msg.JobId]; ok {
+		if time.Since(dispatchedAt) < dispatchDedupTTL {
+			d.logger.Debug().String("job_id", msg.JobId).Msg("dispatcher: duplicate notification, skipping")
+			return
+		}
+	}
+
 	bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
+	// Check if the queue/tier for this job's priority is paused.
+	tierName := store.ResolveTier(d.store.Config().Tiers, int(msg.Priority))
+	if paused, err := d.store.IsQueuePaused(bgCtx, tierName); err == nil && paused {
+		d.logger.Debug().String("job_id", msg.JobId).String("tier", tierName).Msg("dispatcher: queue paused, skipping")
+		return
+	}
 
 	job, _, err := d.store.GetJob(bgCtx, msg.JobId)
 	if err != nil {
@@ -128,8 +159,18 @@ func (d *DispatcherActor) onNewJobNotification(ctx *actor.Context, msg *pb.NewJo
 		return
 	}
 
+	// Skip if job is no longer pending (already dispatched, completed, cancelled, etc.).
+	if job.Status != types.JobStatusPending {
+		d.logger.Debug().String("job_id", msg.JobId).String("status", string(job.Status)).Msg("dispatcher: job not pending, skipping notification")
+		return
+	}
+
 	dispatchMsg := messages.JobToDispatchMsg(job, job.Attempt)
-	d.onDispatchJob(ctx, dispatchMsg)
+	if d.onDispatchJob(ctx, dispatchMsg) {
+		// Only record dedup after successful dispatch so that retry
+		// notifications are not suppressed when no node had capacity.
+		d.recentDispatches[msg.JobId] = time.Now()
+	}
 }
 
 // onWorkerStatus updates the node capacity table.
@@ -141,8 +182,12 @@ func (d *DispatcherActor) onWorkerStatus(ctx *actor.Context, msg *pb.WorkerStatu
 	}
 
 	// Use the sender PID as the WorkerSupervisor PID for this node.
+	// Fall back to the explicit PID fields if ctx.Sender() is nil
+	// (can happen when messages traverse cluster singleton routing).
 	if sender := ctx.Sender(); sender != nil {
 		ns.pid = sender
+	} else if msg.SenderAddress != "" && msg.SenderId != "" {
+		ns.pid = actor.NewPID(msg.SenderAddress, msg.SenderId)
 	}
 
 	ns.runningWorkers = int(msg.RunningWorkers)
@@ -170,13 +215,21 @@ func (d *DispatcherActor) onRejectJob(ctx *actor.Context, msg *pb.RejectJobMsg) 
 	d.onDispatchJob(ctx, dispatchMsg)
 }
 
-// onStaleCheck removes nodes that haven't reported in more than nodeStaleThreshold.
+// onStaleCheck removes nodes that haven't reported in more than nodeStaleThreshold
+// and evicts expired entries from the dispatch dedup map.
 func (d *DispatcherActor) onStaleCheck() {
 	now := time.Now()
 	for nodeID, ns := range d.nodeCapacity {
 		if now.Sub(ns.lastUpdate) > nodeStaleThreshold {
 			d.logger.Warn().String("node_id", nodeID).Time("last_update", ns.lastUpdate).Msg("dispatcher: removing stale node")
 			delete(d.nodeCapacity, nodeID)
+		}
+	}
+
+	// Evict expired dedup entries.
+	for jobID, dispatchedAt := range d.recentDispatches {
+		if now.Sub(dispatchedAt) > dispatchDedupTTL {
+			delete(d.recentDispatches, jobID)
 		}
 	}
 }

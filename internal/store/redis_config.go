@@ -88,6 +88,36 @@ func (c *RedisStoreConfig) prefix() string {
 	return defaultPrefix
 }
 
+// ResolveTier maps a numeric priority (1-10) to a configured tier name.
+// Higher priority → first tier (highest weight), lower → last tier.
+func ResolveTier(tiers []TierConfig, priority int) string {
+	if len(tiers) == 0 {
+		return "normal"
+	}
+	if len(tiers) == 1 {
+		return tiers[0].Name
+	}
+
+	p := priority
+	if p <= 0 {
+		p = 5
+	}
+	if p > 10 {
+		p = 10
+	}
+
+	bucketSize := 10 / len(tiers)
+	if bucketSize == 0 {
+		bucketSize = 1
+	}
+
+	idx := (10 - p) / bucketSize
+	if idx >= len(tiers) {
+		idx = len(tiers) - 1
+	}
+	return tiers[idx].Name
+}
+
 // DefaultTiers returns a sensible default tier configuration.
 func DefaultTiers() []TierConfig {
 	return []TierConfig{

@@ -23,6 +23,9 @@ type NotifierActor struct {
 	engine        *actor.Engine
 	pid           *actor.PID
 	logger        gochainedlog.Logger
+
+	// pendingBuffer holds notifications received before the dispatcher PID is wired.
+	pendingBuffer []*messages.NewJobFromRedisMsg
 }
 
 // NewNotifierActor returns a Hollywood Producer that creates a NotifierActor.
@@ -54,7 +57,12 @@ func (n *NotifierActor) Receive(ctx *actor.Context) {
 		n.onStopped()
 	case messages.WireDispatcherPIDMsg:
 		n.dispatcherPID = msg.PID
-		n.logger.Info().String("pid", msg.PID.String()).Msg("notifier: dispatcher PID wired")
+		n.logger.Info().String("pid", msg.PID.String()).Int("buffered", len(n.pendingBuffer)).Msg("notifier: dispatcher PID wired")
+		// Flush any notifications buffered before the dispatcher was ready.
+		for _, buffered := range n.pendingBuffer {
+			n.onNewJob(ctx, buffered)
+		}
+		n.pendingBuffer = nil
 	case *messages.NewJobFromRedisMsg:
 		n.onNewJob(ctx, msg)
 	case messages.NewJobFromRedisMsg:
@@ -91,7 +99,8 @@ func (n *NotifierActor) onStopped() {
 
 func (n *NotifierActor) onNewJob(ctx *actor.Context, msg *messages.NewJobFromRedisMsg) {
 	if n.dispatcherPID == nil {
-		n.logger.Warn().String("job_id", msg.JobID).Msg("notifier: dispatcher PID not set, dropping notification")
+		n.pendingBuffer = append(n.pendingBuffer, msg)
+		n.logger.Debug().String("job_id", msg.JobID).Int("buffered", len(n.pendingBuffer)).Msg("notifier: dispatcher not ready, buffering notification")
 		return
 	}
 

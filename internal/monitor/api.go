@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
@@ -117,6 +118,15 @@ func (a *API) registerRoutes() {
 
 	// Sync Retries
 	a.mux.HandleFunc("GET /api/sync-retries", a.getSyncRetries)
+
+	// Payload search (JSONPath)
+	a.mux.HandleFunc("GET /api/search/jobs", a.searchJobsByPayload)
+	a.mux.HandleFunc("GET /api/search/workflows", a.searchWorkflowsByPayload)
+	a.mux.HandleFunc("GET /api/search/batches", a.searchBatchesByPayload)
+
+	// Unique keys
+	a.mux.HandleFunc("GET /api/unique-keys/{key}", a.checkUniqueKey)
+	a.mux.HandleFunc("DELETE /api/unique-keys/{key}", a.deleteUniqueKey)
 
 	// Health
 	a.mux.HandleFunc("GET /api/health", a.health)
@@ -351,6 +361,23 @@ func (a *API) listHistoryRuns(w http.ResponseWriter, r *http.Request) {
 	if jid := r.URL.Query().Get("job_id"); jid != "" {
 		filter.JobID = &jid
 	}
+	if nid := r.URL.Query().Get("node_id"); nid != "" {
+		filter.NodeID = &nid
+	}
+	if tt := r.URL.Query().Get("task_type"); tt != "" {
+		taskType := types.TaskType(tt)
+		filter.TaskType = &taskType
+	}
+	if since := r.URL.Query().Get("since"); since != "" {
+		if t, err := time.Parse(time.RFC3339, since); err == nil {
+			filter.Since = &t
+		}
+	}
+	if until := r.URL.Query().Get("until"); until != "" {
+		if t, err := time.Parse(time.RFC3339, until); err == nil {
+			filter.Until = &t
+		}
+	}
 	runs, total, err := a.svc.ListHistoryRuns(r.Context(), filter)
 	if err != nil {
 		writeServiceError(w, err)
@@ -408,6 +435,9 @@ func (a *API) listWorkflows(w http.ResponseWriter, r *http.Request) {
 		status := types.WorkflowStatus(s)
 		filter.Status = &status
 	}
+	if name := r.URL.Query().Get("name"); name != "" {
+		filter.WorkflowName = &name
+	}
 	workflows, total, err := a.svc.ListWorkflows(r.Context(), filter)
 	if err != nil {
 		writeServiceError(w, err)
@@ -457,6 +487,9 @@ func (a *API) listBatches(w http.ResponseWriter, r *http.Request) {
 	if s := r.URL.Query().Get("status"); s != "" {
 		status := types.WorkflowStatus(s)
 		filter.Status = &status
+	}
+	if name := r.URL.Query().Get("name"); name != "" {
+		filter.Name = &name
 	}
 	batches, total, err := a.svc.ListBatches(r.Context(), filter)
 	if err != nil {
@@ -744,6 +777,78 @@ func (a *API) getRedisInfo(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) getSyncRetries(w http.ResponseWriter, _ *http.Request) {
 	jsonOK(w, a.svc.GetSyncRetries())
+}
+
+// ---------------------------------------------------------------------------
+// Payload search (JSONPath)
+// ---------------------------------------------------------------------------
+
+func (a *API) searchJobsByPayload(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	value := r.URL.Query().Get("value")
+	if path == "" || value == "" {
+		writeServiceError(w, &ApiError{Msg: "path and value query params are required", StatusCode: http.StatusBadRequest})
+		return
+	}
+	job, err := a.svc.SearchJobsByPayload(r.Context(), path, value)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, job)
+}
+
+func (a *API) searchWorkflowsByPayload(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	value := r.URL.Query().Get("value")
+	if path == "" || value == "" {
+		writeServiceError(w, &ApiError{Msg: "path and value query params are required", StatusCode: http.StatusBadRequest})
+		return
+	}
+	wf, err := a.svc.SearchWorkflowsByPayload(r.Context(), path, value)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, wf)
+}
+
+func (a *API) searchBatchesByPayload(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	value := r.URL.Query().Get("value")
+	if path == "" || value == "" {
+		writeServiceError(w, &ApiError{Msg: "path and value query params are required", StatusCode: http.StatusBadRequest})
+		return
+	}
+	batch, err := a.svc.SearchBatchesByPayload(r.Context(), path, value)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, batch)
+}
+
+// ---------------------------------------------------------------------------
+// Unique keys
+// ---------------------------------------------------------------------------
+
+func (a *API) checkUniqueKey(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	jobID, exists, err := a.svc.CheckUniqueKey(r.Context(), key)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]any{"unique_key": key, "exists": exists, "job_id": jobID})
+}
+
+func (a *API) deleteUniqueKey(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if err := a.svc.DeleteUniqueKey(r.Context(), key); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "deleted", "unique_key": key})
 }
 
 // ---------------------------------------------------------------------------

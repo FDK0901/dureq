@@ -116,8 +116,8 @@ type RedisStore struct {
 	scriptCASJob        *rueidis.Lua
 	scriptCASUpdate     *rueidis.Lua
 	scriptCreateNX      *rueidis.Lua
-	scriptLeaderRefresh *rueidis.Lua
-	scriptMoveDelayed   *rueidis.Lua
+	scriptPopDelayed    *rueidis.Lua
+	scriptFlushGroup    *rueidis.Lua
 }
 
 // NewRedisStore creates a new Redis store and registers tier configuration.
@@ -135,8 +135,8 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog
 		scriptCASJob:        rueidis.NewLuaScript(luaCASUpdateJobSingleKey),
 		scriptCASUpdate:     rueidis.NewLuaScript(luaCASUpdate),
 		scriptCreateNX:      rueidis.NewLuaScript(luaCreateIfNotExists),
-		scriptLeaderRefresh: rueidis.NewLuaScript(luaLeaderRefresh),
-		scriptMoveDelayed:   rueidis.NewLuaScript(luaMoveDelayedToStream),
+		scriptPopDelayed:    rueidis.NewLuaScript(luaPopDelayed),
+		scriptFlushGroup:    rueidis.NewLuaScript(luaFlushGroup),
 	}
 
 	// Register tiers in sorted set so workers can discover them.
@@ -341,8 +341,14 @@ func (s *RedisStore) GetActiveJobStats(ctx context.Context) (map[types.JobStatus
 
 // GetJobStats returns aggregated job statistics.
 func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats, error) {
-	totalJobs, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
-	totalRuns, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(HistoryRunsKey(s.prefix)).Build()).AsInt64()
+	totalJobs, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return nil, fmt.Errorf("count total jobs: %w", err)
+	}
+	totalRuns, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(HistoryRunsKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return nil, fmt.Errorf("count total runs: %w", err)
+	}
 
 	statuses := []types.JobStatus{
 		types.JobStatusPending, types.JobStatusScheduled, types.JobStatusRunning,
@@ -358,7 +364,11 @@ func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats,
 
 	byStatus := make(map[types.JobStatus]int64)
 	for i, st := range statuses {
-		if n, err := results[i].AsInt64(); err == nil && n > 0 {
+		n, err := results[i].AsInt64()
+		if err != nil {
+			return nil, fmt.Errorf("count jobs by status %q: %w", st, err)
+		}
+		if n > 0 {
 			byStatus[st] = n
 		}
 	}
@@ -562,6 +572,19 @@ func (s *RedisStore) ListActiveRunsByJobID(ctx context.Context, jobID string) ([
 // CancelChannel returns the Redis Pub/Sub channel name used for task cancellation signals.
 func (s *RedisStore) CancelChannel() string {
 	return CancelChannelKey(s.prefix)
+}
+
+// SignalCancelActiveRuns publishes cancel signals to all active runs for a job.
+// This stops in-flight workers via the cancel Pub/Sub bridge.
+func (s *RedisStore) SignalCancelActiveRuns(ctx context.Context, jobID string) {
+	runs, err := s.ListActiveRunsByJobID(ctx, jobID)
+	if err != nil || len(runs) == 0 {
+		return
+	}
+	ch := s.CancelChannel()
+	for _, run := range runs {
+		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ch).Message(run.ID).Build())
+	}
 }
 
 // HasActiveRunForJob returns true if any non-terminal run exists for the given jobID.

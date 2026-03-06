@@ -10,6 +10,7 @@ import (
 
 	"github.com/FDK0901/dureq/internal/scheduler"
 	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/internal/workflow"
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/bytedance/sonic"
 	"github.com/redis/rueidis"
@@ -167,6 +168,7 @@ func New(opts ...Option) (*Client, error) {
 
 	storeCfg := store.RedisStoreConfig{
 		KeyPrefix: cfg.keyPrefix,
+		Tiers:     cfg.tiers,
 	}
 
 	s, err := store.NewRedisStore(rdb, storeCfg, nil)
@@ -257,13 +259,18 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 		return nil, fmt.Errorf("create job: %w", err)
 	}
 
+	// Publish job.enqueued so real-time subscribers (WS, UI) see the new job immediately.
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventJobEnqueued,
+		JobID:     job.ID,
+		TaskType:  job.TaskType,
+		Timestamp: now,
+	})
+
 	switch job.Schedule.Type {
 	case types.ScheduleImmediate:
 		if err := c.dispatchJob(ctx, job); err != nil {
-			c.store.DeleteJob(ctx, job.ID)
-			if job.UniqueKey != nil && *job.UniqueKey != "" {
-				c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
-			}
+			c.rollbackEnqueue(ctx, job)
 			return nil, fmt.Errorf("dispatch: %w", err)
 		}
 		c.publishEvent(ctx, types.JobEvent{
@@ -276,6 +283,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 	default:
 		nextRun, err := scheduler.NextRunTime(job.Schedule, now)
 		if err != nil {
+			c.rollbackEnqueue(ctx, job)
 			return nil, fmt.Errorf("calculate next run: %w", err)
 		}
 		entry := &types.ScheduleEntry{
@@ -284,6 +292,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 			NextRunAt: nextRun,
 		}
 		if _, err := c.store.SaveSchedule(ctx, entry); err != nil {
+			c.rollbackEnqueue(ctx, job)
 			return nil, fmt.Errorf("save schedule: %w", err)
 		}
 		c.publishEvent(ctx, types.JobEvent{
@@ -297,7 +306,9 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 	return job, nil
 }
 
-// Cancel cancels a job by ID.
+// Cancel cancels a job by ID. This updates the job status and removes its
+// schedule, but does NOT signal in-flight worker runs via Pub/Sub. To cancel
+// active runs as well, use the monitor API's CancelJob endpoint instead.
 func (c *Client) Cancel(ctx context.Context, jobID string) error {
 	job, rev, err := c.store.GetJob(ctx, jobID)
 	if err != nil {
@@ -327,6 +338,12 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 	if err != nil {
 		return fmt.Errorf("get job: %w", err)
 	}
+	if job.Status == types.JobStatusRunning {
+		return fmt.Errorf("job is still running; cancel it first")
+	}
+
+	// Cancel any in-flight runs from the previous attempt.
+	c.store.SignalCancelActiveRuns(ctx, jobID)
 
 	now := time.Now()
 	job.Status = types.JobStatusPending
@@ -372,6 +389,10 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*types.Job, error) {
 
 // EnqueueWorkflow submits a workflow definition for execution.
 func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefinition, input any) (*types.WorkflowInstance, error) {
+	if err := workflow.ValidateDAG(&def); err != nil {
+		return nil, fmt.Errorf("validate workflow: %w", err)
+	}
+
 	now := time.Now()
 
 	tasks := make(map[string]types.WorkflowTaskState, len(def.Tasks))
@@ -410,10 +431,20 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 
 	roots := rootTasks(&def)
 	for _, taskName := range roots {
-		c.dispatchWorkflowTask(ctx, wf, taskName, &now)
+		if err := c.dispatchWorkflowTask(ctx, wf, taskName, &now); err != nil {
+			// Clean up already-dispatched child jobs before deleting parent.
+			c.cancelDispatchedWorkflowChildren(ctx, wf)
+			c.store.DeleteWorkflow(ctx, wf.ID)
+			return nil, fmt.Errorf("dispatch root task: %w", err)
+		}
 	}
 
-	c.store.UpdateWorkflow(ctx, wf, rev)
+	if _, err := c.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+		// Children already dispatched — cancel them since we can't persist parent state.
+		c.cancelDispatchedWorkflowChildren(ctx, wf)
+		c.store.DeleteWorkflow(ctx, wf.ID)
+		return nil, fmt.Errorf("update workflow after dispatch: %w", err)
+	}
 
 	return wf, nil
 }
@@ -431,6 +462,20 @@ func (c *Client) GetWorkflow(ctx context.Context, workflowID string) (*types.Wor
 
 // EnqueueBatch submits a batch definition for processing.
 func (c *Client) EnqueueBatch(ctx context.Context, def types.BatchDefinition) (*types.BatchInstance, error) {
+	if len(def.Items) == 0 && (def.OnetimeTaskType == nil || *def.OnetimeTaskType == "") {
+		return nil, fmt.Errorf("batch has no items and no onetime task type")
+	}
+
+	// Validate no duplicate item IDs — duplicates would cause TotalItems
+	// to exceed len(itemStates), making completion impossible.
+	seen := make(map[string]struct{}, len(def.Items))
+	for _, item := range def.Items {
+		if _, dup := seen[item.ID]; dup {
+			return nil, fmt.Errorf("duplicate batch item ID: %q", item.ID)
+		}
+		seen[item.ID] = struct{}{}
+	}
+
 	now := time.Now()
 
 	itemStates := make(map[string]types.BatchItemState, len(def.Items))
@@ -471,11 +516,23 @@ func (c *Client) EnqueueBatch(ctx context.Context, def types.BatchDefinition) (*
 	})
 
 	if def.OnetimeTaskType != nil && *def.OnetimeTaskType != "" {
-		c.dispatchBatchOnetime(ctx, batch, &now)
-		c.store.UpdateBatch(ctx, batch, batchRev)
+		if err := c.dispatchBatchOnetime(ctx, batch, &now); err != nil {
+			c.store.DeleteBatch(ctx, batch.ID)
+			return nil, fmt.Errorf("dispatch batch onetime: %w", err)
+		}
 	} else {
-		c.dispatchBatchChunk(ctx, batch, &now)
-		c.store.UpdateBatch(ctx, batch, batchRev)
+		if err := c.dispatchBatchChunk(ctx, batch, &now); err != nil {
+			c.cancelDispatchedBatchChildren(ctx, batch)
+			c.store.DeleteBatch(ctx, batch.ID)
+			return nil, fmt.Errorf("dispatch batch chunk: %w", err)
+		}
+	}
+
+	if _, err := c.store.UpdateBatch(ctx, batch, batchRev); err != nil {
+		// Children already dispatched — cancel them since we can't persist parent state.
+		c.cancelDispatchedBatchChildren(ctx, batch)
+		c.store.DeleteBatch(ctx, batch.ID)
+		return nil, fmt.Errorf("update batch after dispatch: %w", err)
 	}
 
 	return batch, nil
@@ -493,39 +550,49 @@ func (c *Client) GetBatch(ctx context.Context, batchID string) (*types.BatchInst
 // --- Wait operations ---
 
 // EnqueueAndWait submits a job for immediate execution and waits for the result.
+//
+// To avoid a subscribe-handshake race, the Pub/Sub subscription is established
+// BEFORE the job is enqueued. This guarantees that any result notification
+// published after enqueue is captured by the subscription.
 func (c *Client) EnqueueAndWait(ctx context.Context, taskType types.TaskType, payload any, timeout time.Duration) (*types.WorkResult, error) {
-	job, err := c.Enqueue(ctx, taskType, payload)
-	if err != nil {
-		return nil, err
-	}
+	// Pre-generate a job ID so we can subscribe before enqueuing.
+	jobID := xid.New().String()
 
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	resultCh := store.ResultNotifyChannel(c.store.Prefix(), job.ID)
+	resultCh := store.ResultNotifyChannel(c.store.Prefix(), jobID)
 	subscribeCmd := c.rdb.B().Subscribe().Channel(resultCh).Build()
 
-	// Check if result already exists before subscribing.
-	if result, err := c.store.GetResult(waitCtx, job.ID); err == nil && result != nil {
-		return result, nil
-	}
-
+	// 1. Start subscription BEFORE enqueue to close the race window.
 	resultOut := make(chan *types.WorkResult, 1)
 	errOut := make(chan error, 1)
+	subReady := make(chan struct{}, 1)
 
 	go func() {
 		err := c.rdb.Receive(waitCtx, subscribeCmd, func(msg rueidis.PubSubMessage) {
+			// Signal readiness on first callback invocation (subscription confirmation).
+			select {
+			case subReady <- struct{}{}:
+			default:
+			}
+
 			var result types.WorkResult
 			if err := sonic.ConfigFastest.UnmarshalFromString(msg.Message, &result); err != nil {
 				return
 			}
-			if result.JobID == job.ID {
+			if result.JobID == jobID {
 				select {
 				case resultOut <- &result:
 				default:
 				}
 			}
 		})
+		// Signal readiness even on error so we don't block forever.
+		select {
+		case subReady <- struct{}{}:
+		default:
+		}
 		if err != nil {
 			select {
 			case errOut <- err:
@@ -534,7 +601,15 @@ func (c *Client) EnqueueAndWait(ctx context.Context, taskType types.TaskType, pa
 		}
 	}()
 
-	// Also check once more after subscribe to avoid race.
+	// 2. Enqueue the job with the pre-generated ID.
+	job, err := c.enqueueWithID(ctx, jobID, taskType, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Poll once after enqueue to catch results that arrived before
+	//    the subscription became active (covers the edge case where the
+	//    Receive goroutine hasn't started processing yet).
 	if result, err := c.store.GetResult(waitCtx, job.ID); err == nil && result != nil {
 		return result, nil
 	}
@@ -547,6 +622,43 @@ func (c *Client) EnqueueAndWait(ctx context.Context, taskType types.TaskType, pa
 	case <-waitCtx.Done():
 		return nil, fmt.Errorf("wait for result: %w", waitCtx.Err())
 	}
+}
+
+// enqueueWithID enqueues a job using a pre-generated ID (used by EnqueueAndWait).
+func (c *Client) enqueueWithID(ctx context.Context, jobID string, taskType types.TaskType, payload any) (*types.Job, error) {
+	payloadBytes, err := sonic.ConfigFastest.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
+
+	now := time.Now()
+	job := &types.Job{
+		ID:        jobID,
+		TaskType:  taskType,
+		Payload:   payloadBytes,
+		Schedule:  types.Schedule{Type: types.ScheduleImmediate},
+		Status:    types.JobStatusPending,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if _, err := c.store.CreateJob(ctx, job); err != nil {
+		return nil, fmt.Errorf("create job: %w", err)
+	}
+
+	if err := c.dispatchJob(ctx, job); err != nil {
+		c.rollbackEnqueue(ctx, job)
+		return nil, fmt.Errorf("dispatch: %w", err)
+	}
+
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventJobDispatched,
+		JobID:     job.ID,
+		TaskType:  job.TaskType,
+		Timestamp: now,
+	})
+
+	return job, nil
 }
 
 // GetBatchResults retrieves all item results for a completed batch.
@@ -563,6 +675,14 @@ func (c *Client) Close() {
 
 // --- Internal helpers ---
 
+// rollbackEnqueue cleans up a job and its unique key on enqueue failure.
+func (c *Client) rollbackEnqueue(ctx context.Context, job *types.Job) {
+	c.store.DeleteJob(ctx, job.ID)
+	if job.UniqueKey != nil && *job.UniqueKey != "" {
+		c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
+	}
+}
+
 // dispatchJob publishes a notification to the job:notify Pub/Sub channel.
 // The NotifierActor on each server node subscribes to this channel and
 // forwards it to the DispatcherActor for push-based dispatch.
@@ -578,7 +698,7 @@ func (c *Client) publishEvent(ctx context.Context, event types.JobEvent) {
 	c.store.PublishEvent(ctx, event)
 }
 
-func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowInstance, taskName string, now *time.Time) {
+func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowInstance, taskName string, now *time.Time) error {
 	var taskDef *types.WorkflowTask
 	for i := range wf.Definition.Tasks {
 		if wf.Definition.Tasks[i].Name == taskName {
@@ -587,7 +707,7 @@ func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowIns
 		}
 	}
 	if taskDef == nil {
-		return
+		return fmt.Errorf("task definition not found: %s", taskName)
 	}
 
 	job := &types.Job{
@@ -604,10 +724,11 @@ func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowIns
 	}
 
 	if _, err := c.store.CreateJob(ctx, job); err != nil {
-		return
+		return fmt.Errorf("create job for task %s: %w", taskName, err)
 	}
 	if err := c.dispatchJob(ctx, job); err != nil {
-		return
+		c.store.DeleteJob(ctx, job.ID)
+		return fmt.Errorf("dispatch task %s: %w", taskName, err)
 	}
 
 	if state, ok := wf.Tasks[taskName]; ok {
@@ -616,9 +737,10 @@ func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowIns
 		state.StartedAt = now
 		wf.Tasks[taskName] = state
 	}
+	return nil
 }
 
-func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchInstance, now *time.Time) {
+func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchInstance, now *time.Time) error {
 	job := &types.Job{
 		ID:        xid.New().String(),
 		TaskType:  *batch.Definition.OnetimeTaskType,
@@ -633,10 +755,11 @@ func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchIns
 	}
 
 	if _, err := c.store.CreateJob(ctx, job); err != nil {
-		return
+		return fmt.Errorf("create onetime job: %w", err)
 	}
 	if err := c.dispatchJob(ctx, job); err != nil {
-		return
+		c.store.DeleteJob(ctx, job.ID)
+		return fmt.Errorf("dispatch onetime job: %w", err)
 	}
 
 	batch.OnetimeState = &types.BatchOnetimeState{
@@ -644,9 +767,10 @@ func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchIns
 		Status:    types.JobStatusRunning,
 		StartedAt: now,
 	}
+	return nil
 }
 
-func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInstance, now *time.Time) {
+func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInstance, now *time.Time) error {
 	chunkSize := batch.Definition.ChunkSize
 	if chunkSize <= 0 {
 		chunkSize = 100
@@ -654,6 +778,7 @@ func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInsta
 
 	items := batch.Definition.Items
 	dispatched := 0
+	var firstErr error
 
 	for batch.NextChunkIndex < len(items) && dispatched < chunkSize && batch.RunningItems < chunkSize {
 		item := items[batch.NextChunkIndex]
@@ -679,9 +804,34 @@ func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInsta
 		}
 
 		if _, err := c.store.CreateJob(ctx, job); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("create batch item job %s: %w", item.ID, err)
+			}
+			errStr := err.Error()
+			batch.ItemStates[item.ID] = types.BatchItemState{
+				ItemID:     item.ID,
+				Status:     types.JobStatusFailed,
+				Error:      &errStr,
+				FinishedAt: now,
+			}
+			batch.FailedItems++
+			batch.PendingItems--
 			continue
 		}
 		if err := c.dispatchJob(ctx, job); err != nil {
+			c.store.DeleteJob(ctx, job.ID)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("dispatch batch item %s: %w", item.ID, err)
+			}
+			errStr := err.Error()
+			batch.ItemStates[item.ID] = types.BatchItemState{
+				ItemID:     item.ID,
+				Status:     types.JobStatusFailed,
+				Error:      &errStr,
+				FinishedAt: now,
+			}
+			batch.FailedItems++
+			batch.PendingItems--
 			continue
 		}
 
@@ -695,6 +845,11 @@ func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInsta
 		batch.PendingItems--
 		dispatched++
 	}
+
+	if dispatched == 0 && firstErr != nil {
+		return firstErr
+	}
+	return nil
 }
 
 // rootTasks returns task names that have no dependencies (DAG roots).
@@ -706,6 +861,56 @@ func rootTasks(def *types.WorkflowDefinition) []string {
 		}
 	}
 	return roots
+}
+
+// cancelDispatchedWorkflowChildren cancels and deletes child jobs that were
+// already dispatched for workflow tasks. Called during rollback when a later
+// root task dispatch or final parent update fails.
+func (c *Client) cancelDispatchedWorkflowChildren(ctx context.Context, wf *types.WorkflowInstance) {
+	now := time.Now()
+	for _, state := range wf.Tasks {
+		if state.JobID == "" {
+			continue
+		}
+		if childJob, childRev, err := c.store.GetJob(ctx, state.JobID); err == nil {
+			if !childJob.Status.IsTerminal() {
+				childJob.Status = types.JobStatusCancelled
+				childJob.UpdatedAt = now
+				c.store.UpdateJob(ctx, childJob, childRev)
+				c.store.SignalCancelActiveRuns(ctx, state.JobID)
+			}
+		}
+	}
+}
+
+// cancelDispatchedBatchChildren cancels and deletes child jobs that were
+// already dispatched for batch items. Called during rollback when a later
+// item dispatch or final parent update fails.
+func (c *Client) cancelDispatchedBatchChildren(ctx context.Context, batch *types.BatchInstance) {
+	now := time.Now()
+	for _, state := range batch.ItemStates {
+		if state.JobID == "" {
+			continue
+		}
+		if childJob, childRev, err := c.store.GetJob(ctx, state.JobID); err == nil {
+			if !childJob.Status.IsTerminal() {
+				childJob.Status = types.JobStatusCancelled
+				childJob.UpdatedAt = now
+				c.store.UpdateJob(ctx, childJob, childRev)
+				c.store.SignalCancelActiveRuns(ctx, state.JobID)
+			}
+		}
+	}
+	if batch.OnetimeState != nil && batch.OnetimeState.JobID != "" {
+		if childJob, childRev, err := c.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+			if !childJob.Status.IsTerminal() {
+				childJob.Status = types.JobStatusCancelled
+				childJob.UpdatedAt = now
+				c.store.UpdateJob(ctx, childJob, childRev)
+				c.store.SignalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+			}
+		}
+	}
 }
 
 func strPtr(s string) *string { return &s }

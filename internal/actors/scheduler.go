@@ -161,6 +161,9 @@ func (s *SchedulerActor) processSchedule(ctx *actor.Context, entry *types.Schedu
 				s.advanceSchedule(bgCtx, entry, now)
 				return
 			}
+		} else {
+			// No active run — drain any buffered overlap dispatches.
+			s.drainOverlapBuffer(ctx, bgCtx, job, rev, entry, policy)
 		}
 	}
 
@@ -179,13 +182,26 @@ func (s *SchedulerActor) processSchedule(ctx *actor.Context, entry *types.Schedu
 
 	if len(missedFirings) > 1 {
 		s.logger.Info().String("job_id", entry.JobID).Int("missed_count", len(missedFirings)).Msg("scheduler: backfilling missed firings")
+		currentRev := rev
+		anyDispatched := false
 		for _, firingTime := range missedFirings {
-			s.dispatchFiring(ctx, bgCtx, job, rev, entry, firingTime)
+			newRev, ok := s.dispatchFiring(ctx, bgCtx, job, currentRev, entry, firingTime)
+			if !ok {
+				break // dispatcher unavailable — stop and retry next tick
+			}
+			currentRev = newRev
+			anyDispatched = true
+			lastFiring := firingTime
+			entry.LastProcessedAt = &lastFiring
 		}
-		lastFiring := missedFirings[len(missedFirings)-1]
-		entry.LastProcessedAt = &lastFiring
+		if !anyDispatched {
+			return // leave schedule untouched for next tick
+		}
 	} else {
-		s.dispatchFiring(ctx, bgCtx, job, rev, entry, now)
+		_, ok := s.dispatchFiring(ctx, bgCtx, job, rev, entry, now)
+		if !ok {
+			return // leave schedule untouched for next tick
+		}
 		entry.LastProcessedAt = &now
 	}
 
@@ -194,15 +210,27 @@ func (s *SchedulerActor) processSchedule(ctx *actor.Context, entry *types.Schedu
 }
 
 // dispatchFiring dispatches a single firing of a scheduled job via the DispatcherActor.
-func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time) {
+// Returns (new CAS revision, true) on success. If the dispatcher PID cannot be
+// resolved the job and schedule are left untouched so the next tick retries.
+func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time) (uint64, bool) {
+	// Resolve dispatcher PID first — if unavailable, bail out without
+	// modifying the job or schedule so the next tick retries.
+	pid := s.resolveDispatcherPID()
+	if pid == nil {
+		s.logger.Warn().String("job_id", job.ID).Msg("scheduler: dispatcher PID not resolved, will retry next tick")
+		return rev, false
+	}
+
 	job.Status = types.JobStatusPending
 	job.LastRunAt = &firingTime
 	job.UpdatedAt = time.Now()
 
-	if _, err := s.store.UpdateJob(bgCtx, job, rev); err != nil {
+	newRev, err := s.store.UpdateJob(bgCtx, job, rev)
+	if err != nil {
 		s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: CAS update failed")
-		return
+		return rev, false
 	}
+	rev = newRev
 
 	// Add backfill headers if applicable.
 	if entry.Schedule.CatchupWindow != nil {
@@ -213,10 +241,8 @@ func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.C
 		job.Headers["x-dureq-scheduled-at"] = firingTime.Format(time.RFC3339Nano)
 	}
 
-	if pid := s.resolveDispatcherPID(); pid != nil {
-		dispatchMsg := messages.JobToDispatchMsg(job, job.Attempt)
-		actorCtx.Send(pid, dispatchMsg)
-	}
+	dispatchMsg := messages.JobToDispatchMsg(job, job.Attempt)
+	actorCtx.Send(pid, dispatchMsg)
 
 	s.publishEvent(actorCtx, types.JobEvent{
 		Type:      types.EventJobDispatched,
@@ -224,6 +250,8 @@ func (s *SchedulerActor) dispatchFiring(actorCtx *actor.Context, bgCtx context.C
 		TaskType:  job.TaskType,
 		Timestamp: firingTime,
 	})
+
+	return rev, true
 }
 
 // advanceSchedule calculates and saves the next run time for a schedule.
@@ -265,6 +293,27 @@ func (s *SchedulerActor) expireSchedule(ctx context.Context, entry *types.Schedu
 	job.CompletedAt = &now
 	job.UpdatedAt = now
 	s.store.UpdateJob(ctx, job, rev)
+}
+
+// drainOverlapBuffer pops buffered overlap entries and dispatches them now that
+// no active run exists for the job.
+func (s *SchedulerActor) drainOverlapBuffer(actorCtx *actor.Context, bgCtx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, policy types.OverlapPolicy) {
+	switch policy {
+	case types.OverlapBufferOne:
+		if _, ok, err := s.store.PopOverlapBuffer(bgCtx, entry.JobID); err == nil && ok {
+			s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: draining buffered overlap (one)")
+			s.dispatchFiring(actorCtx, bgCtx, job, rev, entry, time.Now())
+		}
+	case types.OverlapBufferAll:
+		for {
+			if _, ok, err := s.store.PopOverlapBufferAll(bgCtx, entry.JobID); err != nil || !ok {
+				break
+			}
+			s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: draining buffered overlap (all)")
+			newRev, _ := s.dispatchFiring(actorCtx, bgCtx, job, rev, entry, time.Now())
+			rev = newRev
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +500,8 @@ func (s *SchedulerActor) handleOrphanedRun(actorCtx *actor.Context, bgCtx contex
 // Helpers
 // ---------------------------------------------------------------------------
 
-// resolveDispatcherPID lazily looks up the DispatcherActor PID via the cluster.
+// resolveDispatcherPID looks up the DispatcherActor PID via the cluster.
+// Always performs a fresh lookup to handle dispatcher singleton migration.
 func (s *SchedulerActor) resolveDispatcherPID() *actor.PID {
 	if s.dispatcherPID != nil {
 		return s.dispatcherPID
@@ -461,9 +511,9 @@ func (s *SchedulerActor) resolveDispatcherPID() *actor.PID {
 	}
 	pids := s.cluster.GetActiveByKind(KindDispatcher)
 	if len(pids) > 0 && pids[0] != nil {
-		s.dispatcherPID = pids[0]
+		return pids[0]
 	}
-	return s.dispatcherPID
+	return nil
 }
 
 // publishEvent publishes a domain event directly to the Redis store.

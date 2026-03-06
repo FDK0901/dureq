@@ -140,3 +140,10 @@ func WithRedisCluster(addrs []string) Option {
 		c.RedisOptions.ClusterAddrs = addrs
 	}
 }
+
+// WithPriorityTiers sets the priority tier configuration.
+func WithPriorityTiers(tiers []store.TierConfig) Option {
+	return func(c *Config) {
+		c.StoreConfig.Tiers = tiers
+	}
+}

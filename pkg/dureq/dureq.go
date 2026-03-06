@@ -35,8 +35,8 @@ var (
 	//WithElectionTTL           = server.WithElectionTTL
 	//WithLockTTL               = server.WithLockTTL
 	//WithLogger                = server.WithLogger
-	WithKeyPrefix = server.WithKeyPrefix
-	//WithPriorityTiers         = server.WithPriorityTiers
+	WithKeyPrefix     = server.WithKeyPrefix
+	WithPriorityTiers = server.WithPriorityTiers
 	WithRedisSentinel = server.WithRedisSentinel
 	WithRedisCluster  = server.WithRedisCluster
 )

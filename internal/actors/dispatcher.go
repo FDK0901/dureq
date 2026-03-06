@@ -146,6 +146,13 @@ func (d *DispatcherActor) onNewJobNotification(ctx *actor.Context, msg *pb.NewJo
 	bgCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
+	// Check if the queue/tier for this job's priority is paused.
+	tierName := store.ResolveTier(d.store.Config().Tiers, int(msg.Priority))
+	if paused, err := d.store.IsQueuePaused(bgCtx, tierName); err == nil && paused {
+		d.logger.Debug().String("job_id", msg.JobId).String("tier", tierName).Msg("dispatcher: queue paused, skipping")
+		return
+	}
+
 	job, _, err := d.store.GetJob(bgCtx, msg.JobId)
 	if err != nil {
 		d.logger.Error().String("job_id", msg.JobId).Err(err).Msg("dispatcher: failed to load job for notification")

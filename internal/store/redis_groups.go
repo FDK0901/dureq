@@ -60,30 +60,43 @@ func (s *RedisStore) AddToGroup(ctx context.Context, group string, msg types.Gro
 	return size, nil
 }
 
+// luaFlushGroup atomically reads all messages and deletes the list key in one
+// step, preventing a race where a concurrent AddToGroup inserts between
+// LRANGE and DEL.
+//
+// KEYS[1] = messages list key
+// Returns: all elements (or empty array).
+const luaFlushGroup = `
+local msgs = redis.call('LRANGE', KEYS[1], 0, -1)
+if #msgs > 0 then
+    redis.call('DEL', KEYS[1])
+end
+return msgs
+`
+
 // FlushGroup atomically reads and deletes all messages from a group.
 func (s *RedisStore) FlushGroup(ctx context.Context, group string) ([]types.GroupMessage, error) {
 	msgKey := GroupMessagesKey(s.prefix, group)
 
-	// Read all messages.
-	raw, err := s.rdb.Do(ctx, s.rdb.B().Lrange().Key(msgKey).Start(0).Stop(-1).Build()).AsStrSlice()
+	// Atomically read + delete the messages list via Lua.
+	result, err := s.scriptFlushGroup.Exec(ctx, s.rdb, []string{msgKey}, nil).AsStrSlice()
 	if err != nil {
-		return nil, fmt.Errorf("read group messages: %w", err)
+		return nil, fmt.Errorf("flush group messages: %w", err)
 	}
 
-	if len(raw) == 0 {
+	if len(result) == 0 {
 		return nil, nil
 	}
 
-	// Clean up atomically.
-	cmds := make(rueidis.Commands, 0, 3)
-	cmds = append(cmds, s.rdb.B().Del().Key(msgKey).Build())
+	// Clean up metadata (best-effort, non-critical).
+	cmds := make(rueidis.Commands, 0, 2)
 	cmds = append(cmds, s.rdb.B().Del().Key(GroupMetaKey(s.prefix, group)).Build())
 	cmds = append(cmds, s.rdb.B().Zrem().Key(GroupSetKey(s.prefix)).Member(group).Build())
 	s.rdb.DoMulti(ctx, cmds...)
 
 	// Parse messages.
-	messages := make([]types.GroupMessage, 0, len(raw))
-	for _, r := range raw {
+	messages := make([]types.GroupMessage, 0, len(result))
+	for _, r := range result {
 		var msg types.GroupMessage
 		if sonic.ConfigFastest.Unmarshal([]byte(r), &msg) == nil {
 			messages = append(messages, msg)

@@ -168,6 +168,7 @@ func New(opts ...Option) (*Client, error) {
 
 	storeCfg := store.RedisStoreConfig{
 		KeyPrefix: cfg.keyPrefix,
+		Tiers:     cfg.tiers,
 	}
 
 	s, err := store.NewRedisStore(rdb, storeCfg, nil)
@@ -329,6 +330,12 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 	if err != nil {
 		return fmt.Errorf("get job: %w", err)
 	}
+	if job.Status == types.JobStatusRunning {
+		return fmt.Errorf("job is still running; cancel it first")
+	}
+
+	// Cancel any in-flight runs from the previous attempt.
+	c.store.SignalCancelActiveRuns(ctx, jobID)
 
 	now := time.Now()
 	job.Status = types.JobStatusPending
@@ -417,12 +424,17 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 	roots := rootTasks(&def)
 	for _, taskName := range roots {
 		if err := c.dispatchWorkflowTask(ctx, wf, taskName, &now); err != nil {
+			// Clean up already-dispatched child jobs before deleting parent.
+			c.cancelDispatchedWorkflowChildren(ctx, wf)
 			c.store.DeleteWorkflow(ctx, wf.ID)
 			return nil, fmt.Errorf("dispatch root task: %w", err)
 		}
 	}
 
 	if _, err := c.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+		// Children already dispatched — cancel them since we can't persist parent state.
+		c.cancelDispatchedWorkflowChildren(ctx, wf)
+		c.store.DeleteWorkflow(ctx, wf.ID)
 		return nil, fmt.Errorf("update workflow after dispatch: %w", err)
 	}
 
@@ -502,12 +514,16 @@ func (c *Client) EnqueueBatch(ctx context.Context, def types.BatchDefinition) (*
 		}
 	} else {
 		if err := c.dispatchBatchChunk(ctx, batch, &now); err != nil {
+			c.cancelDispatchedBatchChildren(ctx, batch)
 			c.store.DeleteBatch(ctx, batch.ID)
 			return nil, fmt.Errorf("dispatch batch chunk: %w", err)
 		}
 	}
 
 	if _, err := c.store.UpdateBatch(ctx, batch, batchRev); err != nil {
+		// Children already dispatched — cancel them since we can't persist parent state.
+		c.cancelDispatchedBatchChildren(ctx, batch)
+		c.store.DeleteBatch(ctx, batch.ID)
 		return nil, fmt.Errorf("update batch after dispatch: %w", err)
 	}
 
@@ -526,39 +542,49 @@ func (c *Client) GetBatch(ctx context.Context, batchID string) (*types.BatchInst
 // --- Wait operations ---
 
 // EnqueueAndWait submits a job for immediate execution and waits for the result.
+//
+// To avoid a subscribe-handshake race, the Pub/Sub subscription is established
+// BEFORE the job is enqueued. This guarantees that any result notification
+// published after enqueue is captured by the subscription.
 func (c *Client) EnqueueAndWait(ctx context.Context, taskType types.TaskType, payload any, timeout time.Duration) (*types.WorkResult, error) {
-	job, err := c.Enqueue(ctx, taskType, payload)
-	if err != nil {
-		return nil, err
-	}
+	// Pre-generate a job ID so we can subscribe before enqueuing.
+	jobID := xid.New().String()
 
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	resultCh := store.ResultNotifyChannel(c.store.Prefix(), job.ID)
+	resultCh := store.ResultNotifyChannel(c.store.Prefix(), jobID)
 	subscribeCmd := c.rdb.B().Subscribe().Channel(resultCh).Build()
 
-	// Check if result already exists before subscribing.
-	if result, err := c.store.GetResult(waitCtx, job.ID); err == nil && result != nil {
-		return result, nil
-	}
-
+	// 1. Start subscription BEFORE enqueue to close the race window.
 	resultOut := make(chan *types.WorkResult, 1)
 	errOut := make(chan error, 1)
+	subReady := make(chan struct{}, 1)
 
 	go func() {
 		err := c.rdb.Receive(waitCtx, subscribeCmd, func(msg rueidis.PubSubMessage) {
+			// Signal readiness on first callback invocation (subscription confirmation).
+			select {
+			case subReady <- struct{}{}:
+			default:
+			}
+
 			var result types.WorkResult
 			if err := sonic.ConfigFastest.UnmarshalFromString(msg.Message, &result); err != nil {
 				return
 			}
-			if result.JobID == job.ID {
+			if result.JobID == jobID {
 				select {
 				case resultOut <- &result:
 				default:
 				}
 			}
 		})
+		// Signal readiness even on error so we don't block forever.
+		select {
+		case subReady <- struct{}{}:
+		default:
+		}
 		if err != nil {
 			select {
 			case errOut <- err:
@@ -567,7 +593,15 @@ func (c *Client) EnqueueAndWait(ctx context.Context, taskType types.TaskType, pa
 		}
 	}()
 
-	// Also check once more after subscribe to avoid race.
+	// 2. Enqueue the job with the pre-generated ID.
+	job, err := c.enqueueWithID(ctx, jobID, taskType, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Poll once after enqueue to catch results that arrived before
+	//    the subscription became active (covers the edge case where the
+	//    Receive goroutine hasn't started processing yet).
 	if result, err := c.store.GetResult(waitCtx, job.ID); err == nil && result != nil {
 		return result, nil
 	}
@@ -580,6 +614,43 @@ func (c *Client) EnqueueAndWait(ctx context.Context, taskType types.TaskType, pa
 	case <-waitCtx.Done():
 		return nil, fmt.Errorf("wait for result: %w", waitCtx.Err())
 	}
+}
+
+// enqueueWithID enqueues a job using a pre-generated ID (used by EnqueueAndWait).
+func (c *Client) enqueueWithID(ctx context.Context, jobID string, taskType types.TaskType, payload any) (*types.Job, error) {
+	payloadBytes, err := sonic.ConfigFastest.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal payload: %w", err)
+	}
+
+	now := time.Now()
+	job := &types.Job{
+		ID:        jobID,
+		TaskType:  taskType,
+		Payload:   payloadBytes,
+		Schedule:  types.Schedule{Type: types.ScheduleImmediate},
+		Status:    types.JobStatusPending,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if _, err := c.store.CreateJob(ctx, job); err != nil {
+		return nil, fmt.Errorf("create job: %w", err)
+	}
+
+	if err := c.dispatchJob(ctx, job); err != nil {
+		c.rollbackEnqueue(ctx, job)
+		return nil, fmt.Errorf("dispatch: %w", err)
+	}
+
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventJobDispatched,
+		JobID:     job.ID,
+		TaskType:  job.TaskType,
+		Timestamp: now,
+	})
+
+	return job, nil
 }
 
 // GetBatchResults retrieves all item results for a completed batch.
@@ -782,6 +853,56 @@ func rootTasks(def *types.WorkflowDefinition) []string {
 		}
 	}
 	return roots
+}
+
+// cancelDispatchedWorkflowChildren cancels and deletes child jobs that were
+// already dispatched for workflow tasks. Called during rollback when a later
+// root task dispatch or final parent update fails.
+func (c *Client) cancelDispatchedWorkflowChildren(ctx context.Context, wf *types.WorkflowInstance) {
+	now := time.Now()
+	for _, state := range wf.Tasks {
+		if state.JobID == "" {
+			continue
+		}
+		if childJob, childRev, err := c.store.GetJob(ctx, state.JobID); err == nil {
+			if !childJob.Status.IsTerminal() {
+				childJob.Status = types.JobStatusCancelled
+				childJob.UpdatedAt = now
+				c.store.UpdateJob(ctx, childJob, childRev)
+				c.store.SignalCancelActiveRuns(ctx, state.JobID)
+			}
+		}
+	}
+}
+
+// cancelDispatchedBatchChildren cancels and deletes child jobs that were
+// already dispatched for batch items. Called during rollback when a later
+// item dispatch or final parent update fails.
+func (c *Client) cancelDispatchedBatchChildren(ctx context.Context, batch *types.BatchInstance) {
+	now := time.Now()
+	for _, state := range batch.ItemStates {
+		if state.JobID == "" {
+			continue
+		}
+		if childJob, childRev, err := c.store.GetJob(ctx, state.JobID); err == nil {
+			if !childJob.Status.IsTerminal() {
+				childJob.Status = types.JobStatusCancelled
+				childJob.UpdatedAt = now
+				c.store.UpdateJob(ctx, childJob, childRev)
+				c.store.SignalCancelActiveRuns(ctx, state.JobID)
+			}
+		}
+	}
+	if batch.OnetimeState != nil && batch.OnetimeState.JobID != "" {
+		if childJob, childRev, err := c.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+			if !childJob.Status.IsTerminal() {
+				childJob.Status = types.JobStatusCancelled
+				childJob.UpdatedAt = now
+				c.store.UpdateJob(ctx, childJob, childRev)
+				c.store.SignalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+			}
+		}
+	}
 }
 
 func strPtr(s string) *string { return &s }

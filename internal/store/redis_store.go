@@ -117,6 +117,7 @@ type RedisStore struct {
 	scriptCASUpdate     *rueidis.Lua
 	scriptCreateNX      *rueidis.Lua
 	scriptPopDelayed    *rueidis.Lua
+	scriptFlushGroup    *rueidis.Lua
 }
 
 // NewRedisStore creates a new Redis store and registers tier configuration.
@@ -135,6 +136,7 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog
 		scriptCASUpdate:     rueidis.NewLuaScript(luaCASUpdate),
 		scriptCreateNX:      rueidis.NewLuaScript(luaCreateIfNotExists),
 		scriptPopDelayed:    rueidis.NewLuaScript(luaPopDelayed),
+		scriptFlushGroup:    rueidis.NewLuaScript(luaFlushGroup),
 	}
 
 	// Register tiers in sorted set so workers can discover them.
@@ -339,8 +341,14 @@ func (s *RedisStore) GetActiveJobStats(ctx context.Context) (map[types.JobStatus
 
 // GetJobStats returns aggregated job statistics.
 func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats, error) {
-	totalJobs, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
-	totalRuns, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(HistoryRunsKey(s.prefix)).Build()).AsInt64()
+	totalJobs, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return nil, fmt.Errorf("count total jobs: %w", err)
+	}
+	totalRuns, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(HistoryRunsKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return nil, fmt.Errorf("count total runs: %w", err)
+	}
 
 	statuses := []types.JobStatus{
 		types.JobStatusPending, types.JobStatusScheduled, types.JobStatusRunning,
@@ -356,7 +364,11 @@ func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats,
 
 	byStatus := make(map[types.JobStatus]int64)
 	for i, st := range statuses {
-		if n, err := results[i].AsInt64(); err == nil && n > 0 {
+		n, err := results[i].AsInt64()
+		if err != nil {
+			return nil, fmt.Errorf("count jobs by status %q: %w", st, err)
+		}
+		if n > 0 {
 			byStatus[st] = n
 		}
 	}

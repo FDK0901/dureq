@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -619,7 +620,10 @@ func (a *APIService) ListGroups(ctx context.Context) ([]GroupInfo, error) {
 
 	result := make([]GroupInfo, 0, len(groups))
 	for _, g := range groups {
-		size, _ := a.store.GetGroupSize(ctx, g)
+		size, err := a.store.GetGroupSize(ctx, g)
+		if err != nil {
+			return nil, &ApiError{Msg: fmt.Sprintf("get group size for %q: %v", g, err), StatusCode: http.StatusInternalServerError}
+		}
 		result = append(result, GroupInfo{Name: g, Size: size})
 	}
 	return result, nil
@@ -640,21 +644,30 @@ type QueueInfo struct {
 
 func (a *APIService) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	tiers := a.store.Config().Tiers
-	paused, _ := a.store.ListPausedQueues(ctx)
+	paused, err := a.store.ListPausedQueues(ctx)
+	if err != nil {
+		return nil, &ApiError{Msg: fmt.Sprintf("list paused queues: %v", err), StatusCode: http.StatusInternalServerError}
+	}
 	pausedSet := make(map[string]bool, len(paused))
 	for _, p := range paused {
 		pausedSet[p] = true
 	}
 
+	// Use pending job count instead of legacy XLEN (streams are unused in v2 actor path).
+	jobCounts, err := a.store.GetActiveJobStats(ctx)
+	if err != nil {
+		return nil, &ApiError{Msg: fmt.Sprintf("get job stats for queue size: %v", err), StatusCode: http.StatusInternalServerError}
+	}
+	pendingCount := int64(jobCounts[types.JobStatusPending])
+
 	queues := make([]QueueInfo, 0, len(tiers))
 	for _, tier := range tiers {
-		size, _ := a.store.Client().Do(ctx, a.store.Client().B().Xlen().Key(store.WorkStreamKey(a.store.Prefix(), tier.Name)).Build()).AsInt64()
 		queues = append(queues, QueueInfo{
 			Name:       tier.Name,
 			Weight:     tier.Weight,
 			FetchBatch: tier.FetchBatch,
 			Paused:     pausedSet[tier.Name],
-			Size:       size,
+			Size:       pendingCount,
 		})
 	}
 	return queues, nil
@@ -692,9 +705,18 @@ func (a *APIService) GetStats(ctx context.Context) (*StatsResponse, error) {
 		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusInternalServerError}
 	}
 
-	schedules, _ := a.store.ListSchedules(ctx)
-	runs, _ := a.store.ListRuns(ctx)
-	nodes, _ := a.store.ListNodes(ctx)
+	schedules, err := a.store.ListSchedules(ctx)
+	if err != nil {
+		return nil, &ApiError{Msg: fmt.Sprintf("list schedules: %v", err), StatusCode: http.StatusInternalServerError}
+	}
+	runs, err := a.store.ListRuns(ctx)
+	if err != nil {
+		return nil, &ApiError{Msg: fmt.Sprintf("list runs: %v", err), StatusCode: http.StatusInternalServerError}
+	}
+	nodes, err := a.store.ListNodes(ctx)
+	if err != nil {
+		return nil, &ApiError{Msg: fmt.Sprintf("list nodes: %v", err), StatusCode: http.StatusInternalServerError}
+	}
 
 	return &StatsResponse{
 		JobCounts:       jobCounts,

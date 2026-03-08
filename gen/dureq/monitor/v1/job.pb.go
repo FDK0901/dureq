@@ -7,14 +7,13 @@
 package monitorv1
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -2387,7 +2386,7 @@ const file_dureq_monitor_v1_job_proto_rawDesc = "" +
 	"pagination\"b\n" +
 	"\x0fListDLQResponse\x129\n" +
 	"\bmessages\x18\x01 \x03(\v2\x1d.dureq.monitor.v1.WorkMessageR\bmessages\x12\x14\n" +
-	"\x05total\x18\x02 \x01(\x05R\x05totalB7Z5github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"\x05total\x18\x02 \x01(\x05R\x05totalB7Z5github.com/dureq/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var (
 	file_dureq_monitor_v1_job_proto_rawDescOnce sync.Once

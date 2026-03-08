@@ -7,14 +7,13 @@
 package monitorv1
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -1308,7 +1307,7 @@ const file_dureq_monitor_v1_batch_proto_rawDesc = "" +
 	"\bbatch_id\x18\x01 \x01(\tR\abatchId\x12*\n" +
 	"\x11retry_failed_only\x18\x02 \x01(\bR\x0fretryFailedOnly\"/\n" +
 	"\x12RetryBatchResponse\x12\x19\n" +
-	"\bbatch_id\x18\x01 \x01(\tR\abatchIdB7Z5github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"\bbatch_id\x18\x01 \x01(\tR\abatchIdB7Z5github.com/dureq/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var (
 	file_dureq_monitor_v1_batch_proto_rawDescOnce sync.Once

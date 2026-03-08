@@ -7,13 +7,12 @@
 package monitorv1
 
 import (
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
-
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
 )
 
 const (
@@ -407,7 +406,7 @@ const file_dureq_monitor_v1_node_proto_rawDesc = "" +
 	"\x0eGetNodeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\"A\n" +
 	"\x0fGetNodeResponse\x12.\n" +
-	"\x04node\x18\x01 \x01(\v2\x1a.dureq.monitor.v1.NodeInfoR\x04nodeB7Z5github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"\x04node\x18\x01 \x01(\v2\x1a.dureq.monitor.v1.NodeInfoR\x04nodeB7Z5github.com/dureq/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var (
 	file_dureq_monitor_v1_node_proto_rawDescOnce sync.Once

@@ -62,16 +62,16 @@ func (s *RedisStore) AddToGroup(ctx context.Context, group string, msg types.Gro
 }
 
 // FlushGroup atomically reads and deletes all messages from a group.
-// Uses a Lua script so that concurrent callers on different nodes are safe:
-// only one caller will receive the messages; others get an empty result.
+// Uses a single-key Lua script so that concurrent callers on different nodes
+// are safe: only one caller will receive the messages; others get an empty result.
+// Cleanup of the metadata hash and active set is done separately (idempotent).
 func (s *RedisStore) FlushGroup(ctx context.Context, group string) ([]types.GroupMessage, error) {
 	msgKey := GroupMessagesKey(s.prefix, group)
-	metaKey := GroupMetaKey(s.prefix, group)
-	setKey := GroupSetKey(s.prefix)
 
+	// Atomic read+delete on the messages list (single-key Lua for cluster compat).
 	raw, err := s.scriptFlushGroup.Exec(ctx, s.rdb,
-		[]string{msgKey, metaKey, setKey},
-		[]string{group},
+		[]string{msgKey},
+		[]string{},
 	).AsStrSlice()
 	if err != nil {
 		// rueidis returns error for empty array from Lua; treat as no messages.
@@ -81,6 +81,15 @@ func (s *RedisStore) FlushGroup(ctx context.Context, group string) ([]types.Grou
 	if len(raw) == 0 {
 		return nil, nil
 	}
+
+	// Cleanup metadata and active set (idempotent — safe if these fail).
+	metaKey := GroupMetaKey(s.prefix, group)
+	setKey := GroupSetKey(s.prefix)
+	cleanup := rueidis.Commands{
+		s.rdb.B().Del().Key(metaKey).Build(),
+		s.rdb.B().Zrem().Key(setKey).Member(group).Build(),
+	}
+	s.rdb.DoMulti(ctx, cleanup...) // best-effort; orphans are skipped by ListReadyGroups (LLEN=0)
 
 	// Parse messages.
 	messages := make([]types.GroupMessage, 0, len(raw))

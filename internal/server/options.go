@@ -179,9 +179,8 @@ func WithRedisSentinel(masterName string, sentinelAddrs []string, sentinelPasswo
 }
 
 // WithRedisCluster configures Redis Cluster mode with the given node addresses.
-// NOTE: only single-shard (single-master) clusters are supported. dureq uses
-// multi-key Lua scripts whose keys span different hash slots, so multi-shard
-// clusters will fail with CROSSSLOT errors.
+// Both single-shard and multi-shard clusters are supported. All multi-key Lua
+// scripts use hash-tagged keys to ensure slot co-location.
 func WithRedisCluster(addrs []string) Option {
 	return func(c *Config) {
 		c.RedisOptions.ClusterAddrs = addrs

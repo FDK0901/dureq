@@ -1,8 +1,9 @@
 package store
 
 // Lua scripts for atomic Redis operations.
-// All scripts are single-key (KEYS[1] only) for Redis Cluster compatibility,
-// except luaMoveDelayedToStream which uses hash-tagged tier keys.
+// All scripts are Redis Cluster compatible:
+//   - Single-key scripts: CAS, create-if-not-exists, leader refresh, lock ops, job save, flush group
+//   - Hash-tagged multi-key: luaMoveDelayedToStream ({tierName}), election scripts ({election})
 
 // luaCASUpdate performs a compare-and-swap update on a hash key.
 // KEYS[1] = hash key
@@ -181,14 +182,12 @@ local epoch = redis.call('GET', KEYS[2])
 return tonumber(epoch) or 0
 `
 
-// luaFlushGroup atomically reads all messages from a group list, then deletes
-// the list, metadata hash, and removes the group from the active sorted set.
-// Because the entire read+cleanup is a single Lua script, concurrent callers
-// on different nodes are safe: only one will see the messages; others get empty.
+// luaFlushGroup atomically reads and deletes all messages from a group list.
+// Only KEYS[1] is used (single-key) for Redis Cluster compatibility.
+// The critical atomicity guarantee is preserved: only one concurrent caller
+// will see the messages; others get empty. Cleanup of the metadata hash and
+// active set is done separately by the caller (idempotent operations).
 // KEYS[1] = group messages list  (prefix:group:{name}:messages)
-// KEYS[2] = group metadata hash  (prefix:group:{name}:meta)
-// KEYS[3] = active groups sorted set (prefix:groups:active)
-// ARGV[1] = group name (for ZREM member)
 // Returns the list of raw message strings, or empty table.
 const luaFlushGroup = `
 local msgs = redis.call('LRANGE', KEYS[1], 0, -1)
@@ -196,8 +195,6 @@ if #msgs == 0 then
   return {}
 end
 redis.call('DEL', KEYS[1])
-redis.call('DEL', KEYS[2])
-redis.call('ZREM', KEYS[3], ARGV[1])
 return msgs
 `
 

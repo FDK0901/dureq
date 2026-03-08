@@ -39,8 +39,10 @@ func NodesAllKey(prefix string) string           { return prefix + ":nodes:all" 
 func LockKey(prefix, key string) string          { return fmt.Sprintf("%s:lock:%s", prefix, key) }
 
 // Election
-func ElectionLeaderKey(prefix string) string     { return prefix + ":election:leader" }
-func ElectionEpochKey(prefix string) string      { return prefix + ":election:epoch" }
+// Election keys use {election} hash tag so both land in the same Redis Cluster
+// slot, enabling multi-key Lua scripts (elect + refresh with epoch).
+func ElectionLeaderKey(prefix string) string { return prefix + ":{election}:leader" }
+func ElectionEpochKey(prefix string) string  { return prefix + ":{election}:epoch" }
 
 // Workflows
 func WorkflowKey(prefix, id string) string                  { return fmt.Sprintf("%s:workflow:%s", prefix, id) }

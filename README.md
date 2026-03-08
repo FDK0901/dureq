@@ -94,7 +94,7 @@ Client (Go)
 - **Leader-elected coordinator**: only the leader runs Scheduler + Orchestrator
 - **All nodes are workers**: every node polls Redis Streams and executes handlers
 - **Direct Redis data flow**: no actors, no RPC between components on the same node
-- **Single dependency**: Redis only (Standalone, Sentinel, or Cluster)
+- **Single dependency**: Redis only (Standalone, Sentinel, or Cluster — including multi-shard clusters)
 
 ## Features
 
@@ -499,7 +499,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `dureq.WithRedisPassword(pw)`     | -              | Redis password               |
 | `dureq.WithRedisPoolSize(n)`      | -              | Connection pool size         |
 | `dureq.WithRedisSentinel(...)`    | -              | Redis Sentinel failover      |
-| `dureq.WithRedisCluster(addrs)`   | -              | Redis Cluster mode           |
+| `dureq.WithRedisCluster(addrs)`   | -              | Redis Cluster mode (multi-shard supported) |
 | `dureq.WithNodeID(id)`            | auto-generated | Unique node identifier       |
 | `dureq.WithMaxConcurrency(n)`     | `100`          | Maximum concurrent workers   |
 | `dureq.WithLockTTL(d)`            | `30s`          | Distributed lock TTL         |

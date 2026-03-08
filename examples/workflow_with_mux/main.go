@@ -31,18 +31,16 @@ import (
 	"syscall"
 	"time"
 
-	client "github.com/FDK0901/dureq/clients/go"
-	"github.com/FDK0901/dureq/internal/server"
-	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
-	"github.com/bytedance/sonic"
+
+	"github.com/FDK0901/dureq/pkg/dureq"
+	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/rs/zerolog"
 )
 
 // loggingMiddleware is a global middleware that logs every handler invocation
 // with job metadata extracted from the context.
-func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
+func loggingMiddleware(logger *zerolog.Logger) types.MiddlewareFunc {
 	return func(next types.HandlerFunc) types.HandlerFunc {
 		return func(ctx context.Context, payload json.RawMessage) error {
 			jobID := types.GetJobID(ctx)
@@ -50,14 +48,26 @@ func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 			attempt := types.GetAttempt(ctx)
 			nodeID := types.GetNodeID(ctx)
 
-			logger.Info().String("job_id", jobID).String("task_type", string(taskType)).Int("attempt", attempt).String("node_id", nodeID).Msg("[middleware:logging] handler started")
+			logger.Info().
+				Str("job_id", jobID).
+				Str("task_type", string(taskType)).
+				Int("attempt", attempt).
+				Str("node_id", nodeID).
+				Msg("[middleware:logging] handler started")
 
 			err := next(ctx, payload)
 
 			if err != nil {
-				logger.Error().String("job_id", jobID).String("task_type", string(taskType)).Err(err).Msg("[middleware:logging] handler failed")
+				logger.Error().
+					Str("job_id", jobID).
+					Str("task_type", string(taskType)).
+					Err(err).
+					Msg("[middleware:logging] handler failed")
 			} else {
-				logger.Info().String("job_id", jobID).String("task_type", string(taskType)).Msg("[middleware:logging] handler succeeded")
+				logger.Info().
+					Str("job_id", jobID).
+					Str("task_type", string(taskType)).
+					Msg("[middleware:logging] handler succeeded")
 			}
 			return err
 		}
@@ -65,7 +75,7 @@ func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 }
 
 // timingMiddleware is a per-handler middleware that measures execution duration.
-func timingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
+func timingMiddleware(logger *zerolog.Logger) types.MiddlewareFunc {
 	return func(next types.HandlerFunc) types.HandlerFunc {
 		return func(ctx context.Context, payload json.RawMessage) error {
 			start := time.Now()
@@ -73,7 +83,10 @@ func timingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 			elapsed := time.Since(start)
 
 			taskType := types.GetTaskType(ctx)
-			logger.Info().String("task_type", string(taskType)).Duration("elapsed_ms", elapsed).Msg("[middleware:timing] execution time")
+			logger.Info().
+				Str("task_type", string(taskType)).
+				Dur("elapsed_ms", elapsed).
+				Msg("[middleware:timing] execution time")
 			return err
 		}
 	}
@@ -81,14 +94,20 @@ func timingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 
 // orderHandler is a single handler registered for the "order.*" pattern.
 // It dispatches internally based on the actual task type from the context.
-func orderHandler(logger gochainedlog.Logger) types.HandlerFunc {
+func orderHandler(logger *zerolog.Logger) types.HandlerFunc {
 	return func(ctx context.Context, payload json.RawMessage) error {
 		taskType := types.GetTaskType(ctx)
 		jobID := types.GetJobID(ctx)
 		maxRetry := types.GetMaxRetry(ctx)
 		headers := types.GetHeaders(ctx)
 
-		logger.Info().String("task_type", string(taskType)).String("job_id", jobID).Int("max_retry", int(maxRetry)).Any("headers", headers).String("payload", string(payload)).Msg("order handler dispatching")
+		logger.Info().
+			Str("task_type", string(taskType)).
+			Str("job_id", jobID).
+			Int("max_retry", maxRetry).
+			Interface("headers", headers).
+			Str("payload", string(payload)).
+			Msg("order handler dispatching")
 
 		switch taskType {
 		case "order.validate":
@@ -123,22 +142,22 @@ func orderHandler(logger gochainedlog.Logger) types.HandlerFunc {
 }
 
 func main() {
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	zl := chainedzerolog.NewZerologBase()
+	logger := chainedzerolog.NewZerolog(zl)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	zl := chainedzerolog.NewZerologBase()
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	logger := chainedzerolog.NewZerolog(zl)
-
 	// --- Server Side ---
 
-	srv, err := server.New(
-		server.WithRedisURL("redis://localhost:6379"),
-		server.WithRedisDB(15),
-		server.WithRedisPassword("your-password"),
-		server.WithNodeID("workflow-mux-node-1"),
-		server.WithMaxConcurrency(10),
-		server.WithLogger(logger),
+	srv, err := dureq.NewServer(
+		dureq.WithRedisURL("redis://localhost:6379"),
+		dureq.WithRedisDB(15),
+		dureq.WithRedisPassword("your-password"),
+		dureq.WithNodeID("workflow-mux-node-1"),
+		dureq.WithMaxConcurrency(10),
+		dureq.WithLogger(logger),
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create server")
@@ -146,16 +165,18 @@ func main() {
 	}
 
 	// Register global middleware — applies to ALL handlers.
-	srv.Use(loggingMiddleware(logger))
+	srv.Use(loggingMiddleware(&zl))
 
 	// Register a single pattern handler for all "order.*" task types.
+	// The wildcard pattern matches order.validate, order.charge_payment,
+	// order.reserve_inventory, order.ship, order.send_confirmation.
 	err = srv.RegisterHandler(types.HandlerDefinition{
 		TaskType: "order.*", // pattern matching — longest prefix wins
 		Timeout:  20 * time.Second,
-		Handler:  orderHandler(logger),
+		Handler:  orderHandler(&zl),
 		// Per-handler middleware — applied after global middleware.
 		Middlewares: []types.MiddlewareFunc{
-			timingMiddleware(logger),
+			timingMiddleware(&zl),
 		},
 	})
 	if err != nil {
@@ -168,15 +189,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Wait for cluster singleton activation.
-	time.Sleep(2 * time.Second)
+	// Give the server a moment to elect a leader.
+	time.Sleep(3 * time.Second)
 
 	// --- Client Side ---
 
-	cli, err := client.New(
-		client.WithRedisURL("redis://localhost:6379"),
-		client.WithRedisPassword("your-password"),
-		client.WithRedisDB(15),
+	cli, err := dureq.NewClient(
+		dureq.WithClientRedisURL("redis://localhost:6379"),
+		dureq.WithClientRedisPassword("your-password"),
+		dureq.WithClientRedisDB(15),
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create client")
@@ -185,7 +206,7 @@ func main() {
 	defer cli.Close()
 
 	// Define the order processing workflow DAG.
-	orderPayload, _ := sonic.ConfigFastest.Marshal(map[string]string{"order_id": "ORD-2026-001", "customer": "alice"})
+	orderPayload, _ := json.Marshal(map[string]string{"order_id": "ORD-2026-001", "customer": "alice"})
 
 	wfDef := types.WorkflowDefinition{
 		Name: "order-processing-mux",

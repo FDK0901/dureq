@@ -1,0 +1,53 @@
+syntax = "proto3";
+package dureq.monitor.v1;
+
+option go_package = "github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// SortOrder controls result ordering.
+enum SortOrder {
+  SORT_ORDER_UNSPECIFIED = 0;
+  SORT_ORDER_NEWEST = 1;
+  SORT_ORDER_OLDEST = 2;
+}
+
+// PaginationRequest contains common pagination parameters.
+message PaginationRequest {
+  int32 limit = 1;
+  int32 offset = 2;
+  SortOrder sort = 3;
+}
+
+// RetryPolicy describes retry behavior.
+message RetryPolicy {
+  int32 max_attempts = 1;
+  google.protobuf.Duration initial_delay = 2;
+  google.protobuf.Duration max_delay = 3;
+  double multiplier = 4;
+  double jitter = 5;
+}
+
+// AtTime represents a time of day.
+message AtTime {
+  uint32 hour = 1;
+  uint32 minute = 2;
+  uint32 second = 3;
+}
+
+// Schedule defines when a job should run.
+message Schedule {
+  // Type is one of: IMMEDIATE, ONE_TIME, DURATION, CRON, DAILY, WEEKLY, MONTHLY.
+  string type = 1;
+  optional google.protobuf.Timestamp run_at = 2;
+  optional google.protobuf.Duration interval = 3;
+  optional string cron_expr = 4;
+  optional uint32 regular_interval = 5;
+  repeated AtTime at_times = 6;
+  repeated int32 included_days = 7;
+  optional google.protobuf.Timestamp starts_at = 8;
+  optional google.protobuf.Timestamp ends_at = 9;
+  string timezone = 10;
+}
+

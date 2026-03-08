@@ -77,8 +77,10 @@ func main() {
 	}
 
 	// Start monitoring API — HTTP (wired to server's store and dispatcher).
-	svc := monitor.NewAPIService(srv.Store(), srv.Dispatcher(), logger)
-	api := monitor.NewAPI(svc)
+	api := monitor.NewAPI(srv.Store(), srv.Dispatcher(), logger)
+	if w := srv.Worker(); w != nil {
+		api.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
+	}
 	httpSrv := &http.Server{Addr: apiAddr, Handler: api.Handler()}
 	go func() {
 		logger.Info().String("addr", apiAddr).Msg("monitoring HTTP API listening")
@@ -87,9 +89,9 @@ func main() {
 		}
 	}()
 
-	// Start monitoring API — gRPC.
+	// Start monitoring API — gRPC (shares the same APIService).
 	grpcSrv := grpc.NewServer()
-	grpcMonitor := monitor.NewGRPCServer(srv.Store(), srv.Dispatcher(), logger)
+	grpcMonitor := monitor.NewGRPCServer(api.Service())
 	grpcMonitor.RegisterServer(grpcSrv)
 	reflection.Register(grpcSrv)
 	go func() {
@@ -112,7 +114,6 @@ func main() {
 	logger.Info().String("signal", sig.String()).Msg("received signal, shutting down")
 
 	grpcSrv.GracefulStop()
-	api.Shutdown()
 	httpSrv.Close()
 	srv.Stop()
 }

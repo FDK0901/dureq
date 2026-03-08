@@ -49,6 +49,8 @@ const (
 	EventJobScheduleToStartTimeout EventType = "job.schedule_to_start_timeout"
 	EventNodeCrashDetected         EventType = "node.crash_detected"
 	EventJobAutoRecovered          EventType = "job.auto_recovered"
+
+	EventWorkflowSignalReceived EventType = "workflow.signal.received"
 )
 
 // JobEvent is the envelope published to the DUREQ_EVENTS stream.

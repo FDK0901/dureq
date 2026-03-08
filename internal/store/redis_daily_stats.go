@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/redis/rueidis"
 )
 
 // DailyStats holds processed/failed counts for a single date.
@@ -19,9 +21,11 @@ type DailyStats struct {
 func (s *RedisStore) IncrDailyStat(ctx context.Context, field string) {
 	date := time.Now().Format("2006-01-02")
 	key := DailyStatsKey(s.prefix, date)
-	s.rdb.Do(ctx, s.rdb.B().Hincrby().Key(key).Field(field).Increment(1).Build())
+	cmds := make(rueidis.Commands, 0, 2)
+	cmds = append(cmds, s.rdb.B().Hincrby().Key(key).Field(field).Increment(1).Build())
 	// Set TTL of 91 days so stats auto-expire.
-	s.rdb.Do(ctx, s.rdb.B().Expire().Key(key).Seconds(91 * 24 * 3600).Build())
+	cmds = append(cmds, s.rdb.B().Expire().Key(key).Seconds(int64((91 * 24 * time.Hour).Seconds())).Build())
+	s.rdb.DoMulti(ctx, cmds...)
 }
 
 // GetDailyStats returns daily stats for the last N days.

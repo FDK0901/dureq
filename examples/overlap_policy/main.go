@@ -8,16 +8,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	client "github.com/FDK0901/dureq/clients/go"
-	"github.com/FDK0901/dureq/internal/server"
+	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
+
+	"github.com/FDK0901/dureq/pkg/dureq"
 	"github.com/FDK0901/dureq/pkg/types"
-	"github.com/bytedance/sonic"
+	"github.com/rs/zerolog"
 )
 
 type WorkPayload struct {
@@ -25,20 +25,25 @@ type WorkPayload struct {
 }
 
 func main() {
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	zl := chainedzerolog.NewZerologBase()
+	logger := chainedzerolog.NewZerolog(zl)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// --- Server Side ---
 
-	srv, err := server.New(
-		server.WithRedisURL("redis://localhost:6379"),
-		server.WithRedisDB(15),
-		server.WithRedisPassword("your-password"),
-		server.WithNodeID("overlap-node-1"),
-		server.WithMaxConcurrency(10),
+	srv, err := dureq.NewServer(
+		dureq.WithRedisURL("redis://localhost:6379"),
+		dureq.WithRedisDB(15),
+		dureq.WithRedisPassword("your-password"),
+		dureq.WithNodeID("overlap-node-1"),
+		dureq.WithMaxConcurrency(10),
+		dureq.WithLogger(logger),
 	)
 	if err != nil {
-		slog.Error("failed to create server", "err", err)
+		logger.Error().Err(err).Msg("failed to create server")
 		os.Exit(1)
 	}
 
@@ -49,35 +54,35 @@ func main() {
 		Timeout:     30 * time.Second,
 		Handler: func(ctx context.Context, payload json.RawMessage) error {
 			var p WorkPayload
-			if err := sonic.ConfigFastest.Unmarshal(payload, &p); err != nil {
+			if err := json.Unmarshal(payload, &p); err != nil {
 				return &types.NonRetryableError{Err: fmt.Errorf("invalid payload: %w", err)}
 			}
 
-			slog.Info("starting slow task (8s)", "label", p.Label)
+			logger.Info().String("label", p.Label).Msg("starting slow task (8s)")
 			time.Sleep(8 * time.Second)
-			slog.Info("slow task complete", "label", p.Label)
+			logger.Info().String("label", p.Label).Msg("slow task complete")
 			return nil
 		},
 	})
 	if err != nil {
-		slog.Error("failed to register handler", "err", err)
+		logger.Error().Err(err).Msg("failed to register handler")
 		os.Exit(1)
 	}
 
 	if err := srv.Start(ctx); err != nil {
-		slog.Error("failed to start server", "err", err)
+		logger.Error().Err(err).Msg("failed to start server")
 		os.Exit(1)
 	}
 
 	// --- Client Side ---
 
-	cli, err := client.New(
-		client.WithRedisURL("redis://localhost:6379"),
-		client.WithRedisPassword("your-password"),
-		client.WithRedisDB(15),
+	cli, err := dureq.NewClient(
+		dureq.WithClientRedisURL("redis://localhost:6379"),
+		dureq.WithClientRedisPassword("your-password"),
+		dureq.WithClientRedisDB(15),
 	)
 	if err != nil {
-		slog.Error("failed to create client", "err", err)
+		logger.Error().Err(err).Msg("failed to create client")
 		os.Exit(1)
 	}
 	defer cli.Close()
@@ -86,9 +91,9 @@ func main() {
 	endsAt := time.Now().Add(1 * time.Minute)
 
 	// Job 1: SKIP policy — if previous run is still active, skip the next firing.
-	skipPayload, _ := sonic.ConfigFastest.Marshal(WorkPayload{Label: "skip-policy"})
+	skipPayload, _ := json.Marshal(WorkPayload{Label: "skip-policy"})
 	skipKey := "overlap-skip-demo"
-	skipJob, err := cli.EnqueueScheduled(ctx, &client.EnqueueRequest{
+	skipJob, err := cli.EnqueueScheduled(ctx, &dureq.EnqueueRequest{
 		TaskType: "overlap.slow_task",
 		Payload:  skipPayload,
 		Schedule: types.Schedule{
@@ -101,15 +106,15 @@ func main() {
 		Tags:      []string{"overlap", "skip"},
 	})
 	if err != nil {
-		slog.Error("failed to enqueue skip job", "err", err)
+		logger.Error().Err(err).Msg("failed to enqueue skip job")
 	} else {
-		slog.Info("enqueued SKIP overlap policy job", "job_id", skipJob.ID)
+		logger.Info().String("job_id", skipJob.ID).Msg("enqueued SKIP overlap policy job (runs every 5s, task takes 8s)")
 	}
 
 	// Job 2: BUFFER_ONE policy — buffer the most recent missed firing, dispatch after completion.
-	bufPayload, _ := sonic.ConfigFastest.Marshal(WorkPayload{Label: "buffer-one-policy"})
+	bufPayload, _ := json.Marshal(WorkPayload{Label: "buffer-one-policy"})
 	bufKey := "overlap-buffer-demo"
-	bufJob, err := cli.EnqueueScheduled(ctx, &client.EnqueueRequest{
+	bufJob, err := cli.EnqueueScheduled(ctx, &dureq.EnqueueRequest{
 		TaskType: "overlap.slow_task",
 		Payload:  bufPayload,
 		Schedule: types.Schedule{
@@ -122,12 +127,12 @@ func main() {
 		Tags:      []string{"overlap", "buffer-one"},
 	})
 	if err != nil {
-		slog.Error("failed to enqueue buffer job", "err", err)
+		logger.Error().Err(err).Msg("failed to enqueue buffer job")
 	} else {
-		slog.Info("enqueued BUFFER_ONE overlap policy job", "job_id", bufJob.ID)
+		logger.Info().String("job_id", bufJob.ID).Msg("enqueued BUFFER_ONE overlap policy job (runs every 5s, task takes 8s)")
 	}
 
-	slog.Info("watch the logs: SKIP will miss firings, BUFFER_ONE will queue one and dispatch after completion")
+	logger.Info().Msg("watch the logs: SKIP will miss firings, BUFFER_ONE will queue one and dispatch after completion")
 
 	// --- Wait for shutdown ---
 
@@ -136,6 +141,6 @@ func main() {
 	<-sigCh
 
 	fmt.Println()
-	slog.Info("shutting down")
+	logger.Info().Msg("shutting down")
 	srv.Stop()
 }

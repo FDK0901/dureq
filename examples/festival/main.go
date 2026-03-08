@@ -1,7 +1,7 @@
 // Package main demonstrates the dureq festival use case.
 //
 // Scenario: Multiple offline festivals, each with a unique ID.
-// Each festival queries average wait time every 30 seconds (demo interval),
+// Each festival queries average wait time every 30 minutes,
 // starting at the festival open time and ending at the close time.
 // After close, the job is automatically removed.
 package main
@@ -15,12 +15,12 @@ import (
 	"syscall"
 	"time"
 
-	client "github.com/FDK0901/dureq/clients/go"
-	"github.com/FDK0901/dureq/internal/server"
-	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
-	"github.com/bytedance/sonic"
+
+	"github.com/FDK0901/dureq/pkg/dureq"
+	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/rs/xid"
+	"github.com/rs/zerolog"
 )
 
 // FestivalPayload is the input for the festival wait time query handler.
@@ -29,19 +29,22 @@ type FestivalPayload struct {
 }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	zl := chainedzerolog.NewZerologBase()
 	logger := chainedzerolog.NewZerolog(zl)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// --- Server Side ---
 
-	srv, err := server.New(
-		server.WithRedisURL("redis://localhost:6379"),
-		server.WithRedisDB(15),
-		server.WithRedisPassword("your-password"),
-		server.WithNodeID("festival-node-1"),
-		server.WithMaxConcurrency(10),
+	srv, err := dureq.NewServer(
+		dureq.WithRedisURL("redis://localhost:6379"),
+		dureq.WithRedisDB(15),
+		dureq.WithRedisPassword("your-password"),
+		dureq.WithNodeID("festival-node-1"),
+		dureq.WithMaxConcurrency(10),
+		dureq.WithLogger(logger),
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create server")
@@ -62,10 +65,18 @@ func main() {
 		},
 		Handler: func(ctx context.Context, payload json.RawMessage) error {
 			var p FestivalPayload
-			if err := sonic.ConfigFastest.Unmarshal(payload, &p); err != nil {
+			if err := json.Unmarshal(payload, &p); err != nil {
 				return &types.NonRetryableError{Err: fmt.Errorf("invalid payload: %w", err)}
 			}
+
+			// Simulate querying average wait time.
 			logger.Info().String("festival_id", p.FestivalID).String("time", time.Now().Format(time.RFC3339)).Msg("querying average wait time")
+
+			// In production, this would:
+			// 1. Query kiosk data for the festival
+			// 2. Calculate average wait time
+			// 3. Store the result
+
 			return nil
 		},
 	})
@@ -81,10 +92,10 @@ func main() {
 
 	// --- Client Side ---
 
-	cli, err := client.New(
-		client.WithRedisURL("redis://localhost:6379"),
-		client.WithRedisPassword("your-password"),
-		client.WithRedisDB(15),
+	cli, err := dureq.NewClient(
+		dureq.WithClientRedisURL("redis://localhost:6379"),
+		dureq.WithClientRedisPassword("your-password"),
+		dureq.WithClientRedisDB(15),
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create client")
@@ -100,8 +111,8 @@ func main() {
 	}{
 		{
 			ID:        xid.New().String(),
-			OpenDate:  time.Now().Add(1 * time.Minute),
-			CloseDate: time.Now().Add(10 * time.Minute),
+			OpenDate:  time.Now().Add(1 * time.Minute),  // starts in 1 minute (for demo)
+			CloseDate: time.Now().Add(10 * time.Minute), // ends in 10 minutes
 		},
 		{
 			ID:        xid.New().String(),
@@ -110,15 +121,15 @@ func main() {
 		},
 	}
 
-	interval := types.Duration(30 * time.Second)
+	interval := types.Duration(30 * time.Second) // 30 seconds for demo (would be 30 min in production)
 
 	for _, fest := range festivals {
-		payload, _ := sonic.ConfigFastest.Marshal(FestivalPayload{FestivalID: fest.ID})
+		payload, _ := json.Marshal(FestivalPayload{FestivalID: fest.ID})
 		uniqueKey := fmt.Sprintf("festival-wait-%s", fest.ID)
 		openDate := fest.OpenDate
 		closeDate := fest.CloseDate
 
-		job, err := cli.EnqueueScheduled(ctx, &client.EnqueueRequest{
+		job, err := cli.EnqueueScheduled(ctx, &dureq.EnqueueRequest{
 			TaskType: "festival.query_wait_time",
 			Payload:  payload,
 			Schedule: types.Schedule{

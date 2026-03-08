@@ -6,8 +6,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/bytedance/sonic"
+
+	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/redis/rueidis"
 )
 

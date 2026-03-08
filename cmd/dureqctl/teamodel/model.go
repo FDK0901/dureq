@@ -63,7 +63,7 @@ type model struct {
 
 	// List state.
 	cursor         int
-	jobFilter      string // status filter for jobs
+	jobFilter      string
 	workflowFilter string
 	batchFilter    string
 	runFilter      string
@@ -376,7 +376,6 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, key.NewBinding(key.WithKeys("tab"))):
 		if m.page >= pageJobDetail {
-			// From a detail view, go back to the parent tab.
 			switch m.page {
 			case pageJobDetail:
 				m.page = pageJobs

@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/bytedance/sonic"
+
+	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/redis/rueidis"
 )
 
@@ -60,43 +61,30 @@ func (s *RedisStore) AddToGroup(ctx context.Context, group string, msg types.Gro
 	return size, nil
 }
 
-// luaFlushGroup atomically reads all messages and deletes the list key in one
-// step, preventing a race where a concurrent AddToGroup inserts between
-// LRANGE and DEL.
-//
-// KEYS[1] = messages list key
-// Returns: all elements (or empty array).
-const luaFlushGroup = `
-local msgs = redis.call('LRANGE', KEYS[1], 0, -1)
-if #msgs > 0 then
-    redis.call('DEL', KEYS[1])
-end
-return msgs
-`
-
 // FlushGroup atomically reads and deletes all messages from a group.
+// Uses a Lua script so that concurrent callers on different nodes are safe:
+// only one caller will receive the messages; others get an empty result.
 func (s *RedisStore) FlushGroup(ctx context.Context, group string) ([]types.GroupMessage, error) {
 	msgKey := GroupMessagesKey(s.prefix, group)
+	metaKey := GroupMetaKey(s.prefix, group)
+	setKey := GroupSetKey(s.prefix)
 
-	// Atomically read + delete the messages list via Lua.
-	result, err := s.scriptFlushGroup.Exec(ctx, s.rdb, []string{msgKey}, nil).AsStrSlice()
+	raw, err := s.scriptFlushGroup.Exec(ctx, s.rdb,
+		[]string{msgKey, metaKey, setKey},
+		[]string{group},
+	).AsStrSlice()
 	if err != nil {
-		return nil, fmt.Errorf("flush group messages: %w", err)
-	}
-
-	if len(result) == 0 {
+		// rueidis returns error for empty array from Lua; treat as no messages.
 		return nil, nil
 	}
 
-	// Clean up metadata (best-effort, non-critical).
-	cmds := make(rueidis.Commands, 0, 2)
-	cmds = append(cmds, s.rdb.B().Del().Key(GroupMetaKey(s.prefix, group)).Build())
-	cmds = append(cmds, s.rdb.B().Zrem().Key(GroupSetKey(s.prefix)).Member(group).Build())
-	s.rdb.DoMulti(ctx, cmds...)
+	if len(raw) == 0 {
+		return nil, nil
+	}
 
 	// Parse messages.
-	messages := make([]types.GroupMessage, 0, len(result))
-	for _, r := range result {
+	messages := make([]types.GroupMessage, 0, len(raw))
+	for _, r := range raw {
 		var msg types.GroupMessage
 		if sonic.ConfigFastest.Unmarshal([]byte(r), &msg) == nil {
 			messages = append(messages, msg)

@@ -7,13 +7,14 @@
 package monitorv1
 
 import (
+	reflect "reflect"
+	sync "sync"
+	unsafe "unsafe"
+
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
-	reflect "reflect"
-	sync "sync"
-	unsafe "unsafe"
 )
 
 const (
@@ -435,7 +436,7 @@ const file_dureq_monitor_v1_common_proto_rawDesc = "" +
 	"\tSortOrder\x12\x1a\n" +
 	"\x16SORT_ORDER_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11SORT_ORDER_NEWEST\x10\x01\x12\x15\n" +
-	"\x11SORT_ORDER_OLDEST\x10\x02B9Z7github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"\x11SORT_ORDER_OLDEST\x10\x02B7Z5github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var (
 	file_dureq_monitor_v1_common_proto_rawDescOnce sync.Once

@@ -1,0 +1,95 @@
+syntax = "proto3";
+package dureq.monitor.v1;
+
+option go_package = "github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1";
+
+// Each bulk RPC needs unique request/response types per buf STANDARD lint rules.
+// All requests share the same fields: ids + status filter.
+// All responses share the same field: affected count.
+
+// --- Job bulk ---
+
+message BulkCancelJobsRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkCancelJobsResponse {
+  int32 affected = 1;
+}
+
+message BulkRetryJobsRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkRetryJobsResponse {
+  int32 affected = 1;
+}
+
+message BulkDeleteJobsRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkDeleteJobsResponse {
+  int32 affected = 1;
+}
+
+// --- Workflow bulk ---
+
+message BulkCancelWorkflowsRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkCancelWorkflowsResponse {
+  int32 affected = 1;
+}
+
+message BulkRetryWorkflowsRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkRetryWorkflowsResponse {
+  int32 affected = 1;
+}
+
+message BulkDeleteWorkflowsRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkDeleteWorkflowsResponse {
+  int32 affected = 1;
+}
+
+// --- Batch bulk ---
+
+message BulkCancelBatchesRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkCancelBatchesResponse {
+  int32 affected = 1;
+}
+
+message BulkRetryBatchesRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkRetryBatchesResponse {
+  int32 affected = 1;
+}
+
+message BulkDeleteBatchesRequest {
+  repeated string ids = 1;
+  string status = 2;
+}
+
+message BulkDeleteBatchesResponse {
+  int32 affected = 1;
+}

@@ -1,7 +1,7 @@
 syntax = "proto3";
 package dureq.monitor.v1;
 
-option go_package = "github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1";
+option go_package = "github.com/dureq/dureq/gen/dureq/monitor/v1;monitorv1";
 
 import "google/protobuf/timestamp.proto";
 

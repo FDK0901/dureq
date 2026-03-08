@@ -6,9 +6,9 @@ import (
 	"os"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/FDK0901/dureq/cmd/dureqctl/teamodel"
 	"github.com/FDK0901/dureq/internal/api"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {

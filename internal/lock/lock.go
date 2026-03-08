@@ -6,10 +6,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/FDK0901/dureq/internal/store"
-	"github.com/FDK0901/dureq/pkg/types"
 	gochainedlog "github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
+
+	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/redis/rueidis"
 )
 

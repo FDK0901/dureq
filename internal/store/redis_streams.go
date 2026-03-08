@@ -6,8 +6,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/bytedance/sonic"
+
+	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/redis/rueidis"
 )
 
@@ -65,7 +66,8 @@ func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *type
 		FieldValue("deadline", wm.Deadline.Format(time.RFC3339Nano)).
 		FieldValue("priority", strconv.Itoa(int(wm.Priority))).
 		FieldValue("dispatched_at", wm.DispatchedAt.Format(time.RFC3339Nano)).
-		FieldValue("tier", tierName)
+		FieldValue("tier", tierName).
+		FieldValue("version", wm.Version)
 
 	if len(wm.Headers) > 0 {
 		if hdr, err := sonic.ConfigFastest.Marshal(wm.Headers); err == nil {
@@ -79,6 +81,10 @@ func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *type
 		s.rdb.Do(ctx, s.rdb.B().Del().Key(dedupKey).Build())
 		return "", fmt.Errorf("XADD work: %w", err)
 	}
+
+	// Fire-and-forget push notification to wake blocked workers immediately.
+	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(JobNotifyChannel(s.prefix)).Message(tierName).Build())
+
 	return msgID, nil
 }
 
@@ -129,6 +135,13 @@ func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) err
 		cmds = append(cmds, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, event.BatchProgress.BatchID)).Message(string(data)).Build())
 	}
 
+	// Per-workflow event index: index workflow-related events by workflow ID.
+	if event.JobID != "" && isWorkflowEventType(event.Type) {
+		score := float64(event.Timestamp.UnixNano()) / 1e9
+		cmds = append(cmds, s.rdb.B().Zadd().Key(WorkflowEventsKey(s.prefix, event.JobID)).
+			ScoreMember().ScoreMember(score, string(data)).Build())
+	}
+
 	for _, resp := range s.rdb.DoMulti(ctx, cmds...) {
 		if err := resp.Error(); err != nil {
 			return err
@@ -138,7 +151,7 @@ func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) err
 }
 
 // ============================================================
-// Job Notification (dureq actor dispatch trigger)
+// Job Notification (dureqv2 actor dispatch trigger)
 // ============================================================
 
 // PublishJobNotification publishes a lightweight notification to the
@@ -319,6 +332,26 @@ func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.
 	return s.rdb.Do(ctx, s.rdb.B().Zadd().Key(DelayedKey(s.prefix, tierName)).ScoreMember().ScoreMember(float64(executeAt.UnixNano()), string(data)).Build()).Error()
 }
 
+// MoveDelayedToStream atomically moves ripe delayed messages back to the work stream.
+// Returns the number of messages moved.
+func (s *RedisStore) MoveDelayedToStream(ctx context.Context, tierName string, maxMove int) (int64, error) {
+	now := strconv.FormatFloat(float64(time.Now().UnixNano()), 'f', 0, 64)
+	result, err := s.scriptMoveDelayed.Exec(ctx, s.rdb,
+		[]string{DelayedKey(s.prefix, tierName), WorkStreamKey(s.prefix, tierName)},
+		[]string{now, strconv.Itoa(maxMove)},
+	).AsInt64()
+	if err != nil {
+		return 0, err
+	}
+
+	// Wake blocked workers so they pick up the moved messages immediately.
+	if result > 0 {
+		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(JobNotifyChannel(s.prefix)).Message(tierName).Build())
+	}
+
+	return result, nil
+}
+
 // ReenqueueWork re-adds a work message to the stream without dedup.
 // Used when a worker picks up a message for a task type it doesn't handle.
 func (s *RedisStore) ReenqueueWork(ctx context.Context, tierName string, wm *types.WorkMessage, redeliveries int) error {
@@ -334,6 +367,12 @@ func (s *RedisStore) ReenqueueWork(ctx context.Context, tierName string, wm *typ
 		FieldValue("tier", tierName).
 		FieldValue("redeliveries", strconv.Itoa(redeliveries)).
 		Build()).ToString()
+
+	// Wake blocked workers so they pick up the requeued message immediately.
+	if err == nil {
+		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(JobNotifyChannel(s.prefix)).Message(tierName).Build())
+	}
+
 	return err
 }
 
@@ -379,4 +418,23 @@ func metaVal(m map[string]string, key string) string {
 		return ""
 	}
 	return m[key]
+}
+
+// isWorkflowEventType returns true if the event type is workflow-related
+// and should be indexed in the per-workflow event sorted set.
+func isWorkflowEventType(t types.EventType) bool {
+	switch t {
+	case types.EventWorkflowStarted,
+		types.EventWorkflowCompleted,
+		types.EventWorkflowFailed,
+		types.EventWorkflowCancelled,
+		types.EventWorkflowTaskDispatched,
+		types.EventWorkflowTaskCompleted,
+		types.EventWorkflowTaskFailed,
+		types.EventWorkflowTimedOut,
+		types.EventWorkflowRetrying,
+		types.EventWorkflowSignalReceived:
+		return true
+	}
+	return false
 }

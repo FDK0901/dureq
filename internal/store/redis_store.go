@@ -11,6 +11,7 @@ import (
 
 	"github.com/FDK0901/dureq/pkg/types"
 	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/bytedance/sonic"
 	"github.com/redis/rueidis"
 )
 
@@ -116,7 +117,8 @@ type RedisStore struct {
 	scriptCASJob        *rueidis.Lua
 	scriptCASUpdate     *rueidis.Lua
 	scriptCreateNX      *rueidis.Lua
-	scriptPopDelayed    *rueidis.Lua
+	scriptLeaderRefresh *rueidis.Lua
+	scriptMoveDelayed   *rueidis.Lua
 	scriptFlushGroup    *rueidis.Lua
 }
 
@@ -135,7 +137,8 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog
 		scriptCASJob:        rueidis.NewLuaScript(luaCASUpdateJobSingleKey),
 		scriptCASUpdate:     rueidis.NewLuaScript(luaCASUpdate),
 		scriptCreateNX:      rueidis.NewLuaScript(luaCreateIfNotExists),
-		scriptPopDelayed:    rueidis.NewLuaScript(luaPopDelayed),
+		scriptLeaderRefresh: rueidis.NewLuaScript(luaLeaderRefresh),
+		scriptMoveDelayed:   rueidis.NewLuaScript(luaMoveDelayedToStream),
 		scriptFlushGroup:    rueidis.NewLuaScript(luaFlushGroup),
 	}
 
@@ -171,7 +174,7 @@ func (s *RedisStore) Close() error {
 // The job hash is updated atomically via a single-key Lua script;
 // secondary indexes are updated individually (best-effort) for Redis Cluster compatibility.
 func (s *RedisStore) SaveJob(ctx context.Context, job *types.Job) (uint64, error) {
-	data, err := json.Marshal(job)
+	data, err := sonic.ConfigFastest.Marshal(job)
 	if err != nil {
 		return 0, fmt.Errorf("marshal job: %w", err)
 	}
@@ -195,7 +198,7 @@ func (s *RedisStore) SaveJob(ctx context.Context, job *types.Job) (uint64, error
 // CreateJob atomically creates a job only if it doesn't already exist.
 // Secondary indexes are added individually after creation.
 func (s *RedisStore) CreateJob(ctx context.Context, job *types.Job) (uint64, error) {
-	data, err := json.Marshal(job)
+	data, err := sonic.ConfigFastest.Marshal(job)
 	if err != nil {
 		return 0, fmt.Errorf("marshal job: %w", err)
 	}
@@ -235,7 +238,7 @@ func (s *RedisStore) GetJob(ctx context.Context, jobID string) (*types.Job, uint
 	}
 
 	var job types.Job
-	if err := json.Unmarshal([]byte(dataStr), &job); err != nil {
+	if err := sonic.ConfigFastest.Unmarshal([]byte(dataStr), &job); err != nil {
 		return nil, 0, fmt.Errorf("unmarshal job: %w", err)
 	}
 
@@ -247,7 +250,7 @@ func (s *RedisStore) GetJob(ctx context.Context, jobID string) (*types.Job, uint
 // The job hash is updated atomically via a single-key Lua script;
 // secondary indexes are diffed and updated individually.
 func (s *RedisStore) UpdateJob(ctx context.Context, job *types.Job, expectedRev uint64) (uint64, error) {
-	data, err := json.Marshal(job)
+	data, err := sonic.ConfigFastest.Marshal(job)
 	if err != nil {
 		return 0, fmt.Errorf("marshal job: %w", err)
 	}
@@ -268,6 +271,10 @@ func (s *RedisStore) UpdateJob(ctx context.Context, job *types.Job, expectedRev 
 	s.updateJobIndexes(ctx, job, oldData)
 	s.updateJobAssociationIndexes(ctx, job)
 	s.mirrorJobPayload(ctx, job) // best-effort JSON mirror for JSONPath search
+
+	// Append audit trail entry for the state transition.
+	s.appendJobAudit(ctx, job.ID, job.Status, job.LastError)
+
 	return ver, nil
 }
 
@@ -287,7 +294,7 @@ func (s *RedisStore) DeleteJob(ctx context.Context, jobID string) error {
 	// Clean all secondary indexes from old data.
 	if oldData != "" {
 		var old types.Job
-		if json.Unmarshal([]byte(oldData), &old) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(oldData), &old) == nil {
 			s.removeJobIndexes(ctx, jobID, &old)
 		}
 	}
@@ -304,6 +311,18 @@ func (s *RedisStore) ListJobs(ctx context.Context) ([]*types.Job, error) {
 	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrange().Key(JobsByCreatedKey(s.prefix)).Min("0").Max("-1").Build()).AsStrSlice()
 	if err != nil {
 		return nil, fmt.Errorf("list job IDs: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateJobs(ctx, ids)
+}
+
+// ListJobsByStatus returns all jobs with the given status.
+func (s *RedisStore) ListJobsByStatus(ctx context.Context, status types.JobStatus) ([]*types.Job, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrange().Key(JobsByStatusKey(s.prefix, string(status))).Min("0").Max("-1").Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list jobs by status: %w", err)
 	}
 	if len(ids) == 0 {
 		return nil, nil
@@ -341,14 +360,8 @@ func (s *RedisStore) GetActiveJobStats(ctx context.Context) (map[types.JobStatus
 
 // GetJobStats returns aggregated job statistics.
 func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats, error) {
-	totalJobs, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
-	if err != nil {
-		return nil, fmt.Errorf("count total jobs: %w", err)
-	}
-	totalRuns, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(HistoryRunsKey(s.prefix)).Build()).AsInt64()
-	if err != nil {
-		return nil, fmt.Errorf("count total runs: %w", err)
-	}
+	totalJobs, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
+	totalRuns, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(HistoryRunsKey(s.prefix)).Build()).AsInt64()
 
 	statuses := []types.JobStatus{
 		types.JobStatusPending, types.JobStatusScheduled, types.JobStatusRunning,
@@ -364,11 +377,7 @@ func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats,
 
 	byStatus := make(map[types.JobStatus]int64)
 	for i, st := range statuses {
-		n, err := results[i].AsInt64()
-		if err != nil {
-			return nil, fmt.Errorf("count jobs by status %q: %w", st, err)
-		}
-		if n > 0 {
+		if n, err := results[i].AsInt64(); err == nil && n > 0 {
 			byStatus[st] = n
 		}
 	}
@@ -387,7 +396,7 @@ func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats,
 
 // SaveSchedule upserts a schedule and updates the due sorted set.
 func (s *RedisStore) SaveSchedule(ctx context.Context, entry *types.ScheduleEntry) (uint64, error) {
-	data, err := json.Marshal(entry)
+	data, err := sonic.ConfigFastest.Marshal(entry)
 	if err != nil {
 		return 0, fmt.Errorf("marshal schedule: %w", err)
 	}
@@ -418,7 +427,7 @@ func (s *RedisStore) GetSchedule(ctx context.Context, jobID string) (*types.Sche
 	}
 
 	var sched types.ScheduleEntry
-	if err := json.Unmarshal([]byte(result["data"]), &sched); err != nil {
+	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &sched); err != nil {
 		return nil, 0, fmt.Errorf("unmarshal schedule: %w", err)
 	}
 	return &sched, parseVersion(result["_version"]), nil
@@ -469,7 +478,7 @@ func (s *RedisStore) ListSchedules(ctx context.Context) ([]*types.ScheduleEntry,
 
 // SaveRun upserts a job run and maintains the active set and by-job index.
 func (s *RedisStore) SaveRun(ctx context.Context, run *types.JobRun) (uint64, error) {
-	data, err := json.Marshal(run)
+	data, err := sonic.ConfigFastest.Marshal(run)
 	if err != nil {
 		return 0, fmt.Errorf("marshal run: %w", err)
 	}
@@ -508,7 +517,7 @@ func (s *RedisStore) GetRun(ctx context.Context, runID string) (*types.JobRun, u
 	}
 
 	var run types.JobRun
-	if err := json.Unmarshal([]byte(result["data"]), &run); err != nil {
+	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &run); err != nil {
 		return nil, 0, fmt.Errorf("unmarshal run: %w", err)
 	}
 	return &run, parseVersion(result["_version"]), nil
@@ -527,7 +536,7 @@ func (s *RedisStore) DeleteRun(ctx context.Context, runID string) error {
 
 	if dataStr != "" {
 		var run types.JobRun
-		if json.Unmarshal([]byte(dataStr), &run) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &run) == nil {
 			cmds = append(cmds, s.rdb.B().Zrem().Key(RunsByJobKey(s.prefix, run.JobID)).Member(runID).Build())
 			cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveByJobKey(s.prefix, run.JobID)).Member(runID).Build())
 		}
@@ -555,36 +564,21 @@ func (s *RedisStore) ListRuns(ctx context.Context) ([]*types.JobRun, error) {
 }
 
 // ListActiveRunsByJobID returns all active runs belonging to a specific job.
+// Uses the per-job active run set (RunsActiveByJobKey) for O(per-job) lookup.
 func (s *RedisStore) ListActiveRunsByJobID(ctx context.Context, jobID string) ([]*types.JobRun, error) {
-	all, err := s.ListRuns(ctx)
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Smembers().Key(RunsActiveByJobKey(s.prefix, jobID)).Build()).AsStrSlice()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list active runs by job: %w", err)
 	}
-	var result []*types.JobRun
-	for _, r := range all {
-		if r.JobID == jobID {
-			result = append(result, r)
-		}
+	if len(ids) == 0 {
+		return nil, nil
 	}
-	return result, nil
+	return s.hydrateRuns(ctx, ids)
 }
 
 // CancelChannel returns the Redis Pub/Sub channel name used for task cancellation signals.
 func (s *RedisStore) CancelChannel() string {
 	return CancelChannelKey(s.prefix)
-}
-
-// SignalCancelActiveRuns publishes cancel signals to all active runs for a job.
-// This stops in-flight workers via the cancel Pub/Sub bridge.
-func (s *RedisStore) SignalCancelActiveRuns(ctx context.Context, jobID string) {
-	runs, err := s.ListActiveRunsByJobID(ctx, jobID)
-	if err != nil || len(runs) == 0 {
-		return
-	}
-	ch := s.CancelChannel()
-	for _, run := range runs {
-		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ch).Message(run.ID).Build())
-	}
 }
 
 // HasActiveRunForJob returns true if any non-terminal run exists for the given jobID.
@@ -654,7 +648,7 @@ func (s *RedisStore) PopOverlapBufferAll(ctx context.Context, jobID string) (tim
 
 // SaveNode upserts a node with TTL for automatic dead-node cleanup.
 func (s *RedisStore) SaveNode(ctx context.Context, node *types.NodeInfo) (uint64, error) {
-	data, err := json.Marshal(node)
+	data, err := sonic.ConfigFastest.Marshal(node)
 	if err != nil {
 		return 0, fmt.Errorf("marshal node: %w", err)
 	}
@@ -682,7 +676,7 @@ func (s *RedisStore) GetNode(ctx context.Context, nodeID string) (*types.NodeInf
 	}
 
 	var node types.NodeInfo
-	if err := json.Unmarshal([]byte(result["data"]), &node); err != nil {
+	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &node); err != nil {
 		return nil, fmt.Errorf("unmarshal node: %w", err)
 	}
 	return &node, nil
@@ -705,7 +699,7 @@ func (s *RedisStore) ListNodes(ctx context.Context) ([]*types.NodeInfo, error) {
 			continue
 		}
 		var node types.NodeInfo
-		if err := json.Unmarshal([]byte(result["data"]), &node); err != nil {
+		if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &node); err != nil {
 			continue
 		}
 		nodes = append(nodes, &node)
@@ -761,7 +755,7 @@ func (s *RedisStore) DeleteUniqueKey(ctx context.Context, uniqueKey string) erro
 
 // SaveWorkflow upserts a workflow instance and maintains sorted-set indexes.
 func (s *RedisStore) SaveWorkflow(ctx context.Context, wf *types.WorkflowInstance) (uint64, error) {
-	data, err := json.Marshal(wf)
+	data, err := sonic.ConfigFastest.Marshal(wf)
 	if err != nil {
 		return 0, fmt.Errorf("marshal workflow: %w", err)
 	}
@@ -803,7 +797,7 @@ func (s *RedisStore) GetWorkflow(ctx context.Context, id string) (*types.Workflo
 	}
 
 	var wf types.WorkflowInstance
-	if err := json.Unmarshal([]byte(result["data"]), &wf); err != nil {
+	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &wf); err != nil {
 		return nil, 0, fmt.Errorf("unmarshal workflow: %w", err)
 	}
 	return &wf, parseVersion(result["_version"]), nil
@@ -814,7 +808,7 @@ func (s *RedisStore) UpdateWorkflow(ctx context.Context, wf *types.WorkflowInsta
 	key := WorkflowKey(s.prefix, wf.ID)
 	oldStatus := hashFieldFromJSON(ctx, s.rdb, key, "status")
 
-	data, err := json.Marshal(wf)
+	data, err := sonic.ConfigFastest.Marshal(wf)
 	if err != nil {
 		return 0, fmt.Errorf("marshal workflow: %w", err)
 	}
@@ -883,13 +877,25 @@ func (s *RedisStore) ListWorkflows(ctx context.Context) ([]*types.WorkflowInstan
 	return s.hydrateWorkflows(ctx, ids)
 }
 
+// ListWorkflowsByStatus returns workflow instances with the given status.
+func (s *RedisStore) ListWorkflowsByStatus(ctx context.Context, status types.WorkflowStatus) ([]*types.WorkflowInstance, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrange().Key(WorkflowsByStatusKey(s.prefix, string(status))).Min("0").Max("-1").Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list workflows by status: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateWorkflows(ctx, ids)
+}
+
 // ============================================================
 // Batch operations
 // ============================================================
 
 // SaveBatch upserts a batch instance and maintains sorted-set indexes.
 func (s *RedisStore) SaveBatch(ctx context.Context, batch *types.BatchInstance) (uint64, error) {
-	data, err := json.Marshal(batch)
+	data, err := sonic.ConfigFastest.Marshal(batch)
 	if err != nil {
 		return 0, fmt.Errorf("marshal batch: %w", err)
 	}
@@ -931,7 +937,7 @@ func (s *RedisStore) GetBatch(ctx context.Context, batchID string) (*types.Batch
 	}
 
 	var batch types.BatchInstance
-	if err := json.Unmarshal([]byte(result["data"]), &batch); err != nil {
+	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &batch); err != nil {
 		return nil, 0, fmt.Errorf("unmarshal batch: %w", err)
 	}
 	return &batch, parseVersion(result["_version"]), nil
@@ -942,7 +948,7 @@ func (s *RedisStore) UpdateBatch(ctx context.Context, batch *types.BatchInstance
 	key := BatchKey(s.prefix, batch.ID)
 	oldStatus := hashFieldFromJSON(ctx, s.rdb, key, "status")
 
-	data, err := json.Marshal(batch)
+	data, err := sonic.ConfigFastest.Marshal(batch)
 	if err != nil {
 		return 0, fmt.Errorf("marshal batch: %w", err)
 	}
@@ -1011,13 +1017,25 @@ func (s *RedisStore) ListBatches(ctx context.Context) ([]*types.BatchInstance, e
 	return s.hydrateBatches(ctx, ids)
 }
 
+// ListBatchesByStatus returns batch instances with the given status.
+func (s *RedisStore) ListBatchesByStatus(ctx context.Context, status types.WorkflowStatus) ([]*types.BatchInstance, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrange().Key(BatchesByStatusKey(s.prefix, string(status))).Min("0").Max("-1").Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list batches by status: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateBatches(ctx, ids)
+}
+
 // ============================================================
 // Batch item result operations
 // ============================================================
 
 // SaveBatchItemResult stores a single batch item result.
 func (s *RedisStore) SaveBatchItemResult(ctx context.Context, result *types.BatchItemResult) error {
-	data, err := json.Marshal(result)
+	data, err := sonic.ConfigFastest.Marshal(result)
 	if err != nil {
 		return fmt.Errorf("marshal batch item result: %w", err)
 	}
@@ -1045,7 +1063,7 @@ func (s *RedisStore) GetBatchItemResult(ctx context.Context, batchID, itemID str
 	}
 
 	var result types.BatchItemResult
-	if err := json.Unmarshal([]byte(dataStr), &result); err != nil {
+	if err := sonic.ConfigFastest.Unmarshal([]byte(dataStr), &result); err != nil {
 		return nil, fmt.Errorf("unmarshal batch item result: %w", err)
 	}
 	return &result, nil
@@ -1074,7 +1092,7 @@ func (s *RedisStore) ListBatchItemResults(ctx context.Context, batchID string) (
 			continue
 		}
 		var result types.BatchItemResult
-		if json.Unmarshal([]byte(dataStr), &result) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &result) == nil {
 			results = append(results, &result)
 		}
 	}
@@ -1110,7 +1128,7 @@ func (s *RedisStore) ListDLQ(ctx context.Context, limit int) ([]*types.WorkMessa
 
 // SaveJobRun persists a job run to the history indexes.
 func (s *RedisStore) SaveJobRun(ctx context.Context, run *types.JobRun) error {
-	data, err := json.Marshal(run)
+	data, err := sonic.ConfigFastest.Marshal(run)
 	if err != nil {
 		return fmt.Errorf("marshal job run: %w", err)
 	}
@@ -1137,7 +1155,7 @@ func (s *RedisStore) SaveJobRun(ctx context.Context, run *types.JobRun) error {
 
 // SaveJobEvent persists a job event to the history indexes.
 func (s *RedisStore) SaveJobEvent(ctx context.Context, event *types.JobEvent) error {
-	data, err := json.Marshal(event)
+	data, err := sonic.ConfigFastest.Marshal(event)
 	if err != nil {
 		return fmt.Errorf("marshal job event: %w", err)
 	}
@@ -1192,7 +1210,7 @@ func (s *RedisStore) Cleanup(ctx context.Context, olderThan time.Time) (int64, e
 			// Clean secondary indexes if we can read the run data.
 			if dataStr, err := readResults[i].ToString(); err == nil {
 				var run types.JobRun
-				if json.Unmarshal([]byte(dataStr), &run) == nil {
+				if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &run) == nil {
 					if run.JobID != "" {
 						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryRunsByJobKey(s.prefix, run.JobID)).Member(id).Build())
 					}
@@ -1228,7 +1246,7 @@ func (s *RedisStore) Cleanup(ctx context.Context, olderThan time.Time) (int64, e
 			// Clean secondary indexes if we can read the event data.
 			if dataStr, err := readResults[i].ToString(); err == nil {
 				var event types.JobEvent
-				if json.Unmarshal([]byte(dataStr), &event) == nil {
+				if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &event) == nil {
 					if event.JobID != "" {
 						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryEventsByJobKey(s.prefix, event.JobID)).Member(id).Build())
 					}
@@ -1264,7 +1282,7 @@ func (s *RedisStore) hydrateJobs(ctx context.Context, ids []string) ([]*types.Jo
 			continue
 		}
 		var job types.Job
-		if json.Unmarshal([]byte(dataStr), &job) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &job) == nil {
 			jobs = append(jobs, &job)
 		}
 	}
@@ -1285,7 +1303,7 @@ func (s *RedisStore) hydrateSchedules(ctx context.Context, ids []string) ([]*typ
 			continue
 		}
 		var sched types.ScheduleEntry
-		if json.Unmarshal([]byte(dataStr), &sched) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &sched) == nil {
 			scheds = append(scheds, &sched)
 		}
 	}
@@ -1306,7 +1324,7 @@ func (s *RedisStore) hydrateRuns(ctx context.Context, ids []string) ([]*types.Jo
 			continue
 		}
 		var run types.JobRun
-		if json.Unmarshal([]byte(dataStr), &run) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &run) == nil {
 			runs = append(runs, &run)
 		}
 	}
@@ -1327,7 +1345,7 @@ func (s *RedisStore) hydrateWorkflows(ctx context.Context, ids []string) ([]*typ
 			continue
 		}
 		var wf types.WorkflowInstance
-		if json.Unmarshal([]byte(dataStr), &wf) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &wf) == nil {
 			wfs = append(wfs, &wf)
 		}
 	}
@@ -1348,7 +1366,7 @@ func (s *RedisStore) hydrateBatches(ctx context.Context, ids []string) ([]*types
 			continue
 		}
 		var batch types.BatchInstance
-		if json.Unmarshal([]byte(dataStr), &batch) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &batch) == nil {
 			batches = append(batches, &batch)
 		}
 	}
@@ -1398,7 +1416,7 @@ func (s *RedisStore) updateJobIndexes(ctx context.Context, job *types.Job, oldDa
 	}
 
 	var old types.Job
-	if json.Unmarshal([]byte(oldDataStr), &old) != nil {
+	if sonic.ConfigFastest.Unmarshal([]byte(oldDataStr), &old) != nil {
 		// Can't parse old data — just add new indexes.
 		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
 		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
@@ -1484,7 +1502,7 @@ func hashFieldFromJSON(ctx context.Context, rdb rueidis.Client, key, field strin
 		return ""
 	}
 	var m map[string]interface{}
-	if json.Unmarshal([]byte(dataStr), &m) != nil {
+	if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &m) != nil {
 		return ""
 	}
 	if v, ok := m[field]; ok {
@@ -1535,7 +1553,7 @@ func WorkMessageFromStreamValues(values map[string]string) types.WorkMessage {
 	// Parse headers (JSON-encoded map).
 	if h := values["headers"]; h != "" {
 		var headers map[string]string
-		if json.Unmarshal([]byte(h), &headers) == nil {
+		if sonic.ConfigFastest.Unmarshal([]byte(h), &headers) == nil {
 			wm.Headers = headers
 		}
 	}
@@ -1543,6 +1561,8 @@ func WorkMessageFromStreamValues(values map[string]string) types.WorkMessage {
 	if e := values["error"]; e != "" {
 		wm.Metadata = map[string]string{"error": e}
 	}
+	// Worker versioning.
+	wm.Version = values["version"]
 	return wm
 }
 
@@ -1575,7 +1595,7 @@ func (s *RedisStore) mirrorWorkflowPayloads(_ context.Context, wf *types.Workflo
 		}
 		payloads = append(payloads, p)
 	}
-	data, _ := json.Marshal(payloads)
+	data, _ := sonic.ConfigFastest.Marshal(payloads)
 	s.rdb.Do(bgCtx, s.rdb.B().JsonSet().Key(WorkflowPayloadKey(s.prefix, wf.ID)).Path("$").Value(string(data)).Build())
 }
 
@@ -1599,7 +1619,7 @@ func (s *RedisStore) mirrorBatchPayloads(_ context.Context, batch *types.BatchIn
 		}
 		bp.Items = append(bp.Items, p)
 	}
-	data, _ := json.Marshal(bp)
+	data, _ := sonic.ConfigFastest.Marshal(bp)
 	s.rdb.Do(bgCtx, s.rdb.B().JsonSet().Key(BatchPayloadKey(s.prefix, batch.ID)).Path("$").Value(string(data)).Build())
 }
 
@@ -1725,7 +1745,7 @@ func matchJSONGetResult(r rueidis.RedisResult, expected string) bool {
 
 	// Parse the JSON array of results.
 	var results []any
-	if json.Unmarshal([]byte(raw), &results) != nil {
+	if sonic.ConfigFastest.Unmarshal([]byte(raw), &results) != nil {
 		return false
 	}
 	for _, v := range results {
@@ -1734,4 +1754,188 @@ func matchJSONGetResult(r rueidis.RedisResult, expected string) bool {
 		}
 	}
 	return false
+}
+
+// --- Workflow Signal operations ---
+
+// SendSignal appends a signal to a workflow's signal stream.
+func (s *RedisStore) SendSignal(ctx context.Context, signal *types.WorkflowSignal) error {
+	key := WorkflowSignalStreamKey(s.prefix, signal.WorkflowID)
+	data, err := sonic.ConfigFastest.Marshal(signal)
+	if err != nil {
+		return fmt.Errorf("marshal signal: %w", err)
+	}
+	cmd := s.rdb.B().Xadd().Key(key).Id("*").FieldValue().FieldValue("data", string(data)).Build()
+	return s.rdb.Do(ctx, cmd).Error()
+}
+
+// ConsumeSignals reads and acknowledges all pending signals for a workflow.
+// Returns the signals and removes them from the stream.
+func (s *RedisStore) ConsumeSignals(ctx context.Context, workflowID string) ([]types.WorkflowSignal, error) {
+	key := WorkflowSignalStreamKey(s.prefix, workflowID)
+	cmd := s.rdb.B().Xrange().Key(key).Start("-").End("+").Build()
+	entries, err := s.rdb.Do(ctx, cmd).AsXRange()
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	signals := make([]types.WorkflowSignal, 0, len(entries))
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		data, ok := entry.FieldValues["data"]
+		if !ok {
+			continue
+		}
+		var sig types.WorkflowSignal
+		if err := sonic.ConfigFastest.Unmarshal([]byte(data), &sig); err != nil {
+			continue
+		}
+		signals = append(signals, sig)
+		ids = append(ids, entry.ID)
+	}
+
+	// Delete consumed entries.
+	if len(ids) > 0 {
+		s.rdb.Do(ctx, s.rdb.B().Xdel().Key(key).Id(ids...).Build())
+	}
+
+	return signals, nil
+}
+
+// DeleteSignalStream removes the signal stream for a workflow (cleanup).
+func (s *RedisStore) DeleteSignalStream(ctx context.Context, workflowID string) {
+	key := WorkflowSignalStreamKey(s.prefix, workflowID)
+	s.rdb.Do(ctx, s.rdb.B().Del().Key(key).Build())
+}
+
+// --- Job Audit Trail ---
+
+const auditStreamMaxLen = 1000
+
+// appendJobAudit records a state transition in the per-job audit stream.
+func (s *RedisStore) appendJobAudit(ctx context.Context, jobID string, status types.JobStatus, lastError *string) {
+	key := JobAuditKey(s.prefix, jobID)
+	errVal := ""
+	if lastError != nil {
+		errVal = *lastError
+	}
+	cmd := s.rdb.B().Xadd().Key(key).Maxlen().Almost().Threshold(strconv.FormatInt(auditStreamMaxLen, 10)).Id("*").
+		FieldValue().FieldValue("status", string(status)).FieldValue("error", errVal).FieldValue("ts", time.Now().Format(time.RFC3339Nano)).Build()
+	s.rdb.Do(ctx, cmd)
+}
+
+// AuditEntry represents a single state transition in a job's audit trail.
+type AuditEntry struct {
+	ID        string    `json:"id"`
+	Status    string    `json:"status"`
+	Error     string    `json:"error,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// GetJobAuditTrail returns the state transition history for a job.
+func (s *RedisStore) GetJobAuditTrail(ctx context.Context, jobID string) ([]AuditEntry, error) {
+	key := JobAuditKey(s.prefix, jobID)
+	entries, err := s.rdb.Do(ctx, s.rdb.B().Xrange().Key(key).Start("-").End("+").Build()).AsXRange()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]AuditEntry, 0, len(entries))
+	for _, entry := range entries {
+		ae := AuditEntry{
+			ID:     entry.ID,
+			Status: entry.FieldValues["status"],
+			Error:  entry.FieldValues["error"],
+		}
+		if ts, err := time.Parse(time.RFC3339Nano, entry.FieldValues["ts"]); err == nil {
+			ae.Timestamp = ts
+		}
+		result = append(result, ae)
+	}
+	return result, nil
+}
+
+// GetJobAuditCount returns the number of audit entries for a job (XLEN).
+func (s *RedisStore) GetJobAuditCount(ctx context.Context, jobID string) (int64, error) {
+	key := JobAuditKey(s.prefix, jobID)
+	return s.rdb.Do(ctx, s.rdb.B().Xlen().Key(key).Build()).AsInt64()
+}
+
+// GetJobAuditCounts returns audit entry counts for multiple jobs via pipelined XLEN.
+func (s *RedisStore) GetJobAuditCounts(ctx context.Context, jobIDs []string) (map[string]int64, error) {
+	result := make(map[string]int64, len(jobIDs))
+	if len(jobIDs) == 0 {
+		return result, nil
+	}
+	cmds := make([]rueidis.Completed, len(jobIDs))
+	for i, id := range jobIDs {
+		cmds[i] = s.rdb.B().Xlen().Key(JobAuditKey(s.prefix, id)).Build()
+	}
+	resps := s.rdb.DoMulti(ctx, cmds...)
+	for i, resp := range resps {
+		n, err := resp.AsInt64()
+		if err != nil {
+			n = 0
+		}
+		result[jobIDs[i]] = n
+	}
+	return result, nil
+}
+
+// DeleteJobAuditTrail removes the audit stream for a job (cleanup).
+func (s *RedisStore) DeleteJobAuditTrail(ctx context.Context, jobID string) {
+	key := JobAuditKey(s.prefix, jobID)
+	s.rdb.Do(ctx, s.rdb.B().Del().Key(key).Build())
+}
+
+// --- Per-Workflow Event Index ---
+
+// GetWorkflowEvents returns all indexed events for a workflow, ordered by timestamp.
+func (s *RedisStore) GetWorkflowEvents(ctx context.Context, workflowID string) ([]types.JobEvent, error) {
+	key := WorkflowEventsKey(s.prefix, workflowID)
+	members, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(key).Min("-inf").Max("+inf").Build()).AsStrSlice()
+	if err != nil {
+		return nil, err
+	}
+
+	events := make([]types.JobEvent, 0, len(members))
+	for _, m := range members {
+		var ev types.JobEvent
+		if err := sonic.ConfigFastest.Unmarshal([]byte(m), &ev); err != nil {
+			continue
+		}
+		events = append(events, ev)
+	}
+	return events, nil
+}
+
+// DeleteWorkflowEvents removes the per-workflow event index (cleanup).
+func (s *RedisStore) DeleteWorkflowEvents(ctx context.Context, workflowID string) {
+	key := WorkflowEventsKey(s.prefix, workflowID)
+	s.rdb.Do(ctx, s.rdb.B().Del().Key(key).Build())
+}
+
+// --- Node Drain ---
+
+// SetNodeDrain sets the drain flag for a node. While draining, the worker
+// stops fetching new messages but continues processing in-flight tasks.
+func (s *RedisStore) SetNodeDrain(ctx context.Context, nodeID string, drain bool) error {
+	key := NodeDrainKey(s.prefix, nodeID)
+	if drain {
+		return s.rdb.Do(ctx, s.rdb.B().Set().Key(key).Value("1").Ex(600*time.Second).Build()).Error()
+	}
+	return s.rdb.Do(ctx, s.rdb.B().Del().Key(key).Build()).Error()
+}
+
+// IsNodeDraining returns true if the node is in drain mode.
+func (s *RedisStore) IsNodeDraining(ctx context.Context, nodeID string) (bool, error) {
+	key := NodeDrainKey(s.prefix, nodeID)
+	val, err := s.rdb.Do(ctx, s.rdb.B().Get().Key(key).Build()).ToString()
+	if err != nil {
+		return false, nil // key doesn't exist = not draining
+	}
+	return val == "1", nil
 }

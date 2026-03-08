@@ -7,11 +7,12 @@
 package monitorv1
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -934,7 +935,7 @@ const file_dureq_monitor_v1_bulk_proto_rawDesc = "" +
 	"\x03ids\x18\x01 \x03(\tR\x03ids\x12\x16\n" +
 	"\x06status\x18\x02 \x01(\tR\x06status\"7\n" +
 	"\x19BulkDeleteBatchesResponse\x12\x1a\n" +
-	"\baffected\x18\x01 \x01(\x05R\baffectedB9Z7github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"\baffected\x18\x01 \x01(\x05R\baffectedB7Z5github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var (
 	file_dureq_monitor_v1_bulk_proto_rawDescOnce sync.Once

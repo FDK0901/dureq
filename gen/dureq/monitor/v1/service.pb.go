@@ -7,10 +7,11 @@
 package monitorv1
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	unsafe "unsafe"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -74,7 +75,7 @@ const file_dureq_monitor_v1_service_proto_rawDesc = "" +
 	"\rGetDailyStats\x12&.dureq.monitor.v1.GetDailyStatsRequest\x1a'.dureq.monitor.v1.GetDailyStatsResponse\x12]\n" +
 	"\fGetRedisInfo\x12%.dureq.monitor.v1.GetRedisInfoRequest\x1a&.dureq.monitor.v1.GetRedisInfoResponse\x12c\n" +
 	"\x0eGetSyncRetries\x12'.dureq.monitor.v1.GetSyncRetriesRequest\x1a(.dureq.monitor.v1.GetSyncRetriesResponse\x12K\n" +
-	"\x06Health\x12\x1f.dureq.monitor.v1.HealthRequest\x1a .dureq.monitor.v1.HealthResponseB9Z7github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"\x06Health\x12\x1f.dureq.monitor.v1.HealthRequest\x1a .dureq.monitor.v1.HealthResponseB7Z5github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var file_dureq_monitor_v1_service_proto_goTypes = []any{
 	(*ListJobsRequest)(nil),             // 0: dureq.monitor.v1.ListJobsRequest

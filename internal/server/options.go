@@ -9,10 +9,21 @@ import (
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 )
 
+// WithGroupAggregation enables task group aggregation with the given configuration.
+func WithGroupAggregation(cfg types.GroupConfig) Option {
+	return func(c *Config) { c.GroupConfig = &cfg }
+}
+
+// WithRetentionPeriod sets how long completed/dead/cancelled jobs are kept before archival cleanup.
+// Default: 7 days. Set to 0 to disable archival.
+func WithRetentionPeriod(d time.Duration) Option {
+	return func(c *Config) { c.RetentionPeriod = &d }
+}
+
 // Option configures the server.
 type Option func(*Config)
 
-// Config holds all server configuration for dureq (Hollywood actor-based).
+// Config holds all server configuration.
 type Config struct {
 	// Redis connection options.
 	RedisOptions types.RedisOptions
@@ -20,27 +31,41 @@ type Config struct {
 	// NodeID uniquely identifies this server node. Auto-generated if empty.
 	NodeID string
 
-	// ListenAddr is the address for Hollywood Remote (dRPC). Default: random port.
-	ListenAddr string
-
-	// ClusterRegion is the cluster region identifier. Default: "default".
-	ClusterRegion string
-
 	// MaxConcurrency is the overall worker pool size per node. Default: 100.
 	MaxConcurrency int
 
+	// SchedulerTickInterval is how often the leader scans for due schedules. Default: 1s.
+	SchedulerTickInterval time.Duration
+
+	// HeartbeatInterval is how often nodes report health. Default: 5s.
+	HeartbeatInterval time.Duration
+
+	// ElectionTTL is the leader election key TTL. Default: 10s.
+	ElectionTTL time.Duration
+
+	// LockTTL is the distributed lock TTL. Default: 30s.
+	LockTTL time.Duration
+
+	// LockAutoExtend is the interval for auto-extending locks. Default: LockTTL/3.
+	LockAutoExtend time.Duration
+
+	// NodeTTL is the TTL for the node heartbeat KV entry. Default: 15s.
+	NodeTTL time.Duration
+
 	// ShutdownTimeout is the grace period for in-flight tasks before abort.
+	// After this duration, workers will requeue their messages and exit.
 	// Default: 30s.
 	ShutdownTimeout time.Duration
 
-	// LockTTL is the distributed lock TTL for per-run locks. Default: 30s.
-	LockTTL time.Duration
-
-	// LockAutoExtend is the interval for auto-extending per-run locks. Default: LockTTL/3.
-	LockAutoExtend time.Duration
-
 	// StoreConfig holds Redis store configuration.
 	StoreConfig store.RedisStoreConfig
+
+	// GroupConfig enables task group aggregation. Nil = disabled.
+	GroupConfig *types.GroupConfig
+
+	// RetentionPeriod controls how long completed/dead/cancelled jobs are kept.
+	// Nil = default (7 days). Set to pointer to 0 to disable archival.
+	RetentionPeriod *time.Duration
 
 	// Logger is the structured logger. Default: slog.Default().
 	Logger gochainedlog.Logger
@@ -50,11 +75,14 @@ func (c *Config) defaults() {
 	if c.MaxConcurrency == 0 {
 		c.MaxConcurrency = 100
 	}
-	if c.ShutdownTimeout == 0 {
-		c.ShutdownTimeout = 30 * time.Second
+	if c.SchedulerTickInterval == 0 {
+		c.SchedulerTickInterval = 1 * time.Second
 	}
-	if c.ClusterRegion == "" {
-		c.ClusterRegion = "default"
+	if c.HeartbeatInterval == 0 {
+		c.HeartbeatInterval = 5 * time.Second
+	}
+	if c.ElectionTTL == 0 {
+		c.ElectionTTL = 10 * time.Second
 	}
 	if c.LockTTL == 0 {
 		c.LockTTL = 30 * time.Second
@@ -62,9 +90,20 @@ func (c *Config) defaults() {
 	if c.LockAutoExtend == 0 {
 		c.LockAutoExtend = c.LockTTL / 3
 	}
+	if c.NodeTTL == 0 {
+		c.NodeTTL = 15 * time.Second
+	}
+	if c.ShutdownTimeout == 0 {
+		c.ShutdownTimeout = 30 * time.Second
+	}
 	if c.Logger == nil {
 		c.Logger = chainedslog.NewSlog(chainedslog.NewSlogBase())
 	}
+
+	// Propagate to store config.
+	c.StoreConfig.ElectionTTL = c.ElectionTTL
+	c.StoreConfig.LockTTL = c.LockTTL
+	c.StoreConfig.NodeTTL = c.NodeTTL
 }
 
 // WithRedisURL sets the Redis server URL.
@@ -91,36 +130,41 @@ func WithNodeID(id string) Option {
 	return func(c *Config) { c.NodeID = id }
 }
 
-func WithListenAddr(addr string) Option {
-	return func(c *Config) { c.ListenAddr = addr }
-}
-
-func WithClusterRegion(region string) Option {
-	return func(c *Config) { c.ClusterRegion = region }
-}
-
 func WithMaxConcurrency(n int) Option {
 	return func(c *Config) { c.MaxConcurrency = n }
 }
 
-func WithShutdownTimeout(d time.Duration) Option {
-	return func(c *Config) { c.ShutdownTimeout = d }
+func WithSchedulerTickInterval(d time.Duration) Option {
+	return func(c *Config) { c.SchedulerTickInterval = d }
 }
 
-func WithKeyPrefix(prefix string) Option {
-	return func(c *Config) { c.StoreConfig.KeyPrefix = prefix }
+func WithHeartbeatInterval(d time.Duration) Option {
+	return func(c *Config) { c.HeartbeatInterval = d }
 }
 
-func WithLogger(l gochainedlog.Logger) Option {
-	return func(c *Config) { c.Logger = l }
+func WithElectionTTL(d time.Duration) Option {
+	return func(c *Config) { c.ElectionTTL = d }
 }
 
 func WithLockTTL(d time.Duration) Option {
 	return func(c *Config) { c.LockTTL = d }
 }
 
-func WithLockAutoExtend(d time.Duration) Option {
-	return func(c *Config) { c.LockAutoExtend = d }
+func WithLogger(l gochainedlog.Logger) Option {
+	return func(c *Config) { c.Logger = l }
+}
+
+func WithShutdownTimeout(d time.Duration) Option {
+	return func(c *Config) { c.ShutdownTimeout = d }
+}
+
+// WithPriorityTiers sets user-defined priority tiers. Each tier becomes its own Redis Stream.
+func WithPriorityTiers(tiers []store.TierConfig) Option {
+	return func(c *Config) { c.StoreConfig.Tiers = tiers }
+}
+
+func WithKeyPrefix(prefix string) Option {
+	return func(c *Config) { c.StoreConfig.KeyPrefix = prefix }
 }
 
 // WithRedisSentinel configures Redis Sentinel failover mode.
@@ -134,16 +178,12 @@ func WithRedisSentinel(masterName string, sentinelAddrs []string, sentinelPasswo
 	}
 }
 
-// WithRedisCluster configures Redis Cluster mode.
+// WithRedisCluster configures Redis Cluster mode with the given node addresses.
+// NOTE: only single-shard (single-master) clusters are supported. dureq uses
+// multi-key Lua scripts whose keys span different hash slots, so multi-shard
+// clusters will fail with CROSSSLOT errors.
 func WithRedisCluster(addrs []string) Option {
 	return func(c *Config) {
 		c.RedisOptions.ClusterAddrs = addrs
-	}
-}
-
-// WithPriorityTiers sets the priority tier configuration.
-func WithPriorityTiers(tiers []store.TierConfig) Option {
-	return func(c *Config) {
-		c.StoreConfig.Tiers = tiers
 	}
 }

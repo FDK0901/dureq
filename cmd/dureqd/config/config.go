@@ -64,7 +64,7 @@ func getConfigPath() string {
 	}
 
 	// 기본 경로
-	basePath := "configs"
+	basePath := "configs/"
 
 	return filepath.Join(basePath, "config.yaml")
 }

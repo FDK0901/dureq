@@ -609,7 +609,7 @@ const file_dureq_monitor_v1_stats_proto_rawDesc = "" +
 	"\x04data\x18\x01 \x01(\fR\x04data\"\x0f\n" +
 	"\rHealthRequest\"(\n" +
 	"\x0eHealthResponse\x12\x16\n" +
-	"\x06status\x18\x01 \x01(\tR\x06statusB9Z7github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"\x06status\x18\x01 \x01(\tR\x06statusB7Z5github.com/dureq/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var (
 	file_dureq_monitor_v1_stats_proto_rawDescOnce sync.Once

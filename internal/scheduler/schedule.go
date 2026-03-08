@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"sort"
 	"time"
 
@@ -86,6 +87,12 @@ func NextRunTime(s types.Schedule, after time.Time) (time.Time, error) {
 		return time.Time{}, nil // schedule expired
 	}
 
+	// Apply jitter: add a random offset in [0, jitter) to prevent thundering herd.
+	if !next.IsZero() && s.Jitter != nil && s.Jitter.Std() > 0 {
+		jitter := rand.Int64N(int64(s.Jitter.Std()))
+		next = next.Add(time.Duration(jitter))
+	}
+
 	return next, nil
 }
 
@@ -139,12 +146,14 @@ func nextDaily(s types.Schedule, after time.Time, loc *time.Location) (time.Time
 	interval := int(*s.RegularInterval)
 	atTimes := sortAtTimes(s.AtTimes)
 
-	// First pass: check remaining times on the current day.
-	for _, at := range atTimes {
-		candidate := time.Date(after.Year(), after.Month(), after.Day(),
-			int(at.Hour), int(at.Minute), int(at.Second), 0, loc)
-		if candidate.After(after) {
-			return candidate, nil
+	// First pass: check remaining times on the current day (only for interval=1).
+	if interval <= 1 {
+		for _, at := range atTimes {
+			candidate := time.Date(after.Year(), after.Month(), after.Day(),
+				int(at.Hour), int(at.Minute), int(at.Second), 0, loc)
+			if candidate.After(after) {
+				return candidate, nil
+			}
 		}
 	}
 
@@ -172,9 +181,11 @@ func nextWeekly(s types.Schedule, after time.Time, loc *time.Location) (time.Tim
 	atTimes := sortAtTimes(s.AtTimes)
 	weekdays := sortInts(s.IncludedDays)
 
-	// First pass: remaining times in the current week.
-	if next := nextWeekDayAtTime(after, weekdays, atTimes, loc, true); !next.IsZero() {
-		return next, nil
+	// First pass: remaining times in the current week (only for interval=1).
+	if interval <= 1 {
+		if next := nextWeekDayAtTime(after, weekdays, atTimes, loc, true); !next.IsZero() {
+			return next, nil
+		}
 	}
 
 	// Second pass: next interval week.
@@ -218,9 +229,11 @@ func nextMonthly(s types.Schedule, after time.Time, loc *time.Location) (time.Ti
 	atTimes := sortAtTimes(s.AtTimes)
 	days := sortInts(s.IncludedDays)
 
-	// First pass: check current month.
-	if next := nextMonthDayAtTime(after, days, atTimes, loc, true); !next.IsZero() {
-		return next, nil
+	// First pass: check current month (only for interval=1).
+	if interval <= 1 {
+		if next := nextMonthDayAtTime(after, days, atTimes, loc, true); !next.IsZero() {
+			return next, nil
+		}
 	}
 
 	// Subsequent months: advance by interval until we find a valid time.

@@ -22,12 +22,10 @@ import (
 	"syscall"
 	"time"
 
-	client "github.com/FDK0901/dureq/clients/go"
-	"github.com/FDK0901/dureq/internal/server"
-	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
-	"github.com/bytedance/sonic"
+
+	"github.com/FDK0901/dureq/pkg/dureq"
+	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/rs/xid"
 	"github.com/rs/zerolog"
 )
@@ -38,7 +36,7 @@ type FestivalPayload struct {
 }
 
 // loggingMiddleware is a global middleware that logs every handler invocation.
-func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
+func loggingMiddleware(logger *zerolog.Logger) types.MiddlewareFunc {
 	return func(next types.HandlerFunc) types.HandlerFunc {
 		return func(ctx context.Context, payload json.RawMessage) error {
 			jobID := types.GetJobID(ctx)
@@ -46,14 +44,26 @@ func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 			attempt := types.GetAttempt(ctx)
 			nodeID := types.GetNodeID(ctx)
 
-			logger.Info().String("job_id", jobID).String("task_type", string(taskType)).Int("attempt", attempt).String("node_id", nodeID).Msg("[middleware:logging] handler started")
+			logger.Info().
+				Str("job_id", jobID).
+				Str("task_type", string(taskType)).
+				Int("attempt", attempt).
+				Str("node_id", nodeID).
+				Msg("[middleware:logging] handler started")
 
 			err := next(ctx, payload)
 
 			if err != nil {
-				logger.Error().String("job_id", jobID).String("task_type", string(taskType)).Err(err).Msg("[middleware:logging] handler failed")
+				logger.Error().
+					Str("job_id", jobID).
+					Str("task_type", string(taskType)).
+					Err(err).
+					Msg("[middleware:logging] handler failed")
 			} else {
-				logger.Info().String("job_id", jobID).String("task_type", string(taskType)).Msg("[middleware:logging] handler succeeded")
+				logger.Info().
+					Str("job_id", jobID).
+					Str("task_type", string(taskType)).
+					Msg("[middleware:logging] handler succeeded")
 			}
 			return err
 		}
@@ -61,7 +71,7 @@ func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 }
 
 // retryAwareMiddleware is a per-handler middleware that logs retry context.
-func retryAwareMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
+func retryAwareMiddleware(logger *zerolog.Logger) types.MiddlewareFunc {
 	return func(next types.HandlerFunc) types.HandlerFunc {
 		return func(ctx context.Context, payload json.RawMessage) error {
 			attempt := types.GetAttempt(ctx)
@@ -69,7 +79,11 @@ func retryAwareMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 			taskType := types.GetTaskType(ctx)
 
 			if attempt > 1 {
-				logger.Warn().String("task_type", string(taskType)).Int("attempt", attempt).Int("max_retry", maxRetry).Msg("[middleware:retry] retrying handler")
+				logger.Warn().
+					Str("task_type", string(taskType)).
+					Int("attempt", attempt).
+					Int("max_retry", maxRetry).
+					Msg("[middleware:retry] retrying handler")
 			}
 			return next(ctx, payload)
 		}
@@ -77,22 +91,30 @@ func retryAwareMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 }
 
 // festivalHandler is a single handler registered for the "festival.*" pattern.
-func festivalHandler(logger gochainedlog.Logger) types.HandlerFunc {
+func festivalHandler(logger *zerolog.Logger) types.HandlerFunc {
 	return func(ctx context.Context, payload json.RawMessage) error {
 		taskType := types.GetTaskType(ctx)
 		jobID := types.GetJobID(ctx)
 		headers := types.GetHeaders(ctx)
 
-		logger.Info().String("task_type", string(taskType)).String("job_id", jobID).Any("headers", headers).Msg("festival handler dispatching")
+		logger.Info().
+			Str("task_type", string(taskType)).
+			Str("job_id", jobID).
+			Interface("headers", headers).
+			Msg("festival handler dispatching")
 
 		switch taskType {
 		case "festival.query_wait_time":
 			var p FestivalPayload
-			if err := sonic.ConfigFastest.Unmarshal(payload, &p); err != nil {
+			if err := json.Unmarshal(payload, &p); err != nil {
 				return &types.NonRetryableError{Err: fmt.Errorf("invalid payload: %w", err)}
 			}
 
-			logger.Info().String("festival_id", p.FestivalID).Time("time", time.Now()).Msg("querying average wait time")
+			logger.Info().
+				Str("festival_id", p.FestivalID).
+				Str("time", time.Now().Format(time.RFC3339)).
+				Msg("querying average wait time")
+
 			return nil
 
 		default:
@@ -102,22 +124,22 @@ func festivalHandler(logger gochainedlog.Logger) types.HandlerFunc {
 }
 
 func main() {
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	zl := chainedzerolog.NewZerologBase()
+	logger := chainedzerolog.NewZerolog(zl)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	zl := chainedzerolog.NewZerologBase()
-	zl.WithLevel(zerolog.InfoLevel)
-	logger := chainedzerolog.NewZerolog(zl)
-
 	// --- Server Side ---
 
-	srv, err := server.New(
-		server.WithRedisURL("redis://localhost:6379"),
-		server.WithRedisDB(15),
-		server.WithRedisPassword("your-password"),
-		server.WithNodeID("festival-mux-node-2"),
-		server.WithMaxConcurrency(10),
-		server.WithLogger(logger),
+	srv, err := dureq.NewServer(
+		dureq.WithRedisURL("redis://localhost:6379"),
+		dureq.WithRedisDB(15),
+		dureq.WithRedisPassword("your-password"),
+		dureq.WithNodeID("festival-mux-node-2"),
+		dureq.WithMaxConcurrency(10),
+		dureq.WithLogger(logger),
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create server")
@@ -125,7 +147,7 @@ func main() {
 	}
 
 	// Register global middleware — applies to ALL handlers.
-	srv.Use(loggingMiddleware(logger))
+	srv.Use(loggingMiddleware(&zl))
 
 	// Register a single pattern handler for all "festival.*" task types.
 	err = srv.RegisterHandler(types.HandlerDefinition{
@@ -139,10 +161,10 @@ func main() {
 			Multiplier:   2.0,
 			Jitter:       0.1,
 		},
-		Handler: festivalHandler(logger),
+		Handler: festivalHandler(&zl),
 		// Per-handler middleware — applied after global middleware.
 		Middlewares: []types.MiddlewareFunc{
-			retryAwareMiddleware(logger),
+			retryAwareMiddleware(&zl),
 		},
 	})
 	if err != nil {
@@ -157,10 +179,10 @@ func main() {
 
 	// --- Client Side ---
 
-	cli, err := client.New(
-		client.WithRedisURL("redis://localhost:6379"),
-		client.WithRedisPassword("your-password"),
-		client.WithRedisDB(15),
+	cli, err := dureq.NewClient(
+		dureq.WithClientRedisURL("redis://localhost:6379"),
+		dureq.WithClientRedisPassword("your-password"),
+		dureq.WithClientRedisDB(15),
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create client")
@@ -177,24 +199,24 @@ func main() {
 		{
 			ID:        xid.New().String(),
 			OpenDate:  time.Now().Add(5 * time.Second),
-			CloseDate: time.Now().Add(30 * time.Second),
+			CloseDate: time.Now().Add(25 * time.Second),
 		},
 		{
 			ID:        xid.New().String(),
 			OpenDate:  time.Now().Add(10 * time.Second),
-			CloseDate: time.Now().Add(40 * time.Second),
+			CloseDate: time.Now().Add(30 * time.Second),
 		},
 	}
 
 	interval := types.Duration(2 * time.Second)
 
 	for _, fest := range festivals {
-		payload, _ := sonic.ConfigFastest.Marshal(FestivalPayload{FestivalID: fest.ID})
+		payload, _ := json.Marshal(FestivalPayload{FestivalID: fest.ID})
 		uniqueKey := fmt.Sprintf("festival-wait-%s", fest.ID)
 		openDate := fest.OpenDate
 		closeDate := fest.CloseDate
 
-		job, err := cli.EnqueueScheduled(ctx, &client.EnqueueRequest{
+		job, err := cli.EnqueueScheduled(ctx, &dureq.EnqueueRequest{
 			TaskType: "festival.query_wait_time",
 			Payload:  payload,
 			Schedule: types.Schedule{
@@ -211,7 +233,7 @@ func main() {
 			continue
 		}
 
-		logger.Info().String("festival", fest.ID).String("job_id", job.ID).Time("starts_at", fest.OpenDate).Time("ends_at", fest.CloseDate).Msg("enqueued festival job")
+		logger.Info().String("festival", fest.ID).String("job_id", job.ID).String("starts_at", fest.OpenDate.Format(time.RFC3339)).String("ends_at", fest.CloseDate.Format(time.RFC3339)).Msg("enqueued festival job")
 	}
 
 	// --- Wait for shutdown ---

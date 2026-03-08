@@ -1,5 +1,5 @@
 // Package main demonstrates dureq workflows — a DAG of tasks executed
-// with dependency ordering, orchestrated by the actor cluster.
+// with dependency ordering, orchestrated by the leader node.
 //
 // Scenario: An order processing pipeline with this task graph:
 //
@@ -13,7 +13,7 @@
 //	                     ▼
 //	                send_confirmation
 //
-// The OrchestratorActor dispatches root tasks (validate_order), then
+// The orchestrator dispatches root tasks (validate_order), then
 // advances through the DAG as each task completes.
 package main
 
@@ -21,34 +21,39 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	client "github.com/FDK0901/dureq/clients/go"
-	"github.com/FDK0901/dureq/internal/server"
+	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
+
+	"github.com/FDK0901/dureq/pkg/dureq"
 	"github.com/FDK0901/dureq/pkg/types"
-	"github.com/bytedance/sonic"
+	"github.com/rs/zerolog"
 )
 
 func main() {
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	zl := chainedzerolog.NewZerologBase()
+	logger := chainedzerolog.NewZerolog(zl)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// --- Server Side ---
 
-	srv, err := server.New(
-		server.WithRedisURL("redis://localhost:6379"),
-		server.WithRedisDB(15),
-		server.WithRedisPassword("your-password"),
-		server.WithNodeID("workflow-demo-node-1"),
-		server.WithMaxConcurrency(10),
+	srv, err := dureq.NewServer(
+		dureq.WithRedisURL("redis://localhost:6379"),
+		dureq.WithRedisDB(15),
+		dureq.WithRedisPassword("your-password"),
+		dureq.WithNodeID("workflow-demo-node-1"),
+		dureq.WithMaxConcurrency(10),
+		dureq.WithLogger(logger),
 	)
 	if err != nil {
-		slog.Error("failed to create server", "err", err)
+		logger.Error().Err(err).Msg("failed to create server")
 		os.Exit(1)
 	}
 
@@ -58,7 +63,7 @@ func main() {
 			TaskType: "order.validate",
 			Timeout:  10 * time.Second,
 			Handler: func(_ context.Context, payload json.RawMessage) error {
-				slog.Info("validating order", "payload", string(payload))
+				logger.Info().String("payload", string(payload)).Msg("validating order")
 				time.Sleep(time.Duration(500+rand.Intn(500)) * time.Millisecond)
 				return nil
 			},
@@ -67,7 +72,7 @@ func main() {
 			TaskType: "order.charge_payment",
 			Timeout:  15 * time.Second,
 			Handler: func(_ context.Context, payload json.RawMessage) error {
-				slog.Info("charging payment", "payload", string(payload))
+				logger.Info().String("payload", string(payload)).Msg("charging payment")
 				time.Sleep(time.Duration(800+rand.Intn(700)) * time.Millisecond)
 				return nil
 			},
@@ -76,7 +81,7 @@ func main() {
 			TaskType: "order.reserve_inventory",
 			Timeout:  10 * time.Second,
 			Handler: func(_ context.Context, payload json.RawMessage) error {
-				slog.Info("reserving inventory", "payload", string(payload))
+				logger.Info().String("payload", string(payload)).Msg("reserving inventory")
 				time.Sleep(time.Duration(300+rand.Intn(400)) * time.Millisecond)
 				return nil
 			},
@@ -85,7 +90,7 @@ func main() {
 			TaskType: "order.ship",
 			Timeout:  20 * time.Second,
 			Handler: func(_ context.Context, payload json.RawMessage) error {
-				slog.Info("shipping order", "payload", string(payload))
+				logger.Info().String("payload", string(payload)).Msg("shipping order")
 				time.Sleep(time.Duration(1000+rand.Intn(500)) * time.Millisecond)
 				return nil
 			},
@@ -94,7 +99,7 @@ func main() {
 			TaskType: "order.send_confirmation",
 			Timeout:  10 * time.Second,
 			Handler: func(_ context.Context, payload json.RawMessage) error {
-				slog.Info("sending confirmation email", "payload", string(payload))
+				logger.Info().String("payload", string(payload)).Msg("sending confirmation email")
 				time.Sleep(time.Duration(200+rand.Intn(300)) * time.Millisecond)
 				return nil
 			},
@@ -103,34 +108,34 @@ func main() {
 
 	for _, h := range handlers {
 		if err := srv.RegisterHandler(h); err != nil {
-			slog.Error("failed to register handler", "task_type", string(h.TaskType), "err", err)
+			logger.Error().String("task_type", string(h.TaskType)).Err(err).Msg("failed to register handler")
 			os.Exit(1)
 		}
 	}
 
 	if err := srv.Start(ctx); err != nil {
-		slog.Error("failed to start server", "err", err)
+		logger.Error().Err(err).Msg("failed to start server")
 		os.Exit(1)
 	}
 
-	// Wait for cluster singleton activation.
-	time.Sleep(2 * time.Second)
+	// Give the server a moment to elect a leader.
+	time.Sleep(3 * time.Second)
 
 	// --- Client Side ---
 
-	cli, err := client.New(
-		client.WithRedisURL("redis://localhost:6379"),
-		client.WithRedisPassword("your-password"),
-		client.WithRedisDB(15),
+	cli, err := dureq.NewClient(
+		dureq.WithClientRedisURL("redis://localhost:6379"),
+		dureq.WithClientRedisPassword("your-password"),
+		dureq.WithClientRedisDB(15),
 	)
 	if err != nil {
-		slog.Error("failed to create client", "err", err)
+		logger.Error().Err(err).Msg("failed to create client")
 		os.Exit(1)
 	}
 	defer cli.Close()
 
 	// Define the order processing workflow DAG.
-	orderPayload, _ := sonic.ConfigFastest.Marshal(map[string]string{"order_id": "ORD-2026-001", "customer": "alice"})
+	orderPayload, _ := json.Marshal(map[string]string{"order_id": "ORD-2026-001", "customer": "alice"})
 
 	wfDef := types.WorkflowDefinition{
 		Name: "order-processing",
@@ -170,16 +175,11 @@ func main() {
 	// Enqueue the workflow.
 	wf, err := cli.EnqueueWorkflow(ctx, wfDef, map[string]string{"source": "api", "priority": "high"})
 	if err != nil {
-		slog.Error("failed to enqueue workflow", "err", err)
+		logger.Error().Err(err).Msg("failed to enqueue workflow")
 		os.Exit(1)
 	}
 
-	slog.Info("workflow enqueued",
-		"workflow_id", wf.ID,
-		"name", wf.WorkflowName,
-		"status", string(wf.Status),
-		"tasks", len(wf.Tasks),
-	)
+	logger.Info().String("workflow_id", wf.ID).String("name", wf.WorkflowName).String("status", string(wf.Status)).Int("tasks", len(wf.Tasks)).Msg("workflow enqueued")
 
 	// Poll workflow status until terminal.
 	go func() {
@@ -193,7 +193,7 @@ func main() {
 			case <-ticker.C:
 				status, err := cli.GetWorkflow(ctx, wf.ID)
 				if err != nil {
-					slog.Error("failed to get workflow status", "err", err)
+					logger.Error().Err(err).Msg("failed to get workflow status")
 					continue
 				}
 
@@ -204,19 +204,14 @@ func main() {
 					}
 				}
 
-				slog.Info("workflow progress",
-					"workflow_id", wf.ID,
-					"status", string(status.Status),
-					"tasks_completed", completed,
-					"total_tasks", len(status.Tasks),
-				)
+				logger.Info().String("workflow_id", wf.ID).String("status", string(status.Status)).Int("tasks_completed", completed).Int("total_tasks", len(status.Tasks)).Msg("workflow progress")
 
 				if status.Status == types.WorkflowStatusCompleted {
-					slog.Info("workflow completed successfully!", "workflow_id", wf.ID)
+					logger.Info().String("workflow_id", wf.ID).Msg("workflow completed successfully!")
 					return
 				}
 				if status.Status == types.WorkflowStatusFailed {
-					slog.Error("workflow failed", "workflow_id", wf.ID)
+					logger.Error().String("workflow_id", wf.ID).Msg("workflow failed")
 					return
 				}
 			}
@@ -230,6 +225,6 @@ func main() {
 	<-sigCh
 
 	fmt.Println()
-	slog.Info("shutting down")
+	logger.Info().Msg("shutting down")
 	srv.Stop()
 }

@@ -515,7 +515,7 @@ const file_dureq_monitor_v1_queue_proto_rawDesc = "" +
 	"\ttier_name\x18\x01 \x01(\tR\btierName\"\x13\n" +
 	"\x11ListGroupsRequest\"I\n" +
 	"\x12ListGroupsResponse\x123\n" +
-	"\x06groups\x18\x01 \x03(\v2\x1b.dureq.monitor.v1.GroupInfoR\x06groupsB9Z7github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"\x06groups\x18\x01 \x03(\v2\x1b.dureq.monitor.v1.GroupInfoR\x06groupsB7Z5github.com/dureq/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var (
 	file_dureq_monitor_v1_queue_proto_rawDescOnce sync.Once

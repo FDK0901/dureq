@@ -1,106 +1,138 @@
 # dureq
 
-A distributed, actor-based job scheduling and workflow orchestration system built in Go.
+A distributed, Redis-native job scheduling and workflow orchestration system built in Go.
 
-dureq is short for durable redis execution queue.
+**dureq** is short for **du**rable **r**edis **e**xecution **q**ueue.
 
-dureq is a full rewrite of the original pull-based model, now using a **push-based actor model** powered by [Hollywood](https://github.com/anthdm/hollywood) for inter-node communication. It supports one-time and recurring job scheduling, DAG-based workflows, batch processing, automatic retries, distributed locking, leader election, and real-time event streaming — all backed by Redis.
-Heavily inspired by [Asynq](https://github.com/hibiken/asynq), [gocron](https://github.com/go-co-op/gocron), and [river](https://github.com/riverqueue/river).
+99.9% vibe-coded.
 
-## Features
+Inspired by [Asynq](https://github.com/hibiken/asynq), [gocron](https://github.com/go-co-op/gocron), and [river](https://github.com/riverqueue/river).
 
-- **Flexible Scheduling** — Immediate, one-time, interval-based, cron, daily, weekly, and monthly schedules
-- **Workflow Orchestration** — DAG-based task dependencies with automatic state advancement
-- **Batch Processing** — Concurrent item execution with optional preprocessing, chunking, and failure policies
-- **Actor Model** — Cluster-wide singleton actors (scheduler, dispatcher, orchestrator) with per-node workers
-- **Mux Handler** — Pattern-based task type routing (`festival.*`), global and per-handler middleware
-- **Monitoring APIs** — HTTP REST and gRPC APIs for full cluster observability and management
-- **Web Dashboard** — React-based UI ([durequi](https://github.com/FDK0901/durequi)) for visual monitoring
-- **Terminal UI** — Interactive TUI (`dureqctl`) for real-time cluster monitoring
-- **Distributed Locking** — Redis-based locks with auto-extension for safe concurrent execution
-- **Leader Election** — Automatic singleton failover across nodes
-- **Priority Queues** — Four priority levels (Low, Normal, High, Critical) with configurable tiers
-- **Retry Policies** — Exponential backoff with jitter, error classification (retryable, non-retryable, rate-limited)
-- **Overlap Policies** — Control concurrent runs for recurring jobs (allow all, skip, buffer one, buffer all)
-- **Catchup / Backfill** — Recover missed executions within a configurable window
-- **Middleware** — Composable handler middleware chains (global + per-handler)
-- **Progress Reporting** — In-flight progress updates from workers
-- **WebSocket Live Updates** — Real-time event push to web dashboard via WebSocket, with automatic polling fallback
-- **Event Streaming** — Real-time lifecycle events via Redis Pub/Sub and Streams
-- **Payload Search** — JSONPath-based payload search across jobs, workflows, and batches
-- **Unique Keys** — Deduplication via unique keys with lookup and manual deletion
-- **Multi-Tenancy** — Key prefix isolation per tenant
-- **Client SDKs** — Go
+## Why v1? — Rollback from the Actor Model
+
+This repository is the **v1 (current)** implementation of dureq.
+
+A v2 rewrite was attempted using the [Hollywood](https://github.com/anthdm/hollywood) actor framework, moving from v1's pull-based Redis Streams model to a push-based actor model with cluster-wide singleton actors (Scheduler, Dispatcher, Orchestrator) and per-node worker actors (WorkerSupervisor, WorkerActor, EventBridge, Notifier, Heartbeat, ClusterGuard).
+
+The v2 actor model was rolled back to v1 for the following reasons:
+
+### 1. Debugging was a nightmare
+
+Actor boundaries destroy stack traces. When a handler panics or returns an error, the error is caught in `recover()`, converted to a string, and passed through 4-5 actor hops (WorkerActor -> WorkerSupervisor -> EventBridge -> Orchestrator) — each hop flattening the error to a plain string. By the time you see the error in Redis or logs, all type information, wrapped error context, and stack traces are gone. You're left with `"render failed for user user-006: GPU out of memory"` and no idea where in the actor chain things went wrong.
+
+In v1, errors propagate through normal Go function calls. You get real stack traces, `errors.Is()` / `errors.As()` works, and you can set breakpoints anywhere in the call chain.
+
+### 2. Delayed and lagging job dispatch
+
+v2's dispatch path requires **7 actor hops** for a simple job:
+
+```
+NotifierActor -> DispatcherActor -> WorkerSupervisorActor -> WorkerActor (spawn)
+-> handler goroutine -> WorkerActor -> WorkerSupervisor -> EventBridgeActor
+```
+
+Each hop involves actor mailbox queuing, message serialization (protobuf for cross-node), and scheduling overhead. The Dispatcher singleton becomes a bottleneck — every job in the entire cluster must route through a single actor for node selection. Under load, the Dispatcher's mailbox backs up and dispatch latency spikes unpredictably.
+
+v1's path is direct: client writes to Redis Stream -> worker polls stream -> executes. No intermediate actors, no singleton bottleneck, no message serialization between components on the same node.
+
+### 3. Memory allocation explosion
+
+v2 copies the job payload **at minimum 2x** on the dispatch path:
+
+- `Job -> DispatchJobMsg` (protobuf allocation + payload byte copy)
+- `DispatchJobMsg -> ExecuteJobMsg` (another protobuf allocation + payload copy)
+
+Every job completion also allocates: `ExecutionDoneMsg -> WorkerDoneMsg -> DomainEventMsg` — each carrying the full `JobRun` struct and error strings through the actor chain. For high-throughput workloads, this creates significant GC pressure.
+
+v1 passes job data by pointer within the same process. The only serialization boundary is Redis itself.
+
+### 4. Operational complexity without proportional benefit
+
+v2 introduced Hollywood cluster membership, protobuf code generation, singleton election via ClusterGuard, capacity reporting via WorkerStatusMsg (2s interval), and a complex actor wiring phase during startup. This added ~15 source files, protobuf definitions, and a `make genproto` build step — all to solve a problem (push-based dispatch) that v1 solves adequately with a simple Redis Pub/Sub notification that wakes the fetch loop.
+
+The theoretical latency advantage of push-based dispatch (4-12ms vs polling) did not justify the complexity cost in practice, especially since v1's Pub/Sub wake mechanism already eliminates most polling latency.
 
 ## Architecture
 
 ```
-                    ┌─────────────────────┐
-                    │     durequi (UI)    │
-                    │ React Web Dashboard │
-                    └─────────┬───────────┘
-                              │
-               HTTP REST ─────┤───── gRPC
-                              │
-Client (Go)          │
-  │                 ┌─────────▼───────────┐
-  │  enqueue        │      dureqd         │
-  │  via Redis      │  (server daemon)    │
-  │                 │                     │
-  │                 │  :8080 HTTP API     │
-  │                 │  :9090 gRPC API     │
-  │                 └─────────┬───────────┘
-  │                           │
-  ▼                           ▼
-┌──────────────────────────────────────────────────────┐
-│                      Redis                           │
-│  Jobs · Schedules · Streams · Locks · Events         │
-└──────────────────────────────────────────────────────┘
-  │                         ▲
-  ▼  Pub/Sub notify         │  persist results
-┌──────────────────────────────────────────────────────┐
-│  Node (Hollywood Actor Engine)                       │
-│                                                      │
-│  ┌─────────────┐  ┌──────────────┐  ┌────────────┐   │
-│  │  Notifier   │→ │  Dispatcher  │→ │  Worker    │   │
-│  │  (per-node) │  │  (singleton) │  │  Supervisor│   │
-│  └─────────────┘  └──────────────┘  │  (per-node)│   │
-│                          ▲          └─────┬──────┘   │
-│  ┌─────────────┐         │                │          │
-│  │  Scheduler  │─────────┘          ┌─────▼──────┐   │
-│  │  (singleton)│                    │  Worker(s) │   │
-│  └─────────────┘                    │  (per-job) │   │
-│                                     └─────┬──────┘   │
-│  ┌──────────────┐  ┌──────────────┐       │          │
-│  │ Orchestrator │← │ EventBridge  │←──────┘          │
-│  │  (singleton) │  │  (per-node)  │                  │
-│  └──────────────┘  └──────────────┘                  │
-│                                                      │
-│  ┌───────────────┐  ┌───────────────┐                │
-│  │   Heartbeat   │  │ ClusterGuard  │                │
-│  │  (per-node)   │  │  (per-node)   │                │
-│  └───────────────┘  └───────────────┘                │
-└──────────────────────────────────────────────────────┘
-         ▲
-         │  HTTP client
-┌────────┴────────┐
-│    dureqctl     │
-│  (terminal UI)  │
-└─────────────────┘
+Client (Go)
+  |
+  |  enqueue via Redis
+  v
++-----------------------------------------------------------+
+|                         Redis                              |
+|  Jobs . Schedules . Streams . Locks . Events . Results     |
++-----------------------------------------------------------+
+  |                         ^
+  v  Pub/Sub notify         |  persist results
++-----------------------------------------------------------+
+|  Node                                                      |
+|                                                            |
+|  +-------------+  +-------------+  +---------+             |
+|  |  Scheduler  |  | Dispatcher  |  | Worker  |             |
+|  |  (leader)   |  | (direct)    |  | Pool    |             |
+|  +------+------+  +------+------+  +----+----+             |
+|         |                |              |                   |
+|         v                v              v                   |
+|  Sorted Set scan   XADD to Stream   XREADGROUP              |
+|  -> dispatch due   + Pub/Sub wake   -> execute handler      |
+|                                     -> ack / retry          |
+|                                                            |
+|  +---------------+  +----------------+                     |
+|  | Orchestrator  |  | Monitor API    |                     |
+|  | (leader)      |  | HTTP/gRPC/WS   |                     |
+|  +---------------+  +----------------+                     |
++-----------------------------------------------------------+
+         ^
+         |  HTTP / WebSocket
++--------+--------+      +------------------+
+|    durequi      |      |    dureqctl       |
+| (Web Dashboard) |      | (Terminal UI)     |
++-----------------+      +------------------+
 ```
 
-**Singleton actors** run on the elected leader node only:
-- **SchedulerActor** — scans due schedules every second, dispatches jobs, detects orphaned runs, backfills missed executions
-- **DispatcherActor** — routes jobs to nodes based on capacity, task-type affinity, and priority
-- **OrchestratorActor** — advances workflow DAG and batch state machines on job completion/failure
+- **Leader-elected coordinator**: only the leader runs Scheduler + Orchestrator
+- **All nodes are workers**: every node polls Redis Streams and executes handlers
+- **Direct Redis data flow**: no actors, no RPC between components on the same node
+- **Single dependency**: Redis only (Standalone, Sentinel, or Cluster)
 
-**Per-node actors**:
-- **WorkerSupervisorActor** — manages a pool of WorkerActors, enforces concurrency limits
-- **WorkerActor** — executes a single job handler, manages heartbeats and progress
-- **EventBridgeActor** — persists results to Redis, forwards domain events to OrchestratorActor
-- **NotifierActor** — subscribes to Redis Pub/Sub for new job notifications
-- **HeartbeatActor** — maintains node liveness
-- **ClusterGuardActor** — monitors singleton health, triggers re-election if needed
+## Features
+
+### Core
+- **Flexible Scheduling** — Immediate, one-time, interval, cron, daily, weekly, monthly with timezone support
+- **Workflow Orchestration** — DAG-based task dependencies with automatic state advancement and child workflows
+- **Batch Processing** — Optional onetime preprocessing, chunked parallel item execution, failure policies
+- **Group Aggregation** — Collect individual tasks into groups, automatically flush and aggregate into a single job based on grace period, max delay, or max size
+- **Mux Handler** — Pattern-based task type routing (`order.*`), global and per-handler middleware
+- **Priority Queues** — User-defined tiers with weighted fair queuing
+- **Task Queue Rate Limiting** — Distributed token bucket rate limiter per queue (Redis Lua-backed)
+
+### Reliability
+- **Retry Policies** — Exponential backoff with jitter, error classification (retryable, non-retryable, rate-limited)
+- **Overlap Policies** — Control concurrent runs for recurring jobs (allow all, skip, buffer one, buffer all, replace)
+- **Catchup / Backfill** — Recover missed executions within a configurable window
+- **Schedule Jitter** — Random offset on scheduled execution times to prevent thundering herd
+- **Exactly-Once Execution** — Per-run distributed locks prevent duplicate handler invocation
+- **Unique Keys** — Deduplication via unique keys with lookup and manual deletion
+- **Worker Versioning** — BuildID-style safe deployments; version-mismatched work is re-enqueued for matching workers
+- **ScheduleToStart Timeout** — Fail jobs that wait too long in the queue before starting
+- **Workflow Signals** — Send asynchronous external data to running workflows
+
+### Operations
+- **Leader Election** — Automatic failover with configurable TTL and epoch-based fencing tokens
+- **Dynamic Configuration** — Runtime-updateable settings (concurrency, timeouts, retry) via Redis, per-handler overrides
+- **Archival / Retention** — Automatic cleanup of completed/dead/cancelled jobs after configurable retention period
+- **Node Drain** — Graceful worker drain: stop accepting new work while finishing in-flight tasks
+- **Audit Trail** — Per-job state transition history stored as capped Redis Streams
+- **Progress Reporting** — In-flight progress updates from handlers via `types.ReportProgress(ctx, data)`
+- **Distributed Locking** — Redis-based locks with automatic extension
+
+### Observability
+- **Web Dashboard** — React-based UI (durequi) with real-time WebSocket updates
+- **Terminal UI** — Interactive TUI (dureqctl) for cluster monitoring
+- **Monitoring APIs** — HTTP REST, gRPC, and WebSocket for full cluster observability
+- **Payload Search** — JSONPath-based search across jobs, workflows, and batches
+- **Multi-Tenancy** — Key prefix isolation per tenant
 
 ## Getting Started
 
@@ -108,13 +140,6 @@ Client (Go)          │
 
 - Go 1.25+
 - Redis 7+
-- Protocol Buffers compiler (for regenerating proto files)
-
-### Installation
-
-```bash
-go get github.com/FDK0901/dureq
-```
 
 ### Quick Example
 
@@ -127,75 +152,65 @@ import (
     "context"
     "encoding/json"
     "fmt"
-    "log"
+    "time"
 
-    "github.com/FDK0901/dureq/internal/server"
+    "github.com/FDK0901/dureq/pkg/dureq"
     "github.com/FDK0901/dureq/pkg/types"
 )
 
 func main() {
-    srv, err := server.New(
-        server.WithRedisURL("redis://localhost:6379"),
-        server.WithRedisDB(15),
-        server.WithNodeID("node-1"),
-        server.WithMaxConcurrency(10),
+    srv, _ := dureq.NewServer(
+        dureq.WithRedisURL("redis://localhost:6379"),
+        dureq.WithNodeID("node-1"),
+        dureq.WithMaxConcurrency(10),
     )
-    if err != nil {
-        log.Fatal(err)
-    }
 
     srv.RegisterHandler(types.HandlerDefinition{
         TaskType:    "email.send",
         Concurrency: 5,
+        Timeout:     30 * time.Second,
         Handler: func(ctx context.Context, payload json.RawMessage) error {
             fmt.Printf("Sending email: %s\n", payload)
             return nil
         },
-        RetryPolicy: types.DefaultRetryPolicy(),
     })
 
     ctx := context.Background()
-    if err := srv.Start(ctx); err != nil {
-        log.Fatal(err)
-    }
+    srv.Start(ctx)
+    // ... signal handling, srv.Stop()
 }
 ```
 
-**Client (Go):**
+**Client:**
 
 ```go
 package main
 
 import (
     "context"
-    "fmt"
-    "log"
     "time"
 
-    client "github.com/FDK0901/dureq/clients/go"
+    "github.com/FDK0901/dureq/pkg/dureq"
     "github.com/FDK0901/dureq/pkg/types"
 )
 
 func main() {
-    cli, err := client.New(client.WithRedisURL("redis://localhost:6379"))
-    if err != nil {
-        log.Fatal(err)
-    }
+    cli, _ := dureq.NewClient(dureq.WithClientRedisURL("redis://localhost:6379"))
+    defer cli.Close()
 
     ctx := context.Background()
 
     // Immediate job
-    job, _ := cli.EnqueueImmediate(ctx, &client.EnqueueRequest{
-        TaskType: "email.send",
-        Payload:  []byte(`{"to":"user@example.com","subject":"Hello"}`),
+    cli.Enqueue(ctx, "email.send", map[string]string{
+        "to":      "user@example.com",
+        "subject": "Hello",
     })
-    fmt.Println("Enqueued:", job.ID)
 
-    // Recurring job (every 30 seconds)
+    // Recurring job (every 30 seconds, bounded)
     start := time.Now().Add(time.Minute)
     end := start.Add(24 * time.Hour)
     interval := types.Duration(30 * time.Second)
-    cli.EnqueueScheduled(ctx, &client.EnqueueRequest{
+    cli.EnqueueScheduled(ctx, &dureq.EnqueueRequest{
         TaskType: "report.generate",
         Payload:  []byte(`{}`),
         Schedule: types.Schedule{
@@ -207,232 +222,6 @@ func main() {
     })
 }
 ```
-
-## dureqd — Server Daemon
-
-`dureqd` is the main server process that runs the full dureq cluster node. It starts the actor engine, exposes HTTP and gRPC monitoring APIs, and handles graceful shutdown.
-
-```bash
-go run ./cmd/dureqd
-```
-
-### Configuration
-
-`dureqd` reads configuration from a YAML file. Set the path via `DUREQ_CONFIG_PATH` environment variable (default: `configs/config.yaml`).
-
-```yaml
-dureqd:
-  nodeId: ""              # Auto-generated if empty
-  apiAddress: ":8080"     # HTTP monitoring API
-  grpcAddress: ":9090"    # gRPC monitoring API
-  concurrency: 100        # Max concurrent workers
-  prefix: ""              # Redis key prefix (multi-tenancy)
-
-redis:
-  url: "redis://localhost:6379"
-  password: ""
-  db: 0
-  poolSize: 100
-```
-
-### What dureqd provides
-
-| Port    | Protocol  | Purpose                                                       |
-| ------- | --------- | ------------------------------------------------------------- |
-| `:8080` | HTTP      | REST API for monitoring, management, and the web dashboard    |
-| `:8080` | WebSocket | Real-time event push at `/api/ws` (Redis Pub/Sub → WebSocket) |
-| `:9090` | gRPC      | gRPC API with the same capabilities (with reflection enabled) |
-
-## dureqctl — Terminal UI
-
-`dureqctl` is an interactive terminal UI for monitoring and managing dureq clusters in real-time. Built with [Bubble Tea](https://github.com/charmbracelet/bubbletea).
-
-```bash
-go run ./cmd/dureqctl
-```
-
-### Flags
-
-| Flag       | Default                 | Description               |
-| ---------- | ----------------------- | ------------------------- |
-| `-api`     | `http://localhost:8080` | dureqd monitoring API URL |
-| `-refresh` | `5s`                    | Data refresh interval     |
-
-### Pages
-
-| Key | Page      | Description                                                            |
-| --- | --------- | ---------------------------------------------------------------------- |
-| `1` | Dashboard | Cluster overview — active nodes, schedules, runs, job counts by status |
-| `2` | Jobs      | Job list with status filtering, cancel, retry, and detail view         |
-| `3` | Workflows | Workflow instances with task progress, cancel, retry, and detail view  |
-| `4` | Batches   | Batch instances with progress bar, cancel, retry, and detail view      |
-| `5` | Runs      | Historical job run history with status filtering                       |
-| `6` | Nodes     | Active worker nodes with pool stats and heartbeat                      |
-| `7` | Schedules | Active recurring schedules with next run times                         |
-| `8` | Queues    | Priority queue tiers with size, weight, and pause/resume controls      |
-| `9` | DLQ       | Dead letter queue messages                                             |
-
-### Keyboard Controls
-
-| Key             | Action                                                    |
-| --------------- | --------------------------------------------------------- |
-| `j/k` or arrows | Navigate list                                             |
-| `enter`         | View detail (Jobs, Workflows, Batches)                    |
-| `c`             | Cancel selected item (Jobs, Workflows, Batches)           |
-| `r`             | Retry selected item (Jobs, Workflows, Batches) or refresh |
-| `f`             | Cycle status filter (Jobs, Workflows, Batches, Runs)      |
-| `p`             | Pause selected queue (Queues)                             |
-| `u`             | Resume selected queue (Queues)                            |
-| `tab`           | Next page                                                 |
-| `1`-`9`         | Jump to page                                              |
-| `esc`           | Back from detail view                                     |
-| `q` / `ctrl+c`  | Quit                                                      |
-
-## durequi — Web Dashboard
-
-A React-based web dashboard for visual monitoring and management of dureq clusters. Connects to the `dureqd` HTTP and WebSocket APIs.
-
-- **Real-time updates** via WebSocket (`/api/ws`) — events push to the browser and invalidate React Query caches, so data refreshes instantly without polling
-- **Automatic fallback** — if WebSocket disconnects, the dashboard seamlessly falls back to configurable polling (default 5s)
-- **Connection indicator** — sidebar shows live connection status (green = Live, yellow = Connecting, gray = Polling)
-- **Configurable** — WebSocket can be toggled on/off from the Settings page
-
-Repository: [github.com/FDK0901/durequi](https://github.com/FDK0901/durequi)
-
-## Monitoring API
-
-Both HTTP and gRPC APIs expose the same set of operations. The HTTP API serves the web dashboard and CLI, while the gRPC API provides type-safe access with protobuf definitions.
-
-### Endpoints
-
-**Jobs:**
-
-| Method   | Path                         | Description                                                      |
-| -------- | ---------------------------- | ---------------------------------------------------------------- |
-| `GET`    | `/api/jobs`                  | List jobs (paginated, filterable by status/task_type/tag/search) |
-| `GET`    | `/api/jobs/{jobID}`          | Get job details                                                  |
-| `DELETE` | `/api/jobs/{jobID}`          | Delete a job                                                     |
-| `POST`   | `/api/jobs/{jobID}/cancel`   | Cancel a running job                                             |
-| `POST`   | `/api/jobs/{jobID}/retry`    | Retry a failed job                                               |
-| `PUT`    | `/api/jobs/{jobID}/payload`  | Update job payload (pending/scheduled only)                      |
-| `GET`    | `/api/jobs/{jobID}/events`   | List job event history                                           |
-| `GET`    | `/api/jobs/{jobID}/runs`     | List job run history                                             |
-| `GET`    | `/api/jobs/{jobID}/progress` | Get progress for all active runs                                 |
-
-**Schedules:**
-
-| Method | Path                     | Description           |
-| ------ | ------------------------ | --------------------- |
-| `GET`  | `/api/schedules`         | List active schedules |
-| `GET`  | `/api/schedules/{jobID}` | Get schedule details  |
-
-**Nodes:**
-
-| Method | Path                  | Description                  |
-| ------ | --------------------- | ---------------------------- |
-| `GET`  | `/api/nodes`          | List registered worker nodes |
-| `GET`  | `/api/nodes/{nodeID}` | Get node details             |
-
-**Runs:**
-
-| Method | Path                         | Description      |
-| ------ | ---------------------------- | ---------------- |
-| `GET`  | `/api/runs`                  | List active runs |
-| `GET`  | `/api/runs/{runID}`          | Get run details  |
-| `GET`  | `/api/runs/{runID}/progress` | Get run progress |
-
-**History:**
-
-| Method | Path                  | Description                                                           |
-| ------ | --------------------- | --------------------------------------------------------------------- |
-| `GET`  | `/api/history/runs`   | Paginated historical runs (filterable by status/job_id/node_id/task_type/since/until) |
-| `GET`  | `/api/history/events` | Paginated job events (filterable by job_id)                           |
-
-**Workflows:**
-
-| Method | Path                                 | Description                   |
-| ------ | ------------------------------------ | ----------------------------- |
-| `GET`  | `/api/workflows`                     | List workflow instances        |
-| `GET`  | `/api/workflows/{workflowID}`        | Get workflow details          |
-| `POST` | `/api/workflows/{workflowID}/cancel` | Cancel workflow and all tasks |
-| `POST` | `/api/workflows/{workflowID}/retry`  | Retry entire workflow         |
-
-**Batches:**
-
-| Method | Path                                      | Description                                |
-| ------ | ----------------------------------------- | ------------------------------------------ |
-| `GET`  | `/api/batches`                            | List batch instances                       |
-| `GET`  | `/api/batches/{batchID}`                  | Get batch details                          |
-| `GET`  | `/api/batches/{batchID}/results`          | List all item results                      |
-| `GET`  | `/api/batches/{batchID}/results/{itemID}` | Get single item result                     |
-| `POST` | `/api/batches/{batchID}/cancel`           | Cancel batch                               |
-| `POST` | `/api/batches/{batchID}/retry`            | Retry batch (optional `retry_failed_only`) |
-
-**Bulk Operations:**
-
-| Method | Path                         | Description               |
-| ------ | ---------------------------- | ------------------------- |
-| `POST` | `/api/jobs/bulk/cancel`      | Cancel multiple jobs      |
-| `POST` | `/api/jobs/bulk/retry`       | Retry multiple jobs       |
-| `POST` | `/api/jobs/bulk/delete`      | Delete multiple jobs      |
-| `POST` | `/api/workflows/bulk/cancel` | Cancel multiple workflows |
-| `POST` | `/api/workflows/bulk/retry`  | Retry multiple workflows  |
-| `POST` | `/api/workflows/bulk/delete` | Delete multiple workflows |
-| `POST` | `/api/batches/bulk/cancel`   | Cancel multiple batches   |
-| `POST` | `/api/batches/bulk/retry`    | Retry multiple batches    |
-| `POST` | `/api/batches/bulk/delete`   | Delete multiple batches   |
-
-Bulk request body: `{"ids": ["id1", "id2"]}` or `{"status": "failed"}`
-
-**Queues & Groups:**
-
-| Method | Path                            | Description                                   |
-| ------ | ------------------------------- | --------------------------------------------- |
-| `GET`  | `/api/queues`                   | List queue tiers (name, weight, paused, size) |
-| `POST` | `/api/queues/{tierName}/pause`  | Pause a queue                                 |
-| `POST` | `/api/queues/{tierName}/resume` | Resume a queue                                |
-| `GET`  | `/api/groups`                   | List active aggregation groups                |
-
-**Payload Search (JSONPath):**
-
-| Method | Path                      | Description                                          |
-| ------ | ------------------------- | ---------------------------------------------------- |
-| `GET`  | `/api/search/jobs`        | Search jobs by payload JSONPath (`?path=&value=`)    |
-| `GET`  | `/api/search/workflows`   | Search workflows by payload JSONPath                 |
-| `GET`  | `/api/search/batches`     | Search batches by payload JSONPath                   |
-
-**Unique Keys:**
-
-| Method   | Path                      | Description                              |
-| -------- | ------------------------- | ---------------------------------------- |
-| `GET`    | `/api/unique-keys/{key}`  | Check if unique key exists (returns job_id) |
-| `DELETE` | `/api/unique-keys/{key}`  | Delete a unique key                      |
-
-**Statistics & Health:**
-
-| Method | Path                  | Description                                        |
-| ------ | --------------------- | -------------------------------------------------- |
-| `GET`  | `/api/stats`          | Cluster stats (job counts, nodes, runs, schedules) |
-| `GET`  | `/api/stats/daily`    | Daily aggregated statistics                        |
-| `GET`  | `/api/redis/info`     | Redis server info                                  |
-| `GET`  | `/api/sync-retries`   | Pending sync retry entries                         |
-| `GET`  | `/api/health`         | Health check                                       |
-
-**DLQ (Dead Letter Queue):**
-
-| Method | Path       | Description               |
-| ------ | ---------- | ------------------------- |
-| `GET`  | `/api/dlq` | List dead letter messages |
-
-**WebSocket (Real-time Events):**
-
-| Path      | Protocol  | Description                                                                   |
-| --------- | --------- | ----------------------------------------------------------------------------- |
-| `/api/ws` | WebSocket | Real-time event stream — all domain events pushed as JSON `JobEvent` messages |
-
-The WebSocket endpoint subscribes to the Redis Pub/Sub `{prefix}:events` channel and fans out every event to all connected clients. Events include all 29+ types (job, workflow, batch, node, schedule, leader). The durequi dashboard uses this to invalidate React Query caches for instant UI updates, falling back to polling when disconnected.
-
-**Pagination** — query params: `limit` (default 10, max 100), `offset`, `sort` (`newest` or `oldest`)
 
 ## Scheduling
 
@@ -456,54 +245,92 @@ For recurring jobs, control what happens when a new execution is due while a pre
 | `SKIP`       | Skip if any run is still active              |
 | `BUFFER_ONE` | Queue at most one pending dispatch           |
 | `BUFFER_ALL` | Queue all pending dispatches                 |
+| `REPLACE`    | Cancel active run and start new one          |
 
 ## Workflows
 
 Define DAG-based workflows where tasks execute in dependency order:
 
 ```go
-cli.CreateWorkflow(ctx, &types.WorkflowDefinition{
-    Name: "user-onboarding",
+cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{
+    Name: "order-processing",
     Tasks: []types.WorkflowTask{
-        {Name: "create-account", TaskType: "account.create", Payload: payload},
-        {Name: "send-welcome",   TaskType: "email.welcome",  DependsOn: []string{"create-account"}},
-        {Name: "setup-profile",  TaskType: "profile.setup",  DependsOn: []string{"create-account"}},
-        {Name: "notify-admin",   TaskType: "admin.notify",   DependsOn: []string{"send-welcome", "setup-profile"}},
+        {Name: "validate", TaskType: "order.validate", Payload: payload},
+        {Name: "charge",   TaskType: "order.charge",   DependsOn: []string{"validate"}},
+        {Name: "reserve",  TaskType: "order.reserve",  DependsOn: []string{"validate"}},
+        {Name: "ship",     TaskType: "order.ship",     DependsOn: []string{"charge", "reserve"}},
+        {Name: "notify",   TaskType: "order.notify",   DependsOn: []string{"ship"}},
     },
 })
 ```
 
-The orchestrator automatically validates the DAG (no cycles, all dependencies exist), dispatches root tasks first, and advances downstream tasks as dependencies complete.
+The orchestrator validates the DAG (no cycles, all dependencies exist), dispatches root tasks first, and advances downstream tasks as dependencies complete. On retry, only failed tasks and their dependents are re-executed — completed tasks are preserved.
 
 ## Batches
 
-Process collections of items concurrently with optional preprocessing:
+Process collections of items with optional shared preprocessing:
 
 ```go
-cli.CreateBatch(ctx, &types.BatchDefinition{
-    Name:            "process-images",
-    OnetimeTaskType: types.TaskTypePtr("image.prepare"),  // optional preprocessing
-    ItemTaskType:    "image.resize",
-    Items: []types.BatchItem{
-        {ID: "img-1", Payload: json.RawMessage(`{"url":"..."}`)},
-        {ID: "img-2", Payload: json.RawMessage(`{"url":"..."}`)},
-    },
-    ChunkSize:     100,
-    FailurePolicy: types.BatchFailureContinueOnError,
+onetimeType := types.TaskType("image.download_template")
+
+cli.EnqueueBatch(ctx, types.BatchDefinition{
+    Name:            "birthday-cards",
+    OnetimeTaskType: &onetimeType,
+    OnetimePayload:  templatePayload,
+    ItemTaskType:    "image.overlay_text",
+    Items:           items,
+    ChunkSize:       100,
+    FailurePolicy:   types.BatchContinueOnError,
 })
 ```
 
-Failure policies:
-- `CONTINUE_ON_ERROR` — continue processing remaining items even if some fail
-- `FAIL_ON_ERROR` — stop the entire batch on first failure
+- **Onetime preprocessing**: shared setup task runs once before items begin
+- **Chunked dispatch**: configurable chunk size provides backpressure
+- **Failure policies**: `continue_on_error` (collect all results) or `fail_fast` (stop on first failure)
+- **Per-item results**: individual success/failure stored and queryable
+
+## Group Aggregation
+
+Collect individual events into groups and automatically aggregate them into a single job:
+
+```go
+// Server: define aggregator + register handler
+aggregator := types.GroupAggregatorFunc(
+    func(group string, payloads []json.RawMessage) (json.RawMessage, error) {
+        // Merge individual payloads into one
+        return json.Marshal(merged)
+    },
+)
+
+srv, _ := dureq.NewServer(
+    dureq.WithRedisURL("redis://localhost:6379"),
+    dureq.WithGroupAggregation(types.GroupConfig{
+        Aggregator:  aggregator,
+        GracePeriod: 3 * time.Second,  // flush 3s after last item added
+        MaxDelay:    15 * time.Second, // force flush after 15s regardless
+        MaxSize:     10,               // flush immediately when 10 items
+    }),
+)
+
+// Client: enqueue individual items into a group
+cl.EnqueueGroup(ctx, types.EnqueueGroupOption{
+    Group:    "user-alice",
+    TaskType: "analytics.process",
+    Payload:  eventPayload,
+})
+```
+
+Groups are flushed when **any** trigger fires: grace period elapsed (no new items), max delay reached, or max size hit. The aggregator merges all buffered payloads into a single job payload dispatched to the registered handler.
+
+The flush uses an atomic Lua script, so multiple nodes can safely run the aggregation processor concurrently — only one node will claim each group's messages.
 
 ## Error Handling & Retries
 
 ```go
-// Default retry policy: 3 attempts, 5s initial delay, 5m max, 2x multiplier, 10% jitter
+// Default: 3 attempts, 5s initial delay, 5m max, 2x multiplier, 10% jitter
 types.DefaultRetryPolicy()
 
-// Custom retry policy
+// Custom
 &types.RetryPolicy{
     MaxAttempts:  5,
     InitialDelay: 10 * time.Second,
@@ -513,36 +340,26 @@ types.DefaultRetryPolicy()
 }
 ```
 
-Classify errors to control retry behavior:
+Error classification controls retry behavior:
 
 ```go
-// Retryable (default) — transient failures, will retry
-return &types.RetryableError{Err: err}
-
-// Non-retryable — permanent failures, skip remaining retries
-return &types.NonRetryableError{Err: err}
-
-// Rate-limited — retry after a specific duration
-return &types.RateLimitedError{Err: err, RetryAfter: 30 * time.Second}
+return fmt.Errorf("transient failure: %w", err)              // retryable (default)
+return &types.NonRetryableError{Err: err}                    // permanent, skip retries
+return &types.RateLimitedError{Err: err, RetryAfter: 30*time.Second} // retry after delay
 ```
 
 ## Handler Context
 
-Inside a handler, access job metadata via context helpers:
+Inside a handler, access job metadata via context:
 
 ```go
 func handler(ctx context.Context, payload json.RawMessage) error {
     jobID    := types.GetJobID(ctx)
-    runID    := types.GetRunID(ctx)
     attempt  := types.GetAttempt(ctx)
-    maxRetry := types.GetMaxRetry(ctx)
     taskType := types.GetTaskType(ctx)
-    priority := types.GetPriority(ctx)
-    nodeID   := types.GetNodeID(ctx)
     headers  := types.GetHeaders(ctx)
 
-    // Report progress
-    types.ReportProgress(ctx, map[string]any{"percent": 50})
+    types.ReportProgress(ctx, json.RawMessage(`{"percent": 50}`))
 
     return nil
 }
@@ -550,79 +367,117 @@ func handler(ctx context.Context, payload json.RawMessage) error {
 
 ## Middleware
 
-Middleware can be applied globally via `srv.Use()` or per-handler via `HandlerDefinition.Middlewares`. Global middleware runs first, then per-handler middleware, forming a chain around the handler.
-
 ```go
-// Global middleware — applies to ALL handlers.
-srv.Use(func(next types.HandlerFunc) types.HandlerFunc {
-    return func(ctx context.Context, payload json.RawMessage) error {
-        log.Printf("Starting job %s", types.GetJobID(ctx))
-        err := next(ctx, payload)
-        log.Printf("Finished job %s (err=%v)", types.GetJobID(ctx), err)
-        return err
-    }
-})
+// Global — applies to ALL handlers
+srv.Use(loggingMiddleware, metricsMiddleware)
 
-// Per-handler middleware — applied after global middleware.
+// Per-handler — applied after global middleware
 srv.RegisterHandler(types.HandlerDefinition{
-    TaskType:    "email.send",
-    Handler:     emailHandler,
-    Middlewares: []types.MiddlewareFunc{retryAwareMiddleware},
+    TaskType: "order.*",
+    Handler:  orderHandler,
+    Middlewares: []types.MiddlewareFunc{timingMiddleware},
 })
 ```
 
-### Pattern-Based Routing (Mux)
+Pattern-based routing: register `"order.*"` to match `order.validate`, `order.charge`, `order.ship`, etc. Use `types.GetTaskType(ctx)` inside the handler to dispatch.
 
-Register a single handler for multiple task types using glob patterns:
+## Monitoring API
 
-```go
-srv.RegisterHandler(types.HandlerDefinition{
-    TaskType: "festival.*",  // matches festival.query_wait_time, festival.send_alert, etc.
-    Handler:  festivalHandler,
-})
-```
+### Endpoints
 
-Inside the handler, use `types.GetTaskType(ctx)` to distinguish the actual task type and dispatch accordingly.
+**Jobs:**
 
-## Configuration
+| Method   | Path                     | Description                       |
+| -------- | ------------------------ | --------------------------------- |
+| `GET`    | `/api/jobs`              | List jobs (paginated, filterable) |
+| `GET`    | `/api/jobs/{id}`         | Get job details                   |
+| `DELETE` | `/api/jobs/{id}`         | Delete a job                      |
+| `POST`   | `/api/jobs/{id}/cancel`  | Cancel a running job              |
+| `POST`   | `/api/jobs/{id}/retry`   | Retry a failed job                |
+| `PUT`    | `/api/jobs/{id}/payload` | Update job payload                |
+| `GET`    | `/api/jobs/{id}/events`  | Job event history                 |
+| `GET`    | `/api/jobs/{id}/runs`    | Job run history                   |
 
-### Server Options
+**Workflows:**
 
-| Option                          | Default        | Description                        |
-| ------------------------------- | -------------- | ---------------------------------- |
-| `WithRedisURL(url)`             | —              | Redis connection URL               |
-| `WithRedisDB(db)`               | `0`            | Redis database number              |
-| `WithRedisPassword(pw)`         | —              | Redis password                     |
-| `WithRedisPoolSize(n)`          | —              | Connection pool size               |
-| `WithRedisSentinel(...)`        | —              | Redis Sentinel failover config     |
-| `WithRedisCluster(addrs)`       | —              | Redis Cluster mode addresses       |
-| `WithNodeID(id)`                | auto-generated | Unique node identifier             |
-| `WithListenAddr(addr)`          | —              | Address for remote actor RPC       |
-| `WithClusterRegion(region)`     | `"default"`    | Region for multi-region deployment |
-| `WithMaxConcurrency(n)`         | `100`          | Maximum concurrent workers         |
-| `WithShutdownTimeout(d)`        | `30s`          | Graceful shutdown timeout          |
-| `WithLockTTL(d)`                | `30s`          | Distributed lock TTL               |
-| `WithLockAutoExtend(d)`         | `LockTTL/3`    | Lock auto-extension interval       |
-| `WithKeyPrefix(prefix)`         | —              | Redis key prefix (multi-tenancy)   |
-| `WithPriorityTiers(tiers)`      | —              | Custom priority tier mapping       |
-| `WithLogger(logger)`            | —              | Custom logger                      |
+| Method | Path                         | Description              |
+| ------ | ---------------------------- | ------------------------ |
+| `GET`  | `/api/workflows`             | List workflows           |
+| `GET`  | `/api/workflows/{id}`        | Get workflow details     |
+| `POST` | `/api/workflows/{id}/cancel` | Cancel workflow          |
+| `POST` | `/api/workflows/{id}/retry`  | Retry from failure point |
 
-### Client Options
+**Batches:**
 
-| Option                     | Default | Description                        |
-| -------------------------- | ------- | ---------------------------------- |
-| `WithRedisURL(url)`        | —       | Redis connection URL               |
-| `WithRedisDB(db)`          | `0`     | Redis database number              |
-| `WithRedisPassword(pw)`    | —       | Redis password                     |
-| `WithRedisPoolSize(n)`     | —       | Connection pool size               |
-| `WithKeyPrefix(prefix)`    | —       | Key namespace for multi-tenancy    |
-| `WithPriorityTiers(tiers)` | —       | Custom priority tier mapping       |
-| `WithClusterAddrs(addrs)`  | —       | Redis Cluster addresses            |
-| `WithStore(store)`         | —       | Use an existing store (in-process) |
+| Method | Path                                 | Description            |
+| ------ | ------------------------------------ | ---------------------- |
+| `GET`  | `/api/batches`                       | List batches           |
+| `GET`  | `/api/batches/{id}`                  | Get batch details      |
+| `GET`  | `/api/batches/{id}/results`          | List item results      |
+| `GET`  | `/api/batches/{id}/results/{itemId}` | Get single item result |
+| `POST` | `/api/batches/{id}/cancel`           | Cancel batch           |
+| `POST` | `/api/batches/{id}/retry`            | Retry batch            |
+
+**Bulk Operations:**
+
+| Method | Path                         | Description               |
+| ------ | ---------------------------- | ------------------------- |
+| `POST` | `/api/jobs/bulk/cancel`      | Cancel multiple jobs      |
+| `POST` | `/api/jobs/bulk/retry`       | Retry multiple jobs       |
+| `POST` | `/api/jobs/bulk/delete`      | Delete multiple jobs      |
+| `POST` | `/api/workflows/bulk/cancel` | Cancel multiple workflows |
+| `POST` | `/api/workflows/bulk/retry`  | Retry multiple workflows  |
+| `POST` | `/api/workflows/bulk/delete` | Delete multiple workflows |
+| `POST` | `/api/batches/bulk/cancel`   | Cancel multiple batches   |
+| `POST` | `/api/batches/bulk/retry`    | Retry multiple batches    |
+| `POST` | `/api/batches/bulk/delete`   | Delete multiple batches   |
+
+**Audit Trail:**
+
+| Method | Path                        | Description                       |
+| ------ | --------------------------- | --------------------------------- |
+| `GET`  | `/api/jobs/{id}/audit`      | Job state transition history      |
+| `POST` | `/api/audit/counts`         | Audit entry counts (batch lookup) |
+| `GET`  | `/api/workflows/{id}/audit` | Aggregated workflow audit trail   |
+
+**Node Drain:**
+
+| Method   | Path                    | Description           |
+| -------- | ----------------------- | --------------------- |
+| `POST`   | `/api/nodes/{id}/drain` | Start draining a node |
+| `DELETE` | `/api/nodes/{id}/drain` | Stop draining a node  |
+| `GET`    | `/api/nodes/{id}/drain` | Check drain status    |
+
+**Other:**
+
+| Method   | Path                        | Description                        |
+| -------- | --------------------------- | ---------------------------------- |
+| `GET`    | `/api/stats`                | Cluster stats                      |
+| `GET`    | `/api/stats/daily`          | Daily aggregated statistics        |
+| `GET`    | `/api/nodes`                | Worker nodes                       |
+| `GET`    | `/api/schedules`            | Active schedules                   |
+| `GET`    | `/api/queues`               | Queue tiers (size, weight, paused) |
+| `POST`   | `/api/queues/{tier}/pause`  | Pause a queue                      |
+| `POST`   | `/api/queues/{tier}/resume` | Resume a queue                     |
+| `GET`    | `/api/dlq`                  | Dead letter queue                  |
+| `GET`    | `/api/history/runs`         | Historical runs (filterable)       |
+| `GET`    | `/api/history/events`       | Historical events                  |
+| `GET`    | `/api/search/jobs`          | Search by payload JSONPath         |
+| `GET`    | `/api/search/workflows`     | Search workflows by payload        |
+| `GET`    | `/api/search/batches`       | Search batches by payload          |
+| `GET`    | `/api/unique-keys/{key}`    | Check unique key                   |
+| `DELETE` | `/api/unique-keys/{key}`    | Delete unique key                  |
+| `GET`    | `/api/redis/info`           | Redis server info                  |
+| `GET`    | `/api/sync-retries`         | Pending sync retries               |
+| `GET`    | `/api/health`               | Health check                       |
+
+**WebSocket:**
+
+| Path      | Description                                        |
+| --------- | -------------------------------------------------- |
+| `/api/ws` | Real-time event stream (all domain events as JSON) |
 
 ## Event Types
-
-dureq emits lifecycle events via Redis Streams for monitoring and integration:
 
 | Category     | Events                                                                                                                     |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------- |
@@ -632,114 +487,132 @@ dureq emits lifecycle events via Redis Streams for monitoring and integration:
 | **Batch**    | `started`, `completed`, `failed`, `cancelled`, `item.completed`, `item.failed`, `progress`, `timed_out`, `retrying`        |
 | **Node**     | `joined`, `left`, `crash_detected`                                                                                         |
 | **Leader**   | `elected`, `lost`                                                                                                          |
-| **Recovery** | `job.auto_recovered`, `schedule_to_start_timeout`                                                                          |
+
+## Configuration
+
+### Server Options
+
+| Option                            | Default        | Description                  |
+| --------------------------------- | -------------- | ---------------------------- |
+| `dureq.WithRedisURL(url)`         | -              | Redis connection URL         |
+| `dureq.WithRedisDB(db)`           | `0`            | Redis database number        |
+| `dureq.WithRedisPassword(pw)`     | -              | Redis password               |
+| `dureq.WithRedisPoolSize(n)`      | -              | Connection pool size         |
+| `dureq.WithRedisSentinel(...)`    | -              | Redis Sentinel failover      |
+| `dureq.WithRedisCluster(addrs)`   | -              | Redis Cluster mode           |
+| `dureq.WithNodeID(id)`            | auto-generated | Unique node identifier       |
+| `dureq.WithMaxConcurrency(n)`     | `100`          | Maximum concurrent workers   |
+| `dureq.WithLockTTL(d)`            | `30s`          | Distributed lock TTL         |
+| `dureq.WithKeyPrefix(prefix)`     | -              | Redis key prefix             |
+| `dureq.WithPriorityTiers(tiers)`  | -              | Custom priority tier mapping |
+| `dureq.WithGroupAggregation(cfg)` | disabled       | Enable group aggregation     |
+| `dureq.WithRetentionPeriod(d)`    | `7d`           | Retention for completed jobs |
+| `dureq.WithLogger(logger)`        | -              | Custom logger                |
+
+### Client Options
+
+| Option                              | Default | Description                  |
+| ----------------------------------- | ------- | ---------------------------- |
+| `dureq.WithClientRedisURL(url)`     | -       | Redis connection URL         |
+| `dureq.WithClientRedisDB(db)`       | `0`     | Redis database number        |
+| `dureq.WithClientRedisPassword(pw)` | -       | Redis password               |
+| `dureq.WithClientKeyPrefix(prefix)` | -       | Key namespace                |
+| `dureq.WithClientTiers(tiers)`      | -       | Custom priority tier mapping |
+| `dureq.WithClientRedisStore(store)` | -       | Use existing store           |
+
+## Dynamic Configuration
+
+Settings can be updated at runtime without restarting nodes. Overrides are stored in Redis and polled every 10 seconds.
+
+**Global overrides:**
+
+```bash
+# Via Redis directly
+redis-cli HSET dureq:config:global MaxConcurrency 200
+redis-cli HSET dureq:config:global SchedulerTickInterval 5s
+```
+
+**Per-handler overrides:**
+
+```bash
+redis-cli HSET dureq:config:handler:email.send Concurrency 20
+redis-cli HSET dureq:config:handler:email.send Timeout 60s
+redis-cli HSET dureq:config:handler:email.send MaxAttempts 5
+```
+
+These overrides take precedence over values set at server startup. Delete a field to revert to the startup default.
 
 ## Project Structure
 
 ```
 dureq/
-├── cmd/
-│   ├── dureqd/             # Server daemon (actor engine + HTTP/gRPC APIs)
-│   │   ├── main.go
-│   │   └── config/         # YAML config loading (Koanf)
-│   └── dureqctl/           # Interactive terminal UI (Bubble Tea)
-│       ├── main.go
-│       └── teamodel/       # TUI model, views, and key handling
-├── clients/
-│   └── go/                 # Go client SDK
-├── pkg/
-│   ├── types/              # Public domain types (Job, Schedule, Workflow, Batch, etc.)
-│   └── dureq/              # Package-level convenience API
-├── internal/
-│   ├── server/             # Actor-based server entry point and options
-│   ├── actors/             # All actor implementations
-│   ├── handler/            # Handler registry (task type → handler mapping)
-│   ├── monitor/            # HTTP REST + gRPC monitoring APIs, WebSocket hub
-│   ├── api/                # HTTP client for dureqctl
-│   ├── store/              # Redis persistence layer (Lua scripts, streams, pagination)
-│   ├── messages/           # Internal message types
-│   ├── scheduler/          # Standalone scheduler component
-│   ├── workflow/           # DAG validation & topological sort
-│   ├── lock/               # Distributed locking
-│   ├── cache/              # In-memory schedule cache
-│   └── provider/           # Service providers (Redis client factory)
-├── proto/
-│   └── dureq/
-│       ├── messages.proto          # Inter-actor message definitions
-│       └── monitor/v1/             # gRPC monitoring service definitions
-│           ├── service.proto       # 37 RPC methods
-│           ├── job.proto
-│           ├── workflow.proto
-│           ├── batch.proto
-│           ├── bulk.proto
-│           ├── node.proto
-│           ├── queue.proto
-│           ├── stats.proto
-│           └── common.proto
-├── gen/dureq/              # Generated protobuf code
-├── examples/               # Runnable examples
-├── benchmarks/             # Performance benchmarks
-├── Makefile                # Proto generation
-└── go.mod
++-- cmd/
+|   +-- dureqd/             # Server daemon (HTTP/gRPC APIs)
+|   +-- dureqctl/            # Interactive terminal UI (Bubble Tea)
++-- internal/
+|   +-- server/              # Server setup, handler registry, options
+|   +-- worker/              # Redis Streams consumer, goroutine pool, retry
+|   +-- dispatcher/          # Job -> Stream dispatch, priority tier mapping
+|   +-- scheduler/           # Leader-only schedule scanner, orphan detection
+|   +-- workflow/            # DAG orchestrator, batch state machine
+|   +-- aggregation/         # Group aggregation processor (leader-independent)
+|   +-- store/               # Redis persistence (Lua scripts, streams, pagination)
+|   +-- client/              # Go client SDK
+|   +-- monitor/             # HTTP REST, gRPC, WebSocket APIs
+|   +-- election/            # Redis-based leader election with epoch fencing
+|   +-- lock/                # Distributed locking with auto-extension
+|   +-- dynconfig/           # Dynamic configuration (runtime-updateable via Redis)
+|   +-- ratelimit/           # Distributed token bucket rate limiter
+|   +-- archival/            # Retention-based cleanup of old jobs
+|   +-- cache/               # In-memory schedule and job cache
+|   +-- lifecycle/           # Graceful shutdown coordination
++-- pkg/
+|   +-- types/               # Public domain types (Job, Schedule, Workflow, Batch)
++-- examples/                # Runnable demos
++-- tests/
+|   +-- integration/         # Integration tests (requires Redis)
++-- proto/
+|   +-- dureq/monitor/v1/   # gRPC service definitions
++-- gen/                     # Generated protobuf code
 ```
 
 ## Examples
 
-The [examples/](examples/) directory contains runnable demos:
-
-| Example                  | Description                                                 |
-| ------------------------ | ----------------------------------------------------------- |
-| `festival/`              | Recurring scheduled jobs                                    |
-| `festival_with_mux/`     | Recurring jobs with pattern-based mux routing and middleware |
-| `festival_mux_just_server/` | Server-only mux example (no client)                      |
-| `batch/`                 | Batch item processing                                       |
-| `batch_with_mux/`        | Batch with mux handler                                      |
-| `workflow/`              | DAG workflow execution                                      |
-| `workflow_with_mux/`     | Workflow with mux handler                                   |
-| `onetimeat/`             | One-time scheduled execution                                |
-| `onetimeat_with_mux/`    | One-time execution with mux handler                         |
-| `heartbeat_progress/`    | Progress reporting from workers                             |
-| `overlap_policy/`        | Overlap policy demonstration                                |
+| Example                     | Description                                                  |
+| --------------------------- | ------------------------------------------------------------ |
+| `onetimeat/`                | One-time scheduled execution                                 |
+| `onetimeat_with_mux/`       | One-time with pattern-based routing                          |
+| `festival/`                 | Recurring scheduled jobs (duration, daily, weekly)           |
+| `festival_with_mux/`        | Recurring with mux routing and middleware                    |
+| `festival_mux_just_server/` | Server-only mux example                                      |
+| `workflow/`                 | DAG workflow with task dependencies                          |
+| `workflow_with_mux/`        | Workflow with mux handler                                    |
+| `child_workflow/`           | Parent-child workflow with cancellation propagation          |
+| `signals/`                  | Workflow signals (async external input to running workflows) |
+| `batch/`                    | Batch processing with onetime preprocessing                  |
+| `batch_with_mux/`           | Batch with pattern-based routing                             |
+| `aggregation/`              | Group aggregation (collect events, flush as single batch)    |
+| `heartbeat_progress/`       | In-flight progress reporting                                 |
+| `overlap_policy/`           | Overlap policy demonstration (including REPLACE)             |
+| `retention/`                | Archival and retention management                            |
 
 ```bash
-cd examples/festival
+cd examples/workflow_with_mux
 go run main.go
-```
-
-## Building
-
-```bash
-# Build all packages
-go build ./...
-
-# Run the server daemon
-go run ./cmd/dureqd
-
-# Run the terminal UI
-go run ./cmd/dureqctl -api http://localhost:8080
-
-# Run tests
-go test ./...
-
-# Run benchmarks
-cd benchmarks && go test -bench=. ./...
-
-# Regenerate protobuf code
-make genproto
 ```
 
 ## Dependencies
 
-| Dependency                                                | Purpose                           |
-| --------------------------------------------------------- | --------------------------------- |
-| [hollywood](https://github.com/anthdm/hollywood)          | Actor framework with clustering   |
-| [rueidis](https://github.com/redis/rueidis)               | High-performance Redis client     |
-| [robfig/cron](https://github.com/robfig/cron)             | Cron expression parsing           |
-| [vtprotobuf](https://github.com/planetscale/vtprotobuf)   | Optimized protobuf marshaling     |
-| [sonic](https://github.com/bytedance/sonic)               | Fast JSON serialization           |
-| [xid](https://github.com/rs/xid)                          | Globally unique ID generation     |
-| [go-chainedlog](https://github.com/FDK0901/go-chainedlog) | Structured logging                |
-| [bubbletea](https://github.com/charmbracelet/bubbletea)   | Terminal UI framework (dureqctl)  |
-| [koanf](https://github.com/knadh/koanf)                   | Configuration management (dureqd) |
-| [grpc-go](https://google.golang.org/grpc)                 | gRPC server and reflection        |
-| [websocket](https://nhooyr.io/websocket)                  | WebSocket server (real-time push) |
+| Dependency                                                | Purpose                       |
+| --------------------------------------------------------- | ----------------------------- |
+| [rueidis](https://github.com/redis/rueidis)               | High-performance Redis client |
+| [ants](https://github.com/panjf2000/ants)                 | Goroutine pool                |
+| [robfig/cron](https://github.com/robfig/cron)             | Cron expression parsing       |
+| [sonic](https://github.com/bytedance/sonic)               | Fast JSON serialization       |
+| [xid](https://github.com/rs/xid)                          | Globally unique ID generation |
+| [go-chainedlog](https://github.com/FDK0901/go-chainedlog) | Structured logging            |
+| [websocket](https://github.com/coder/websocket)           | WebSocket server              |
+| [bubbletea](https://github.com/charmbracelet/bubbletea)   | Terminal UI framework         |
+| [koanf](https://github.com/knadh/koanf)                   | Configuration management      |
+| [grpc-go](https://google.golang.org/grpc)                 | gRPC server                   |
+| [vtprotobuf](https://github.com/planetscale/vtprotobuf)   | Optimized protobuf marshaling |

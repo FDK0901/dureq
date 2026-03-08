@@ -835,7 +835,7 @@ const file_dureq_monitor_v1_workflow_proto_rawDesc = "" +
 	"workflowId\"8\n" +
 	"\x15RetryWorkflowResponse\x12\x1f\n" +
 	"\vworkflow_id\x18\x01 \x01(\tR\n" +
-	"workflowIdB9Z7github.com/FDK0901/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
+	"workflowIdB7Z5github.com/dureq/dureq/gen/dureq/monitor/v1;monitorv1b\x06proto3"
 
 var (
 	file_dureq_monitor_v1_workflow_proto_rawDescOnce sync.Once

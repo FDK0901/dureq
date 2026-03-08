@@ -24,17 +24,16 @@ import (
 	"syscall"
 	"time"
 
-	client "github.com/FDK0901/dureq/clients/go"
-	"github.com/FDK0901/dureq/internal/server"
-	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
-	"github.com/bytedance/sonic"
+
+	"github.com/FDK0901/dureq/pkg/dureq"
+	"github.com/FDK0901/dureq/pkg/types"
+	"github.com/rs/zerolog"
 )
 
 // loggingMiddleware is a global middleware that logs every handler invocation
 // with job metadata extracted from the context.
-func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
+func loggingMiddleware(logger *zerolog.Logger) types.MiddlewareFunc {
 	return func(next types.HandlerFunc) types.HandlerFunc {
 		return func(ctx context.Context, payload json.RawMessage) error {
 			jobID := types.GetJobID(ctx)
@@ -42,14 +41,26 @@ func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 			attempt := types.GetAttempt(ctx)
 			nodeID := types.GetNodeID(ctx)
 
-			logger.Info().String("job_id", jobID).String("task_type", string(taskType)).Int("attempt", attempt).String("node_id", nodeID).Msg("[middleware:logging] handler started")
+			logger.Info().
+				Str("job_id", jobID).
+				Str("task_type", string(taskType)).
+				Int("attempt", attempt).
+				Str("node_id", nodeID).
+				Msg("[middleware:logging] handler started")
 
 			err := next(ctx, payload)
 
 			if err != nil {
-				logger.Error().String("job_id", jobID).String("task_type", string(taskType)).Err(err).Msg("[middleware:logging] handler failed")
+				logger.Error().
+					Str("job_id", jobID).
+					Str("task_type", string(taskType)).
+					Err(err).
+					Msg("[middleware:logging] handler failed")
 			} else {
-				logger.Info().String("job_id", jobID).String("task_type", string(taskType)).Msg("[middleware:logging] handler succeeded")
+				logger.Info().
+					Str("job_id", jobID).
+					Str("task_type", string(taskType)).
+					Msg("[middleware:logging] handler succeeded")
 			}
 			return err
 		}
@@ -57,7 +68,7 @@ func loggingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 }
 
 // timingMiddleware is a per-handler middleware that measures execution duration.
-func timingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
+func timingMiddleware(logger *zerolog.Logger) types.MiddlewareFunc {
 	return func(next types.HandlerFunc) types.HandlerFunc {
 		return func(ctx context.Context, payload json.RawMessage) error {
 			start := time.Now()
@@ -65,7 +76,10 @@ func timingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 			elapsed := time.Since(start)
 
 			taskType := types.GetTaskType(ctx)
-			logger.Info().String("task_type", string(taskType)).Duration("elapsed_ms", elapsed).Msg("[middleware:timing] execution time")
+			logger.Info().
+				Str("task_type", string(taskType)).
+				Dur("elapsed_ms", elapsed).
+				Msg("[middleware:timing] execution time")
 			return err
 		}
 	}
@@ -73,24 +87,28 @@ func timingMiddleware(logger gochainedlog.Logger) types.MiddlewareFunc {
 
 // imageHandler is a single handler registered for the "image.*" pattern.
 // It dispatches internally based on the actual task type from the context.
-func imageHandler(logger gochainedlog.Logger) types.HandlerFuncWithResult {
+func imageHandler(logger *zerolog.Logger) types.HandlerFuncWithResult {
 	return func(ctx context.Context, payload json.RawMessage) (json.RawMessage, error) {
 		taskType := types.GetTaskType(ctx)
 		jobID := types.GetJobID(ctx)
 		headers := types.GetHeaders(ctx)
 
-		logger.Info().String("task_type", string(taskType)).String("job_id", jobID).Any("headers", headers).Msg("image handler dispatching")
+		logger.Info().
+			Str("task_type", string(taskType)).
+			Str("job_id", jobID).
+			Interface("headers", headers).
+			Msg("image handler dispatching")
 
 		switch taskType {
 		case "image.download_template":
-			logger.Info().String("payload", string(payload)).Msg("downloading shared template image")
+			logger.Info().Str("payload", string(payload)).Msg("downloading shared template image")
 			time.Sleep(time.Duration(500+rand.Intn(1000)) * time.Millisecond)
 
 			result := map[string]string{
 				"template_url": "https://cdn.example.com/templates/background-v2.png",
 				"dimensions":   "1920x1080",
 			}
-			data, _ := sonic.ConfigFastest.Marshal(result)
+			data, _ := json.Marshal(result)
 			return data, nil
 
 		case "image.overlay_text":
@@ -98,9 +116,9 @@ func imageHandler(logger gochainedlog.Logger) types.HandlerFuncWithResult {
 				UserID string `json:"user_id"`
 				Text   string `json:"text"`
 			}
-			sonic.ConfigFastest.Unmarshal(payload, &item)
+			json.Unmarshal(payload, &item)
 
-			logger.Info().String("user_id", item.UserID).String("text", item.Text).Msg("overlaying text onto template")
+			logger.Info().Str("user_id", item.UserID).Str("text", item.Text).Msg("overlaying text onto template")
 			time.Sleep(time.Duration(200+rand.Intn(800)) * time.Millisecond)
 
 			// Simulate 10% failure rate.
@@ -111,7 +129,7 @@ func imageHandler(logger gochainedlog.Logger) types.HandlerFuncWithResult {
 			result := map[string]string{
 				"output_url": fmt.Sprintf("https://cdn.example.com/output/%s.png", item.UserID),
 			}
-			data, _ := sonic.ConfigFastest.Marshal(result)
+			data, _ := json.Marshal(result)
 			return data, nil
 
 		default:
@@ -121,21 +139,22 @@ func imageHandler(logger gochainedlog.Logger) types.HandlerFuncWithResult {
 }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 	zl := chainedzerolog.NewZerologBase()
 	logger := chainedzerolog.NewZerolog(zl)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// --- Server Side ---
 
-	srv, err := server.New(
-		server.WithRedisURL("redis://localhost:6379"),
-		server.WithRedisDB(15),
-		server.WithRedisPassword("your-password"),
-		server.WithNodeID("batch-mux-node-1"),
-		server.WithMaxConcurrency(10),
-		server.WithLogger(logger),
+	srv, err := dureq.NewServer(
+		dureq.WithRedisURL("redis://localhost:6379"),
+		dureq.WithRedisDB(15),
+		dureq.WithRedisPassword("your-password"),
+		dureq.WithNodeID("batch-mux-node-1"),
+		dureq.WithMaxConcurrency(10),
+		dureq.WithLogger(logger),
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create server")
@@ -143,16 +162,17 @@ func main() {
 	}
 
 	// Register global middleware — applies to ALL handlers.
-	srv.Use(loggingMiddleware(logger))
+	srv.Use(loggingMiddleware(&zl))
 
 	// Register a single pattern handler for all "image.*" task types.
+	// The wildcard pattern matches image.download_template, image.overlay_text.
 	err = srv.RegisterHandler(types.HandlerDefinition{
 		TaskType:          "image.*", // pattern matching
 		Timeout:           30 * time.Second,
-		HandlerWithResult: imageHandler(logger),
+		HandlerWithResult: imageHandler(&zl),
 		// Per-handler middleware — applied after global middleware.
 		Middlewares: []types.MiddlewareFunc{
-			timingMiddleware(logger),
+			timingMiddleware(&zl),
 		},
 	})
 	if err != nil {
@@ -167,12 +187,12 @@ func main() {
 
 	// --- Client Side ---
 
-	time.Sleep(2 * time.Second) // wait for cluster activation
+	time.Sleep(2 * time.Second) // wait for leader election
 
-	cl, err := client.New(
-		client.WithRedisURL("redis://localhost:6379"),
-		client.WithRedisPassword("your-password"),
-		client.WithRedisDB(15),
+	cl, err := dureq.NewClient(
+		dureq.WithClientRedisURL("redis://localhost:6379"),
+		dureq.WithClientRedisPassword("your-password"),
+		dureq.WithClientRedisDB(15),
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create client")
@@ -197,7 +217,7 @@ func main() {
 
 	items := make([]types.BatchItem, len(users))
 	for i, u := range users {
-		payload, _ := sonic.ConfigFastest.Marshal(map[string]string{
+		payload, _ := json.Marshal(map[string]string{
 			"user_id": u.ID,
 			"text":    u.Text,
 		})
@@ -210,7 +230,7 @@ func main() {
 	onetimeTaskType := types.TaskType("image.download_template")
 	itemTaskType := types.TaskType("image.overlay_text")
 
-	templatePayload, _ := sonic.ConfigFastest.Marshal(map[string]string{
+	templatePayload, _ := json.Marshal(map[string]string{
 		"template_id": "birthday-v2",
 		"source":      "https://assets.example.com/templates/birthday-v2.psd",
 	})
@@ -246,7 +266,15 @@ func main() {
 					logger.Warn().Err(err).Msg("failed to poll batch status")
 					continue
 				}
-				logger.Info().String("batch_id", b.ID).String("status", string(b.Status)).Int("completed", b.CompletedItems).Int("failed", b.FailedItems).Int("running", b.RunningItems).Int("pending", b.PendingItems).Int("total", b.TotalItems).Msg("batch progress")
+				logger.Info().
+					String("batch_id", b.ID).
+					String("status", string(b.Status)).
+					Int("completed", b.CompletedItems).
+					Int("failed", b.FailedItems).
+					Int("running", b.RunningItems).
+					Int("pending", b.PendingItems).
+					Int("total", b.TotalItems).
+					Msg("batch progress")
 
 				if b.Status.IsTerminal() {
 					// Fetch and display results.

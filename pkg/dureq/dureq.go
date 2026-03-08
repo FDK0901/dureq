@@ -17,28 +17,32 @@
 package dureq
 
 import (
-	client "github.com/FDK0901/dureq/clients/go"
+	"github.com/FDK0901/dureq/internal/client"
 	"github.com/FDK0901/dureq/internal/server"
 	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/pkg/types"
 )
 
 // Server options — re-export from internal/server.
 var (
-	WithRedisURL       = server.WithRedisURL
-	WithRedisPassword  = server.WithRedisPassword
-	WithRedisDB        = server.WithRedisDB
-	WithRedisPoolSize  = server.WithRedisPoolSize
-	WithNodeID         = server.WithNodeID
-	WithMaxConcurrency = server.WithMaxConcurrency
-	//WithSchedulerTickInterval = server.WithSchedulerTickInterval
-	//WithHeartbeatInterval     = server.WithHeartbeatInterval
-	//WithElectionTTL           = server.WithElectionTTL
-	//WithLockTTL               = server.WithLockTTL
-	//WithLogger                = server.WithLogger
-	WithKeyPrefix     = server.WithKeyPrefix
-	WithPriorityTiers = server.WithPriorityTiers
-	WithRedisSentinel = server.WithRedisSentinel
-	WithRedisCluster  = server.WithRedisCluster
+	WithRedisURL              = server.WithRedisURL
+	WithRedisPassword         = server.WithRedisPassword
+	WithRedisDB               = server.WithRedisDB
+	WithRedisPoolSize         = server.WithRedisPoolSize
+	WithNodeID                = server.WithNodeID
+	WithMaxConcurrency        = server.WithMaxConcurrency
+	WithSchedulerTickInterval = server.WithSchedulerTickInterval
+	WithHeartbeatInterval     = server.WithHeartbeatInterval
+	WithElectionTTL           = server.WithElectionTTL
+	WithLockTTL               = server.WithLockTTL
+	WithLogger                = server.WithLogger
+	WithKeyPrefix             = server.WithKeyPrefix
+	WithPriorityTiers         = server.WithPriorityTiers
+	WithRedisSentinel         = server.WithRedisSentinel
+	WithRedisCluster          = server.WithRedisCluster
+	WithGroupAggregation      = server.WithGroupAggregation
+	WithRetentionPeriod       = server.WithRetentionPeriod
+	WithShutdownTimeout       = server.WithShutdownTimeout
 )
 
 // NewServer creates a new dureq server node.
@@ -48,10 +52,14 @@ func NewServer(opts ...server.Option) (*server.Server, error) {
 
 // Client options — re-export from pkg/client.
 var (
-	WithClientRedisURL   = client.WithRedisURL
-	WithClientRedisStore = client.WithStore
-	WithClientKeyPrefix  = client.WithKeyPrefix
-	WithClientTiers      = client.WithPriorityTiers
+	WithClientRedisURL      = client.WithRedisURL
+	WithClientRedisPassword = client.WithRedisPassword
+	WithClientRedisDB       = client.WithRedisDB
+	WithClientRedisPoolSize = client.WithRedisPoolSize
+	WithClientKeyPrefix     = client.WithKeyPrefix
+	WithClientTiers         = client.WithPriorityTiers
+	WithClientClusterAddrs  = client.WithClusterAddrs
+	WithClientRedisStore    = client.WithStore
 )
 
 // NewClient creates a new dureq client for enqueuing jobs.
@@ -61,3 +69,12 @@ func NewClient(opts ...client.Option) (*client.Client, error) {
 
 // Re-export store types commonly needed by users.
 type TierConfig = store.TierConfig
+
+// Re-export client types commonly needed by users.
+type EnqueueRequest = client.EnqueueRequest
+
+// Re-export types for group aggregation.
+type EnqueueGroupOption = types.EnqueueGroupOption
+type GroupConfig = types.GroupConfig
+type GroupAggregator = types.GroupAggregator
+type GroupAggregatorFunc = types.GroupAggregatorFunc

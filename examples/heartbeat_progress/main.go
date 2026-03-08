@@ -9,16 +9,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	client "github.com/FDK0901/dureq/clients/go"
-	"github.com/FDK0901/dureq/internal/server"
+	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
+
+	"github.com/FDK0901/dureq/pkg/dureq"
 	"github.com/FDK0901/dureq/pkg/types"
-	"github.com/bytedance/sonic"
+	"github.com/rs/zerolog"
 )
 
 type ProcessPayload struct {
@@ -27,20 +27,25 @@ type ProcessPayload struct {
 }
 
 func main() {
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	zl := chainedzerolog.NewZerologBase()
+	logger := chainedzerolog.NewZerolog(zl)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// --- Server Side ---
 
-	srv, err := server.New(
-		server.WithRedisURL("redis://localhost:6379"),
-		server.WithRedisDB(15),
-		server.WithRedisPassword("your-password"),
-		server.WithNodeID("heartbeat-node-1"),
-		server.WithMaxConcurrency(5),
+	srv, err := dureq.NewServer(
+		dureq.WithRedisURL("redis://localhost:6379"),
+		dureq.WithRedisDB(15),
+		dureq.WithRedisPassword("your-password"),
+		dureq.WithNodeID("heartbeat-node-1"),
+		dureq.WithMaxConcurrency(5),
+		dureq.WithLogger(logger),
 	)
 	if err != nil {
-		slog.Error("failed to create server", "err", err)
+		logger.Error().Err(err).Msg("failed to create server")
 		os.Exit(1)
 	}
 
@@ -57,11 +62,11 @@ func main() {
 		},
 		Handler: func(ctx context.Context, payload json.RawMessage) error {
 			var p ProcessPayload
-			if err := sonic.ConfigFastest.Unmarshal(payload, &p); err != nil {
+			if err := json.Unmarshal(payload, &p); err != nil {
 				return &types.NonRetryableError{Err: fmt.Errorf("invalid payload: %w", err)}
 			}
 
-			slog.Info("starting data processing", "dataset_id", p.DatasetID, "rows", p.Rows)
+			logger.Info().String("dataset_id", p.DatasetID).Int("rows", p.Rows).Msg("starting data processing")
 
 			// Simulate processing rows in chunks, reporting progress.
 			chunkSize := p.Rows / 10
@@ -92,47 +97,47 @@ func main() {
 					"rows_total":     p.Rows,
 					"percent":        pct,
 				}); err != nil {
-					slog.Warn("failed to report progress", "err", err)
+					logger.Warn().Err(err).Msg("failed to report progress")
 				}
 
-				slog.Info("processing", "dataset_id", p.DatasetID, "percent", pct)
+				logger.Info().String("dataset_id", p.DatasetID).Float64("percent", pct).Msg("processing")
 			}
 
-			slog.Info("processing complete", "dataset_id", p.DatasetID)
+			logger.Info().String("dataset_id", p.DatasetID).Msg("processing complete")
 			return nil
 		},
 	})
 	if err != nil {
-		slog.Error("failed to register handler", "err", err)
+		logger.Error().Err(err).Msg("failed to register handler")
 		os.Exit(1)
 	}
 
 	if err := srv.Start(ctx); err != nil {
-		slog.Error("failed to start server", "err", err)
+		logger.Error().Err(err).Msg("failed to start server")
 		os.Exit(1)
 	}
 
 	// --- Client Side ---
 
-	cli, err := client.New(
-		client.WithRedisURL("redis://localhost:6379"),
-		client.WithRedisPassword("your-password"),
-		client.WithRedisDB(15),
+	cli, err := dureq.NewClient(
+		dureq.WithClientRedisURL("redis://localhost:6379"),
+		dureq.WithClientRedisPassword("your-password"),
+		dureq.WithClientRedisDB(15),
 	)
 	if err != nil {
-		slog.Error("failed to create client", "err", err)
+		logger.Error().Err(err).Msg("failed to create client")
 		os.Exit(1)
 	}
 	defer cli.Close()
 
 	// Enqueue a data processing job with a custom heartbeat timeout.
 	hbTimeout := types.Duration(10 * time.Second)
-	payload, _ := sonic.ConfigFastest.Marshal(ProcessPayload{
+	payload, _ := json.Marshal(ProcessPayload{
 		DatasetID: "ds-001",
 		Rows:      1000,
 	})
 
-	job, err := cli.EnqueueScheduled(ctx, &client.EnqueueRequest{
+	job, err := cli.EnqueueScheduled(ctx, &dureq.EnqueueRequest{
 		TaskType: "data.process",
 		Payload:  payload,
 		Schedule: types.Schedule{Type: types.ScheduleImmediate},
@@ -146,11 +151,12 @@ func main() {
 		Tags:             []string{"data-processing", "demo"},
 	})
 	if err != nil {
-		slog.Error("failed to enqueue job", "err", err)
+		logger.Error().Err(err).Msg("failed to enqueue job")
 		os.Exit(1)
 	}
 
-	slog.Info("enqueued data processing job", "job_id", job.ID, "heartbeat_timeout", "10s")
+	logger.Info().String("job_id", job.ID).Msg("enqueued data processing job with heartbeat timeout=10s")
+	logger.Info().Msg("check progress: curl http://localhost:7654/api/runs | jq")
 
 	// --- Wait for shutdown ---
 
@@ -159,6 +165,6 @@ func main() {
 	<-sigCh
 
 	fmt.Println()
-	slog.Info("shutting down")
+	logger.Info().Msg("shutting down")
 	srv.Stop()
 }

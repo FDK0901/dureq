@@ -8,24 +8,30 @@ import (
 
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
+	gochainedlog "github.com/FDK0901/go-chainedlog"
 )
 
+// SyncRetryStatsFunc is a function that returns the current SyncRetrier stats
+// as a JSON-serializable value. Set via SetSyncRetryStatsFunc.
+type SyncRetryStatsFunc func() any
+
 // API serves the monitoring HTTP endpoints for the React UI.
-// It is a thin wrapper around APIService that handles HTTP parameter parsing
-// and JSON response formatting.
 type API struct {
-	svc    *APIService
-	mux    *http.ServeMux
+	svc *APIService
+	mux *http.ServeMux
 }
 
-// NewAPI creates a new monitoring HTTP API backed by an APIService.
-func NewAPI(svc *APIService) *API {
-	api := &API{
-		svc: svc,
-		mux: http.NewServeMux(),
-	}
+// NewAPI creates a new monitoring API backed by Redis.
+func NewAPI(s *store.RedisStore, disp Dispatcher, logger gochainedlog.Logger) *API {
+	svc := NewAPIService(s, disp, logger)
+	api := &API{svc: svc, mux: http.NewServeMux()}
 	api.registerRoutes()
 	return api
+}
+
+// SetSyncRetryStatsFunc sets the function used to retrieve SyncRetrier stats.
+func (a *API) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
+	a.svc.SetSyncRetryStatsFunc(fn)
 }
 
 // Handler returns the HTTP handler for mounting in a server.
@@ -33,9 +39,14 @@ func (a *API) Handler() http.Handler {
 	return corsMiddleware(a.mux)
 }
 
-// Shutdown stops the WebSocket hub's Redis subscription.
+// Shutdown cancels the hub's Redis subscription.
 func (a *API) Shutdown() {
 	a.svc.Shutdown()
+}
+
+// Service returns the underlying APIService (used by gRPC server).
+func (a *API) Service() *APIService {
+	return a.svc
 }
 
 func (a *API) registerRoutes() {
@@ -119,25 +130,33 @@ func (a *API) registerRoutes() {
 	// Sync Retries
 	a.mux.HandleFunc("GET /api/sync-retries", a.getSyncRetries)
 
-	// Payload search (JSONPath)
-	a.mux.HandleFunc("GET /api/search/jobs", a.searchJobsByPayload)
-	a.mux.HandleFunc("GET /api/search/workflows", a.searchWorkflowsByPayload)
-	a.mux.HandleFunc("GET /api/search/batches", a.searchBatchesByPayload)
+	// Search (payload JSONPath)
+	a.mux.HandleFunc("GET /api/search/jobs", a.searchJobs)
+	a.mux.HandleFunc("GET /api/search/workflows", a.searchWorkflows)
+	a.mux.HandleFunc("GET /api/search/batches", a.searchBatches)
 
 	// Unique keys
-	a.mux.HandleFunc("GET /api/unique-keys/{key}", a.checkUniqueKey)
+	a.mux.HandleFunc("GET /api/unique-keys/{key}", a.getUniqueKey)
 	a.mux.HandleFunc("DELETE /api/unique-keys/{key}", a.deleteUniqueKey)
+
+	// Audit trail
+	a.mux.HandleFunc("GET /api/jobs/{jobID}/audit", a.getJobAuditTrail)
+	a.mux.HandleFunc("POST /api/audit/counts", a.getAuditCounts)
+	a.mux.HandleFunc("GET /api/workflows/{workflowID}/audit", a.getWorkflowAuditTrail)
+
+	// Node drain
+	a.mux.HandleFunc("POST /api/nodes/{nodeID}/drain", a.drainNode)
+	a.mux.HandleFunc("DELETE /api/nodes/{nodeID}/drain", a.undrainNode)
+	a.mux.HandleFunc("GET /api/nodes/{nodeID}/drain", a.getNodeDrainStatus)
+
+	// WebSocket
+	a.mux.HandleFunc("GET /api/ws", HandleWebSocket(a.svc.Hub(), a.svc.Logger()))
 
 	// Health
 	a.mux.HandleFunc("GET /api/health", a.health)
-
-	// WebSocket (real-time events)
-	a.mux.HandleFunc("/api/ws", HandleWebSocket(a.svc.Hub(), a.svc.Logger()))
 }
 
-// ---------------------------------------------------------------------------
-// Jobs
-// ---------------------------------------------------------------------------
+// --- Jobs ---
 
 func (a *API) listJobs(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
@@ -171,7 +190,7 @@ func (a *API) listJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) getJob(w http.ResponseWriter, r *http.Request) {
-	job, _, err := a.svc.GetJob(r.Context(), r.PathValue("jobID"))
+	job, err := a.svc.GetJob(r.Context(), r.PathValue("jobID"))
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -207,8 +226,20 @@ func (a *API) deleteJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listJobEvents(w http.ResponseWriter, r *http.Request) {
-	limit := parseIntQuery(r, "limit", 50, maxPageLimit)
-	events, err := a.svc.ListJobEvents(r.Context(), r.PathValue("jobID"), limit)
+	jobID := r.PathValue("jobID")
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > maxPageLimit {
+		limit = maxPageLimit
+	}
+	events, _, err := a.svc.ListJobEvents(r.Context(), store.EventFilter{
+		JobID: &jobID,
+		Limit: limit,
+	})
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -217,8 +248,20 @@ func (a *API) listJobEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listJobRuns(w http.ResponseWriter, r *http.Request) {
-	limit := parseIntQuery(r, "limit", 50, maxPageLimit)
-	runs, err := a.svc.ListJobRuns(r.Context(), r.PathValue("jobID"), limit)
+	jobID := r.PathValue("jobID")
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > maxPageLimit {
+		limit = maxPageLimit
+	}
+	runs, _, err := a.svc.ListJobRuns(r.Context(), store.RunFilter{
+		JobID: &jobID,
+		Limit: limit,
+	})
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -226,31 +269,17 @@ func (a *API) listJobRuns(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, runs)
 }
 
-func (a *API) updateJobPayload(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("jobID")
-
-	var body struct {
-		Payload json.RawMessage `json:"payload"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
-		return
-	}
-
-	if err := a.svc.UpdateJobPayload(r.Context(), jobID, body.Payload); err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, map[string]string{"status": "updated", "job_id": jobID})
-}
-
-// ---------------------------------------------------------------------------
-// Schedules
-// ---------------------------------------------------------------------------
+// --- Schedules ---
 
 func (a *API) listSchedules(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
-	schedules, total, err := a.svc.ListSchedules(r.Context(), pp.Sort, pp.Limit, pp.Offset)
+
+	filter := store.ScheduleFilter{
+		Sort:   pp.Sort,
+		Limit:  pp.Limit,
+		Offset: pp.Offset,
+	}
+	schedules, total, err := a.svc.ListSchedules(r.Context(), filter)
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -267,9 +296,7 @@ func (a *API) getSchedule(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, sched)
 }
 
-// ---------------------------------------------------------------------------
-// Nodes
-// ---------------------------------------------------------------------------
+// --- Nodes ---
 
 func (a *API) listNodes(w http.ResponseWriter, r *http.Request) {
 	nodes, err := a.svc.ListNodes(r.Context())
@@ -289,9 +316,7 @@ func (a *API) getNode(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, node)
 }
 
-// ---------------------------------------------------------------------------
-// Runs
-// ---------------------------------------------------------------------------
+// --- Runs ---
 
 func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
 	runs, err := a.svc.ListActiveRuns(r.Context())
@@ -343,12 +368,11 @@ func (a *API) getJobProgress(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, result)
 }
 
-// ---------------------------------------------------------------------------
-// History
-// ---------------------------------------------------------------------------
+// --- History ---
 
 func (a *API) listHistoryRuns(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
+
 	filter := store.RunFilter{
 		Sort:   pp.Sort,
 		Limit:  pp.Limit,
@@ -387,8 +411,16 @@ func (a *API) listHistoryRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) listHistoryEvents(w http.ResponseWriter, r *http.Request) {
-	limit := parseIntQuery(r, "limit", 50, maxPageLimit)
+	limit := 50
 	offset := 0
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > maxPageLimit {
+		limit = maxPageLimit
+	}
 	if o := r.URL.Query().Get("offset"); o != "" {
 		if parsed, err := strconv.Atoi(o); err == nil && parsed >= 0 {
 			offset = parsed
@@ -406,9 +438,7 @@ func (a *API) listHistoryEvents(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]any{"data": events, "total": total})
 }
 
-// ---------------------------------------------------------------------------
-// DLQ
-// ---------------------------------------------------------------------------
+// --- DLQ ---
 
 func (a *API) listDLQ(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
@@ -420,12 +450,11 @@ func (a *API) listDLQ(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, paginatedResponse{Data: msgs, Total: total})
 }
 
-// ---------------------------------------------------------------------------
-// Workflows
-// ---------------------------------------------------------------------------
+// --- Workflows ---
 
 func (a *API) listWorkflows(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
+
 	filter := store.WorkflowFilter{
 		Sort:   pp.Sort,
 		Limit:  pp.Limit,
@@ -473,12 +502,11 @@ func (a *API) retryWorkflow(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "retried", "workflow_id": wfID})
 }
 
-// ---------------------------------------------------------------------------
-// Batches
-// ---------------------------------------------------------------------------
+// --- Batches ---
 
 func (a *API) listBatches(w http.ResponseWriter, r *http.Request) {
 	pp := parsePageParams(r)
+
 	filter := store.BatchFilter{
 		Sort:   pp.Sort,
 		Limit:  pp.Limit,
@@ -556,9 +584,46 @@ func (a *API) retryBatch(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "retried", "batch_id": batchID})
 }
 
-// ---------------------------------------------------------------------------
-// Groups
-// ---------------------------------------------------------------------------
+// --- Stats ---
+
+func (a *API) getStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := a.svc.GetStats(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, stats)
+}
+
+func (a *API) getDailyStats(w http.ResponseWriter, r *http.Request) {
+	days := 7
+	if d := r.URL.Query().Get("days"); d != "" {
+		if parsed, err := strconv.Atoi(d); err == nil && parsed > 0 && parsed <= 90 {
+			days = parsed
+		}
+	}
+	entries, err := a.svc.GetDailyStats(r.Context(), days)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, entries)
+}
+
+func (a *API) getRedisInfo(w http.ResponseWriter, r *http.Request) {
+	sections, err := a.svc.GetRedisInfo(r.Context(), r.URL.Query().Get("section"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, sections)
+}
+
+func (a *API) getSyncRetries(w http.ResponseWriter, _ *http.Request) {
+	jsonOK(w, a.svc.GetSyncRetries())
+}
+
+// --- Groups ---
 
 func (a *API) listGroups(w http.ResponseWriter, r *http.Request) {
 	groups, err := a.svc.ListGroups(r.Context())
@@ -569,9 +634,7 @@ func (a *API) listGroups(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, groups)
 }
 
-// ---------------------------------------------------------------------------
-// Queues
-// ---------------------------------------------------------------------------
+// --- Queues ---
 
 func (a *API) listQueues(w http.ResponseWriter, r *http.Request) {
 	queues, err := a.svc.ListQueues(r.Context())
@@ -600,9 +663,75 @@ func (a *API) resumeQueue(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "resumed", "queue": tierName})
 }
 
-// ---------------------------------------------------------------------------
-// Bulk operations
-// ---------------------------------------------------------------------------
+// --- Job Payload Update ---
+
+func (a *API) updateJobPayload(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobID")
+
+	var body struct {
+		Payload json.RawMessage `json:"payload"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+
+	if err := a.svc.UpdateJobPayload(r.Context(), jobID, body.Payload); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "updated", "job_id": jobID})
+}
+
+// --- Search ---
+
+func (a *API) searchJobs(w http.ResponseWriter, r *http.Request) {
+	job, err := a.svc.SearchJobsByPayload(r.Context(), r.URL.Query().Get("path"), r.URL.Query().Get("value"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, job)
+}
+
+func (a *API) searchWorkflows(w http.ResponseWriter, r *http.Request) {
+	wf, err := a.svc.SearchWorkflowsByPayload(r.Context(), r.URL.Query().Get("path"), r.URL.Query().Get("value"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, wf)
+}
+
+func (a *API) searchBatches(w http.ResponseWriter, r *http.Request) {
+	batch, err := a.svc.SearchBatchesByPayload(r.Context(), r.URL.Query().Get("path"), r.URL.Query().Get("value"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, batch)
+}
+
+// --- Unique Keys ---
+
+func (a *API) getUniqueKey(w http.ResponseWriter, r *http.Request) {
+	result, err := a.svc.CheckUniqueKey(r.Context(), r.PathValue("key"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, result)
+}
+
+func (a *API) deleteUniqueKey(w http.ResponseWriter, r *http.Request) {
+	if err := a.svc.DeleteUniqueKey(r.Context(), r.PathValue("key")); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "deleted"})
+}
+
+// --- Bulk ---
 
 func (a *API) parseBulkRequest(r *http.Request) (BulkRequest, error) {
 	var req BulkRequest
@@ -623,12 +752,12 @@ func (a *API) bulkCancelJobs(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkCancelJobs(r.Context(), req)
+	result, err := a.svc.BulkCancelJobs(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
 func (a *API) bulkRetryJobs(w http.ResponseWriter, r *http.Request) {
@@ -637,12 +766,12 @@ func (a *API) bulkRetryJobs(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkRetryJobs(r.Context(), req)
+	result, err := a.svc.BulkRetryJobs(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
 func (a *API) bulkDeleteJobs(w http.ResponseWriter, r *http.Request) {
@@ -651,12 +780,12 @@ func (a *API) bulkDeleteJobs(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkDeleteJobs(r.Context(), req)
+	result, err := a.svc.BulkDeleteJobs(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
 func (a *API) bulkCancelWorkflows(w http.ResponseWriter, r *http.Request) {
@@ -665,12 +794,12 @@ func (a *API) bulkCancelWorkflows(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkCancelWorkflows(r.Context(), req)
+	result, err := a.svc.BulkCancelWorkflows(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
 func (a *API) bulkRetryWorkflows(w http.ResponseWriter, r *http.Request) {
@@ -679,12 +808,12 @@ func (a *API) bulkRetryWorkflows(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkRetryWorkflows(r.Context(), req)
+	result, err := a.svc.BulkRetryWorkflows(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
 func (a *API) bulkDeleteWorkflows(w http.ResponseWriter, r *http.Request) {
@@ -693,12 +822,12 @@ func (a *API) bulkDeleteWorkflows(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkDeleteWorkflows(r.Context(), req)
+	result, err := a.svc.BulkDeleteWorkflows(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
 func (a *API) bulkCancelBatches(w http.ResponseWriter, r *http.Request) {
@@ -707,12 +836,12 @@ func (a *API) bulkCancelBatches(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkCancelBatches(r.Context(), req)
+	result, err := a.svc.BulkCancelBatches(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
 func (a *API) bulkRetryBatches(w http.ResponseWriter, r *http.Request) {
@@ -721,12 +850,12 @@ func (a *API) bulkRetryBatches(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkRetryBatches(r.Context(), req)
+	result, err := a.svc.BulkRetryBatches(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
 func (a *API) bulkDeleteBatches(w http.ResponseWriter, r *http.Request) {
@@ -735,133 +864,21 @@ func (a *API) bulkDeleteBatches(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
 		return
 	}
-	affected, err := a.svc.BulkDeleteBatches(r.Context(), req)
+	result, err := a.svc.BulkDeleteBatches(r.Context(), req)
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
-	jsonOK(w, map[string]int{"affected": affected})
+	jsonOK(w, result)
 }
 
-// ---------------------------------------------------------------------------
-// Stats
-// ---------------------------------------------------------------------------
-
-func (a *API) getStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := a.svc.GetStats(r.Context())
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, stats)
-}
-
-func (a *API) getDailyStats(w http.ResponseWriter, r *http.Request) {
-	days := parseIntQuery(r, "days", 7, 90)
-	entries, err := a.svc.GetDailyStats(r.Context(), days)
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, entries)
-}
-
-func (a *API) getRedisInfo(w http.ResponseWriter, r *http.Request) {
-	sections, err := a.svc.GetRedisInfo(r.Context(), r.URL.Query().Get("section"))
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, sections)
-}
-
-func (a *API) getSyncRetries(w http.ResponseWriter, _ *http.Request) {
-	jsonOK(w, a.svc.GetSyncRetries())
-}
-
-// ---------------------------------------------------------------------------
-// Payload search (JSONPath)
-// ---------------------------------------------------------------------------
-
-func (a *API) searchJobsByPayload(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	value := r.URL.Query().Get("value")
-	if path == "" || value == "" {
-		writeServiceError(w, &ApiError{Msg: "path and value query params are required", StatusCode: http.StatusBadRequest})
-		return
-	}
-	job, err := a.svc.SearchJobsByPayload(r.Context(), path, value)
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, job)
-}
-
-func (a *API) searchWorkflowsByPayload(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	value := r.URL.Query().Get("value")
-	if path == "" || value == "" {
-		writeServiceError(w, &ApiError{Msg: "path and value query params are required", StatusCode: http.StatusBadRequest})
-		return
-	}
-	wf, err := a.svc.SearchWorkflowsByPayload(r.Context(), path, value)
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, wf)
-}
-
-func (a *API) searchBatchesByPayload(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	value := r.URL.Query().Get("value")
-	if path == "" || value == "" {
-		writeServiceError(w, &ApiError{Msg: "path and value query params are required", StatusCode: http.StatusBadRequest})
-		return
-	}
-	batch, err := a.svc.SearchBatchesByPayload(r.Context(), path, value)
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, batch)
-}
-
-// ---------------------------------------------------------------------------
-// Unique keys
-// ---------------------------------------------------------------------------
-
-func (a *API) checkUniqueKey(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
-	jobID, exists, err := a.svc.CheckUniqueKey(r.Context(), key)
-	if err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, map[string]any{"unique_key": key, "exists": exists, "job_id": jobID})
-}
-
-func (a *API) deleteUniqueKey(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
-	if err := a.svc.DeleteUniqueKey(r.Context(), key); err != nil {
-		writeServiceError(w, err)
-		return
-	}
-	jsonOK(w, map[string]string{"status": "deleted", "unique_key": key})
-}
-
-// ---------------------------------------------------------------------------
-// Health
-// ---------------------------------------------------------------------------
+// --- Health ---
 
 func (a *API) health(w http.ResponseWriter, _ *http.Request) {
 	jsonOK(w, map[string]string{"status": "ok"})
 }
 
-// ---------------------------------------------------------------------------
-// Pagination & helpers
-// ---------------------------------------------------------------------------
+// --- Pagination ---
 
 const maxPageLimit = 100
 
@@ -892,36 +909,18 @@ func parsePageParams(r *http.Request) pageParams {
 	return p
 }
 
-// parseIntQuery parses an integer query parameter with a default and max cap.
-func parseIntQuery(r *http.Request, key string, defaultVal, maxVal int) int {
-	v := defaultVal
-	if s := r.URL.Query().Get(key); s != "" {
-		if parsed, err := strconv.Atoi(s); err == nil && parsed > 0 {
-			v = parsed
-		}
-	}
-	if v > maxVal {
-		v = maxVal
-	}
-	return v
-}
-
 type paginatedResponse struct {
 	Data  any `json:"data"`
 	Total int `json:"total"`
 }
 
-// ApiError is a service-layer error that carries an HTTP status code.
-// Handlers can type-assert errors to *ApiError to extract the status code.
-type ApiError struct {
-	Msg        string `json:"error"`
-	StatusCode int    `json:"-"`
+// --- Helpers ---
+
+func jsonOK(w http.ResponseWriter, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
 }
 
-func (e *ApiError) Error() string { return e.Msg }
-
-// writeServiceError writes a JSON error response, extracting the status code
-// from *ApiError if available.
 func writeServiceError(w http.ResponseWriter, err error) {
 	code := http.StatusInternalServerError
 	if apiErr, ok := err.(*ApiError); ok {
@@ -930,11 +929,6 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-}
-
-func jsonOK(w http.ResponseWriter, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -950,4 +944,90 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// --- Filter helpers (used by both api_service.go and grpc) ---
+
+func jobFilterByStatus(status string, limit int) store.JobFilter {
+	s := types.JobStatus(status)
+	return store.JobFilter{Status: &s, Limit: limit}
+}
+
+func workflowFilterByStatus(status *types.WorkflowStatus, limit int) store.WorkflowFilter {
+	return store.WorkflowFilter{Status: status, Limit: limit}
+}
+
+func batchFilterByStatus(status *types.WorkflowStatus, limit int) store.BatchFilter {
+	return store.BatchFilter{Status: status, Limit: limit}
+}
+
+// --- Audit Trail ---
+
+func (a *API) getJobAuditTrail(w http.ResponseWriter, r *http.Request) {
+	entries, err := a.svc.GetJobAuditTrail(r.Context(), r.PathValue("jobID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, entries)
+}
+
+func (a *API) getAuditCounts(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs []string `json:"ids"`
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+			return
+		}
+	}
+	if len(body.IDs) > maxPageLimit {
+		body.IDs = body.IDs[:maxPageLimit]
+	}
+	counts, err := a.svc.GetJobAuditCounts(r.Context(), body.IDs)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, counts)
+}
+
+func (a *API) getWorkflowAuditTrail(w http.ResponseWriter, r *http.Request) {
+	entries, err := a.svc.GetWorkflowAuditTrail(r.Context(), r.PathValue("workflowID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, entries)
+}
+
+// --- Node Drain ---
+
+func (a *API) drainNode(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("nodeID")
+	if err := a.svc.SetNodeDrain(r.Context(), nodeID, true); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "draining", "node_id": nodeID})
+}
+
+func (a *API) undrainNode(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("nodeID")
+	if err := a.svc.SetNodeDrain(r.Context(), nodeID, false); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "active", "node_id": nodeID})
+}
+
+func (a *API) getNodeDrainStatus(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("nodeID")
+	draining, err := a.svc.IsNodeDraining(r.Context(), nodeID)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]any{"node_id": nodeID, "draining": draining})
 }

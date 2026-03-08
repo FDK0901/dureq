@@ -42,6 +42,13 @@ type TierConfig struct {
 
 	// FetchBatch is the number of messages to read per XREADGROUP call. Default: 10.
 	FetchBatch int
+
+	// RateLimit, if set, limits how many messages per second can be fetched from this tier.
+	// Uses a distributed token bucket. Zero = no rate limit.
+	RateLimit float64
+
+	// RateBurst is the maximum burst size for the rate limiter. Default: RateLimit.
+	RateBurst int
 }
 
 func (c *RedisStoreConfig) defaults() {
@@ -86,36 +93,6 @@ func (c *RedisStoreConfig) prefix() string {
 		return c.KeyPrefix + "_" + defaultPrefix
 	}
 	return defaultPrefix
-}
-
-// ResolveTier maps a numeric priority (1-10) to a configured tier name.
-// Higher priority → first tier (highest weight), lower → last tier.
-func ResolveTier(tiers []TierConfig, priority int) string {
-	if len(tiers) == 0 {
-		return "normal"
-	}
-	if len(tiers) == 1 {
-		return tiers[0].Name
-	}
-
-	p := priority
-	if p <= 0 {
-		p = 5
-	}
-	if p > 10 {
-		p = 10
-	}
-
-	bucketSize := 10 / len(tiers)
-	if bucketSize == 0 {
-		bucketSize = 1
-	}
-
-	idx := (10 - p) / bucketSize
-	if idx >= len(tiers) {
-		idx = len(tiers) - 1
-	}
-	return tiers[idx].Name
 }
 
 // DefaultTiers returns a sensible default tier configuration.

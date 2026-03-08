@@ -7,8 +7,6 @@ import (
 	pb "github.com/FDK0901/dureq/gen/dureq/monitor/v1"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // --- Schedules ---
@@ -22,9 +20,9 @@ func (g *GRPCServer) ListSchedules(ctx context.Context, req *pb.ListSchedulesReq
 		Limit:  pp.Limit,
 		Offset: pp.Offset,
 	}
-	schedules, total, err := g.store.ListSchedulesPaginated(ctx, filter)
+	schedules, total, err := g.svc.ListSchedules(ctx, filter)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list schedules: %v", err)
+		return nil, toGRPCError(err)
 	}
 
 	out := make([]*pb.ScheduleEntry, len(schedules))
@@ -40,9 +38,9 @@ func (g *GRPCServer) ListSchedules(ctx context.Context, req *pb.ListSchedulesReq
 
 // GetSchedule returns a single schedule entry by job ID.
 func (g *GRPCServer) GetSchedule(ctx context.Context, req *pb.GetScheduleRequest) (*pb.GetScheduleResponse, error) {
-	sched, _, err := g.store.GetSchedule(ctx, req.GetJobId())
+	sched, err := g.svc.GetSchedule(ctx, req.GetJobId())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "schedule not found: %v", err)
+		return nil, toGRPCError(err)
 	}
 	return &pb.GetScheduleResponse{
 		Schedule: scheduleEntryToPB(sched),
@@ -53,9 +51,9 @@ func (g *GRPCServer) GetSchedule(ctx context.Context, req *pb.GetScheduleRequest
 
 // ListNodes returns all registered server nodes.
 func (g *GRPCServer) ListNodes(ctx context.Context, _ *pb.ListNodesRequest) (*pb.ListNodesResponse, error) {
-	nodes, err := g.store.ListNodes(ctx)
+	nodes, err := g.svc.ListNodes(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list nodes: %v", err)
+		return nil, toGRPCError(err)
 	}
 
 	out := make([]*pb.NodeInfo, len(nodes))
@@ -68,9 +66,9 @@ func (g *GRPCServer) ListNodes(ctx context.Context, _ *pb.ListNodesRequest) (*pb
 
 // GetNode returns a single node by ID.
 func (g *GRPCServer) GetNode(ctx context.Context, req *pb.GetNodeRequest) (*pb.GetNodeResponse, error) {
-	node, err := g.store.GetNode(ctx, req.GetNodeId())
-	if err != nil || node == nil {
-		return nil, status.Errorf(codes.NotFound, "node not found")
+	node, err := g.svc.GetNode(ctx, req.GetNodeId())
+	if err != nil {
+		return nil, toGRPCError(err)
 	}
 	return &pb.GetNodeResponse{Node: nodeInfoToPB(node)}, nil
 }
@@ -79,9 +77,9 @@ func (g *GRPCServer) GetNode(ctx context.Context, req *pb.GetNodeRequest) (*pb.G
 
 // ListRuns returns all active runs.
 func (g *GRPCServer) ListRuns(ctx context.Context, _ *pb.ListRunsRequest) (*pb.ListRunsResponse, error) {
-	runs, err := g.store.ListRuns(ctx)
+	runs, err := g.svc.ListActiveRuns(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list runs: %v", err)
+		return nil, toGRPCError(err)
 	}
 
 	out := make([]*pb.JobRun, len(runs))
@@ -94,9 +92,9 @@ func (g *GRPCServer) ListRuns(ctx context.Context, _ *pb.ListRunsRequest) (*pb.L
 
 // GetRun returns a single run by ID.
 func (g *GRPCServer) GetRun(ctx context.Context, req *pb.GetRunRequest) (*pb.GetRunResponse, error) {
-	run, _, err := g.store.GetRun(ctx, req.GetRunId())
+	run, err := g.svc.GetRun(ctx, req.GetRunId())
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "run not found: %v", err)
+		return nil, toGRPCError(err)
 	}
 	return &pb.GetRunResponse{Run: jobRunToPB(run)}, nil
 }
@@ -120,9 +118,9 @@ func (g *GRPCServer) ListHistoryRuns(ctx context.Context, req *pb.ListHistoryRun
 		filter.JobID = &jid
 	}
 
-	runs, total, err := g.store.ListJobRuns(ctx, filter)
+	runs, total, err := g.svc.ListHistoryRuns(ctx, filter)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list history runs: %v", err)
+		return nil, toGRPCError(err)
 	}
 
 	out := make([]*pb.JobRun, len(runs))
@@ -156,9 +154,9 @@ func (g *GRPCServer) ListHistoryEvents(ctx context.Context, req *pb.ListHistoryE
 		filter.JobID = &jid
 	}
 
-	events, total, err := g.store.ListJobEvents(ctx, filter)
+	events, total, err := g.svc.ListHistoryEvents(ctx, filter)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list history events: %v", err)
+		return nil, toGRPCError(err)
 	}
 
 	out := make([]*pb.JobEvent, len(events))
@@ -178,19 +176,9 @@ func (g *GRPCServer) ListHistoryEvents(ctx context.Context, req *pb.ListHistoryE
 func (g *GRPCServer) ListDLQ(ctx context.Context, req *pb.ListDLQRequest) (*pb.ListDLQResponse, error) {
 	pp := parsePaginationPB(req.GetPagination())
 
-	msgs, err := g.store.ListDLQ(ctx, 1000)
+	msgs, total, err := g.svc.ListDLQ(ctx, pp.Limit, pp.Offset)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list dlq: %v", err)
-	}
-
-	total := len(msgs)
-	if pp.Offset < len(msgs) {
-		msgs = msgs[pp.Offset:]
-	} else {
-		msgs = nil
-	}
-	if pp.Limit > 0 && len(msgs) > pp.Limit {
-		msgs = msgs[:pp.Limit]
+		return nil, toGRPCError(err)
 	}
 
 	out := make([]*pb.WorkMessage, len(msgs))
@@ -208,18 +196,14 @@ func (g *GRPCServer) ListDLQ(ctx context.Context, req *pb.ListDLQRequest) (*pb.L
 
 // ListGroups returns all active aggregation groups with their sizes.
 func (g *GRPCServer) ListGroups(ctx context.Context, _ *pb.ListGroupsRequest) (*pb.ListGroupsResponse, error) {
-	groups, err := g.store.ListGroups(ctx)
+	groups, err := g.svc.ListGroups(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list groups: %v", err)
+		return nil, toGRPCError(err)
 	}
 
 	out := make([]*pb.GroupInfo, 0, len(groups))
-	for _, name := range groups {
-		size, err := g.store.GetGroupSize(ctx, name)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "get group size for %q: %v", name, err)
-		}
-		out = append(out, &pb.GroupInfo{Name: name, Size: size})
+	for _, gi := range groups {
+		out = append(out, &pb.GroupInfo{Name: gi.Name, Size: gi.Size})
 	}
 
 	return &pb.ListGroupsResponse{Groups: out}, nil
@@ -229,49 +213,37 @@ func (g *GRPCServer) ListGroups(ctx context.Context, _ *pb.ListGroupsRequest) (*
 
 // ListQueues returns queue/tier information including pause state and size.
 func (g *GRPCServer) ListQueues(ctx context.Context, _ *pb.ListQueuesRequest) (*pb.ListQueuesResponse, error) {
-	tiers := g.store.Config().Tiers
-	paused, err := g.store.ListPausedQueues(ctx)
+	queues, err := g.svc.ListQueues(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list paused queues: %v", err)
-	}
-	pausedSet := make(map[string]bool, len(paused))
-	for _, p := range paused {
-		pausedSet[p] = true
+		return nil, toGRPCError(err)
 	}
 
-	// Use pending job count instead of legacy XLEN (streams are unused in v2 actor path).
-	jobCounts, err := g.store.GetActiveJobStats(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "get job stats for queue size: %v", err)
-	}
-	pendingCount := int64(jobCounts[types.JobStatusPending])
-
-	queues := make([]*pb.QueueInfo, 0, len(tiers))
-	for _, tier := range tiers {
-		queues = append(queues, &pb.QueueInfo{
-			Name:       tier.Name,
-			Weight:     int32(tier.Weight),
-			FetchBatch: int32(tier.FetchBatch),
-			Paused:     pausedSet[tier.Name],
-			Size:       pendingCount,
+	out := make([]*pb.QueueInfo, 0, len(queues))
+	for _, q := range queues {
+		out = append(out, &pb.QueueInfo{
+			Name:       q.Name,
+			Weight:     int32(q.Weight),
+			FetchBatch: int32(q.FetchBatch),
+			Paused:     q.Paused,
+			Size:       q.Size,
 		})
 	}
 
-	return &pb.ListQueuesResponse{Queues: queues}, nil
+	return &pb.ListQueuesResponse{Queues: out}, nil
 }
 
 // PauseQueue pauses a queue/tier by name.
 func (g *GRPCServer) PauseQueue(ctx context.Context, req *pb.PauseQueueRequest) (*pb.PauseQueueResponse, error) {
-	if err := g.store.PauseQueue(ctx, req.GetTierName()); err != nil {
-		return nil, status.Errorf(codes.Internal, "pause queue: %v", err)
+	if err := g.svc.PauseQueue(ctx, req.GetTierName()); err != nil {
+		return nil, toGRPCError(err)
 	}
 	return &pb.PauseQueueResponse{TierName: req.GetTierName()}, nil
 }
 
 // ResumeQueue resumes a paused queue/tier by name.
 func (g *GRPCServer) ResumeQueue(ctx context.Context, req *pb.ResumeQueueRequest) (*pb.ResumeQueueResponse, error) {
-	if err := g.store.UnpauseQueue(ctx, req.GetTierName()); err != nil {
-		return nil, status.Errorf(codes.Internal, "resume queue: %v", err)
+	if err := g.svc.ResumeQueue(ctx, req.GetTierName()); err != nil {
+		return nil, toGRPCError(err)
 	}
 	return &pb.ResumeQueueResponse{TierName: req.GetTierName()}, nil
 }
@@ -281,50 +253,29 @@ func (g *GRPCServer) ResumeQueue(ctx context.Context, req *pb.ResumeQueueRequest
 // GetStats returns overall system statistics including job counts, active schedules,
 // runs, and nodes.
 func (g *GRPCServer) GetStats(ctx context.Context, _ *pb.GetStatsRequest) (*pb.GetStatsResponse, error) {
-	jobCounts, err := g.store.GetActiveJobStats(ctx)
+	stats, err := g.svc.GetStats(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "get job stats: %v", err)
+		return nil, toGRPCError(err)
 	}
 
-	schedules, err := g.store.ListSchedules(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list schedules: %v", err)
-	}
-	runs, err := g.store.ListRuns(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list runs: %v", err)
-	}
-	nodes, err := g.store.ListNodes(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list nodes: %v", err)
-	}
-
-	counts := make(map[string]int32, len(jobCounts))
-	for s, c := range jobCounts {
+	counts := make(map[string]int32, len(stats.JobCounts))
+	for s, c := range stats.JobCounts {
 		counts[string(s)] = int32(c)
 	}
 
 	return &pb.GetStatsResponse{
 		JobCounts:       counts,
-		ActiveSchedules: int32(len(schedules)),
-		ActiveRuns:      int32(len(runs)),
-		ActiveNodes:     int32(len(nodes)),
+		ActiveSchedules: int32(stats.ActiveSchedules),
+		ActiveRuns:      int32(stats.ActiveRuns),
+		ActiveNodes:     int32(stats.ActiveNodes),
 	}, nil
 }
 
 // GetDailyStats returns aggregated daily processing statistics.
 func (g *GRPCServer) GetDailyStats(ctx context.Context, req *pb.GetDailyStatsRequest) (*pb.GetDailyStatsResponse, error) {
-	days := int(req.GetDays())
-	if days <= 0 {
-		days = 7
-	}
-	if days > 90 {
-		days = 90
-	}
-
-	entries, err := g.store.GetDailyStats(ctx, days)
+	entries, err := g.svc.GetDailyStats(ctx, int(req.GetDays()))
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "get daily stats: %v", err)
+		return nil, toGRPCError(err)
 	}
 
 	out := make([]*pb.DailyStatsEntry, 0, len(entries))
@@ -341,17 +292,11 @@ func (g *GRPCServer) GetDailyStats(ctx context.Context, req *pb.GetDailyStatsReq
 
 // GetRedisInfo returns parsed Redis INFO output organized by section.
 func (g *GRPCServer) GetRedisInfo(ctx context.Context, req *pb.GetRedisInfoRequest) (*pb.GetRedisInfoResponse, error) {
-	section := req.GetSection()
-	if section == "" {
-		section = "all"
-	}
-
-	info, err := g.store.Client().Do(ctx, g.store.Client().B().Info().Section(section).Build()).ToString()
+	sections, err := g.svc.GetRedisInfo(ctx, req.GetSection())
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "get redis info: %v", err)
+		return nil, toGRPCError(err)
 	}
 
-	sections := store.ParseRedisInfo(info)
 	out := make(map[string]*pb.RedisInfoSection, len(sections))
 	for name, entries := range sections {
 		out[name] = &pb.RedisInfoSection{Entries: entries}
@@ -362,14 +307,10 @@ func (g *GRPCServer) GetRedisInfo(ctx context.Context, req *pb.GetRedisInfoReque
 
 // GetSyncRetries returns the current SyncRetrier statistics as an opaque JSON blob.
 func (g *GRPCServer) GetSyncRetries(_ context.Context, _ *pb.GetSyncRetriesRequest) (*pb.GetSyncRetriesResponse, error) {
-	if g.syncRetryStats == nil {
-		return &pb.GetSyncRetriesResponse{Data: []byte("{}")}, nil
-	}
-
-	result := g.syncRetryStats()
+	result := g.svc.GetSyncRetries()
 	data, err := json.Marshal(result)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "marshal sync retries: %v", err)
+		return nil, toGRPCError(err)
 	}
 	return &pb.GetSyncRetriesResponse{Data: data}, nil
 }

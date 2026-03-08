@@ -66,7 +66,6 @@ func (h *hub) Broadcast(data []byte) {
 		select {
 		case c.Send <- data:
 		default:
-			// Slow consumer — drop this event.
 		}
 	}
 }

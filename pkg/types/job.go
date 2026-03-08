@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"math/rand"
 	"time"
 )
 
@@ -62,6 +60,10 @@ type HandlerDefinition struct {
 	Timeout           time.Duration         // per-execution timeout (0 = no timeout)
 	RetryPolicy       *RetryPolicy          // default retry (overridable per-job)
 	Middlewares       []MiddlewareFunc      // per-handler middleware (applied after global)
+	// Version identifies the handler build for safe deployments.
+	// When set, the worker will skip messages dispatched with a different version
+	// and re-enqueue them for a matching worker to pick up.
+	Version string
 }
 
 // RetryPolicy describes retry behavior.
@@ -71,6 +73,10 @@ type RetryPolicy struct {
 	MaxDelay     time.Duration `json:"max_delay"`
 	Multiplier   float64       `json:"multiplier"`
 	Jitter       float64       `json:"jitter"` // 0.0 - 1.0
+	// NonRetryableErrors is a list of error message substrings that should not be retried.
+	// If a task fails with an error containing any of these strings, it is immediately
+	// moved to dead status without retrying.
+	NonRetryableErrors []string `json:"non_retryable_errors,omitempty"`
 }
 
 // DefaultRetryPolicy returns a sensible default retry policy.
@@ -82,23 +88,6 @@ func DefaultRetryPolicy() *RetryPolicy {
 		Multiplier:   2.0,
 		Jitter:       0.1,
 	}
-}
-
-// CalculateBackoff computes the retry delay for the given attempt using
-// exponential backoff with optional jitter.
-func CalculateBackoff(attempt int, policy *RetryPolicy) time.Duration {
-	delay := float64(policy.InitialDelay) * math.Pow(policy.Multiplier, float64(attempt))
-
-	if time.Duration(delay) > policy.MaxDelay {
-		delay = float64(policy.MaxDelay)
-	}
-
-	if policy.Jitter > 0 {
-		jitterRange := delay * policy.Jitter
-		delay = delay - jitterRange + (rand.Float64() * 2 * jitterRange)
-	}
-
-	return time.Duration(delay)
 }
 
 // ScheduleType defines how a job is scheduled.
@@ -127,6 +116,8 @@ const (
 	OverlapBufferOne OverlapPolicy = "BUFFER_ONE"
 	// OverlapBufferAll buffers all pending dispatches while a run is active.
 	OverlapBufferAll OverlapPolicy = "BUFFER_ALL"
+	// OverlapReplace cancels the current active run and starts a new one.
+	OverlapReplace OverlapPolicy = "REPLACE"
 )
 
 // Schedule defines "when" a job should run.
@@ -163,6 +154,11 @@ type Schedule struct {
 	// MaxBackfillPerTick limits how many missed firings are enqueued in a
 	// single scheduler tick to prevent flooding. Default: 10 if CatchupWindow is set.
 	MaxBackfillPerTick *int `json:"max_backfill_per_tick,omitempty"`
+
+	// Jitter adds a random offset to the computed next run time.
+	// This prevents thundering herd when many jobs share the same schedule.
+	// E.g., Jitter of 30s means the firing time is offset by rand(0, 30s).
+	Jitter *Duration `json:"jitter,omitempty"`
 }
 
 // AtTime represents a time of day as hour, minute, second.
@@ -269,7 +265,7 @@ func (s *Schedule) Validate() error {
 	// Validate overlap policy.
 	if s.OverlapPolicy != "" {
 		switch s.OverlapPolicy {
-		case OverlapAllowAll, OverlapSkip, OverlapBufferOne, OverlapBufferAll:
+		case OverlapAllowAll, OverlapSkip, OverlapBufferOne, OverlapBufferAll, OverlapReplace:
 			// valid
 		default:
 			return fmt.Errorf("unknown overlap_policy: %s", s.OverlapPolicy)
@@ -290,6 +286,16 @@ func (s *Schedule) Validate() error {
 	}
 	if s.MaxBackfillPerTick != nil && *s.MaxBackfillPerTick < 1 {
 		return errors.New("max_backfill_per_tick must be >= 1")
+	}
+
+	// Validate jitter.
+	if s.Jitter != nil {
+		if s.Jitter.Std() < 0 {
+			return errors.New("jitter must be non-negative")
+		}
+		if s.Type == ScheduleImmediate || s.Type == ScheduleOneTime {
+			return errors.New("jitter is only valid for recurring schedules")
+		}
 	}
 
 	return nil
@@ -398,6 +404,9 @@ type WorkMessage struct {
 	Headers      map[string]string `json:"headers,omitempty"`
 	Priority     Priority          `json:"priority,omitempty"`
 	DispatchedAt time.Time         `json:"dispatched_at,omitempty"`
+	// Version is the handler version this message was dispatched with.
+	// Workers with a mismatched version will skip and re-enqueue the message.
+	Version string `json:"version,omitempty"`
 }
 
 // WorkResult is the outcome of executing a work message.
@@ -411,13 +420,15 @@ type WorkResult struct {
 
 // NodeInfo is registered by each node in the dureq_nodes KV bucket.
 type NodeInfo struct {
-	NodeID        string     `json:"node_id"`
-	Address       string     `json:"address,omitempty"`
-	TaskTypes     []string   `json:"task_types"`
-	StartedAt     time.Time  `json:"started_at"`
-	LastHeartbeat time.Time  `json:"last_heartbeat"`
-	PoolStats     *PoolStats `json:"pool_stats,omitempty"`
-	ActiveRunIDs  []string   `json:"active_run_ids,omitempty"`
+	NodeID        string            `json:"node_id"`
+	Address       string            `json:"address,omitempty"`
+	TaskTypes     []string          `json:"task_types"`
+	StartedAt     time.Time         `json:"started_at"`
+	LastHeartbeat time.Time         `json:"last_heartbeat"`
+	PoolStats     *PoolStats        `json:"pool_stats,omitempty"`
+	ActiveRunIDs  []string          `json:"active_run_ids,omitempty"`
+	// HandlerVersions maps task type → handler version for safe deployment routing.
+	HandlerVersions map[string]string `json:"handler_versions,omitempty"`
 }
 
 // PoolStats captures worker pool metrics for a node.
@@ -464,11 +475,18 @@ type WorkflowDefinition struct {
 }
 
 // WorkflowTask is one step in a workflow DAG.
+// A task is either a regular task (TaskType set) or a child workflow
+// (ChildWorkflowDef set). Exactly one of TaskType or ChildWorkflowDef should be set.
 type WorkflowTask struct {
 	Name      string          `json:"name"`
 	TaskType  TaskType        `json:"task_type"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 	DependsOn []string        `json:"depends_on,omitempty"`
+
+	// ChildWorkflowDef, when set, makes this task spawn a child workflow
+	// instead of dispatching a regular job. The child runs independently
+	// and the parent task completes when the child workflow completes.
+	ChildWorkflowDef *WorkflowDefinition `json:"child_workflow_def,omitempty"`
 }
 
 // WorkflowInstance is a running instance of a workflow definition.
@@ -482,9 +500,16 @@ type WorkflowInstance struct {
 	Deadline     *time.Time                   `json:"deadline,omitempty"`
 	Attempt      int                          `json:"attempt,omitempty"`
 	MaxAttempts  int                          `json:"max_attempts,omitempty"`
-	CreatedAt    time.Time                    `json:"created_at"`
-	UpdatedAt    time.Time                    `json:"updated_at"`
-	CompletedAt  *time.Time                   `json:"completed_at,omitempty"`
+
+	// ParentWorkflowID links this workflow to a parent workflow that spawned it
+	// as a child workflow task.
+	ParentWorkflowID *string `json:"parent_workflow_id,omitempty"`
+	// ParentTaskName is the task name in the parent workflow that this child represents.
+	ParentTaskName *string `json:"parent_task_name,omitempty"`
+
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 }
 
 // WorkflowTaskState tracks the state of one task within a workflow instance.
@@ -495,6 +520,8 @@ type WorkflowTaskState struct {
 	Error      *string    `json:"error,omitempty"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// ChildWorkflowID is set when this task spawned a child workflow.
+	ChildWorkflowID string `json:"child_workflow_id,omitempty"`
 }
 
 // --- Batch Processing Types ---
@@ -606,6 +633,16 @@ type BatchItemResult struct {
 	Success bool            `json:"success"`
 	Output  json.RawMessage `json:"output,omitempty"`
 	Error   *string         `json:"error,omitempty"`
+}
+
+// --- Workflow Signal Types ---
+
+// WorkflowSignal is an external signal sent to a running workflow.
+type WorkflowSignal struct {
+	Name       string          `json:"name"`
+	Payload    json.RawMessage `json:"payload,omitempty"`
+	SentAt     time.Time       `json:"sent_at"`
+	WorkflowID string          `json:"workflow_id"`
 }
 
 // BatchProgress is published as an event for progress tracking.

@@ -191,6 +191,10 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 				s.store.PushOverlapBufferAll(ctx, entry.JobID, now)
 				s.advanceSchedule(ctx, entry, now)
 				return
+			case types.OverlapReplace:
+				s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: cancelling active runs for REPLACE overlap")
+				s.cancelActiveRunsForJob(ctx, entry.JobID)
+				// Fall through to dispatch the new run.
 			}
 		}
 	}
@@ -208,36 +212,56 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 
 	missedFirings, _ := MissedFirings(entry.Schedule, refTime, now, maxBackfill)
 
+	dispatched := false
 	if len(missedFirings) > 1 {
 		s.logger.Info().String("job_id", entry.JobID).Int("missed_count", len(missedFirings)).Msg("scheduler: backfilling missed firings")
+		allOK := true
 		for _, firingTime := range missedFirings {
-			s.dispatchFiring(ctx, job, rev, entry, firingTime)
+			newRev, ok := s.dispatchFiring(ctx, job, rev, entry, firingTime, true)
+			if !ok {
+				allOK = false
+				break
+			}
+			rev = newRev
+			dispatched = true
 		}
-		lastFiring := missedFirings[len(missedFirings)-1]
-		entry.LastProcessedAt = &lastFiring
+		if allOK {
+			lastFiring := missedFirings[len(missedFirings)-1]
+			entry.LastProcessedAt = &lastFiring
+		}
 	} else {
 		// Normal single dispatch.
-		s.dispatchFiring(ctx, job, rev, entry, now)
-		entry.LastProcessedAt = &now
+		_, ok := s.dispatchFiring(ctx, job, rev, entry, now, false)
+		if ok {
+			entry.LastProcessedAt = &now
+			dispatched = true
+		}
 	}
 
 	s.cache.InvalidateJob(job.ID)
-	s.advanceSchedule(ctx, entry, now)
+	if dispatched {
+		s.advanceSchedule(ctx, entry, now)
+	}
 }
 
 // dispatchFiring dispatches a single firing of a scheduled job.
-func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time) {
+// Returns the new revision and true on success, or (0, false) on failure.
+func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time, isBackfill bool) (uint64, bool) {
+	prevStatus := job.Status
+	prevLastRunAt := job.LastRunAt
+
 	job.Status = types.JobStatusPending
 	job.LastRunAt = &firingTime
 	job.UpdatedAt = time.Now()
 
-	if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+	newRev, err := s.store.UpdateJob(ctx, job, rev)
+	if err != nil {
 		s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: CAS update failed")
-		return
+		return 0, false
 	}
 
-	// Add backfill headers if firing time differs from now.
-	if !firingTime.Equal(time.Now().Truncate(time.Second)) && entry.Schedule.CatchupWindow != nil {
+	// Add backfill headers for missed firings being caught up.
+	if isBackfill {
 		if job.Headers == nil {
 			job.Headers = make(map[string]string)
 		}
@@ -246,8 +270,15 @@ func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint
 	}
 
 	if err := s.dispatcher.Dispatch(ctx, job, job.Attempt); err != nil {
-		s.logger.Error().String("job_id", job.ID).Err(err).Msg("scheduler: dispatch failed")
-		return
+		s.logger.Error().String("job_id", job.ID).Err(err).Msg("scheduler: dispatch failed, rolling back status")
+		// Rollback: revert job status to prevent state inconsistency.
+		job.Status = prevStatus
+		job.LastRunAt = prevLastRunAt
+		job.UpdatedAt = time.Now()
+		if _, rbErr := s.store.UpdateJob(ctx, job, newRev); rbErr != nil {
+			s.logger.Error().String("job_id", job.ID).Err(rbErr).Msg("scheduler: rollback after dispatch failure also failed")
+		}
+		return 0, false
 	}
 
 	s.dispatcher.PublishEvent(types.JobEvent{
@@ -256,20 +287,21 @@ func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint
 		TaskType:  job.TaskType,
 		Timestamp: firingTime,
 	})
+	return newRev, true
 }
 
 // advanceSchedule calculates and saves the next run time for a schedule.
 func (s *Scheduler) advanceSchedule(ctx context.Context, entry *types.ScheduleEntry, now time.Time) {
 	nextRun, err := NextRunTime(entry.Schedule, now)
 	if err != nil || nextRun.IsZero() {
-		s.store.DeleteSchedule(ctx, entry.JobID)
+		s.expireSchedule(ctx, entry)
 		s.cache.InvalidateSchedules()
 		s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: schedule exhausted")
 		return
 	}
 
 	if entry.Schedule.EndsAt != nil && nextRun.After(*entry.Schedule.EndsAt) {
-		s.store.DeleteSchedule(ctx, entry.JobID)
+		s.expireSchedule(ctx, entry)
 		s.cache.InvalidateSchedules()
 		s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: schedule will expire before next run")
 		return
@@ -410,11 +442,22 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 
 			if job.Attempt < retryPolicy.MaxAttempts {
 				// Auto-recover: redispatch.
+				prevStatus := job.Status
 				job.Status = types.JobStatusPending
 				job.LastError = &errMsg
 				job.UpdatedAt = now
-				s.store.UpdateJob(ctx, job, rev)
-				s.dispatcher.Dispatch(ctx, job, job.Attempt)
+				newRev, updateErr := s.store.UpdateJob(ctx, job, rev)
+				if updateErr != nil {
+					s.logger.Error().String("job_id", run.JobID).Err(updateErr).Msg("scheduler: failed to update orphaned job for auto-recovery")
+					continue
+				}
+				if dispErr := s.dispatcher.Dispatch(ctx, job, job.Attempt); dispErr != nil {
+					s.logger.Error().String("job_id", run.JobID).Err(dispErr).Msg("scheduler: dispatch failed for orphan recovery, rolling back")
+					job.Status = prevStatus
+					job.UpdatedAt = time.Now()
+					s.store.UpdateJob(ctx, job, newRev)
+					continue
+				}
 
 				s.dispatcher.PublishEvent(types.JobEvent{
 					Type:      types.EventJobAutoRecovered,
@@ -450,22 +493,38 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 	}
 }
 
+// cancelActiveRunsForJob signals cancellation to all active runs of a job.
+func (s *Scheduler) cancelActiveRunsForJob(ctx context.Context, jobID string) {
+	runs, err := s.store.ListActiveRunsByJobID(ctx, jobID)
+	if err != nil {
+		s.logger.Warn().String("job_id", jobID).Err(err).Msg("scheduler: failed to list active runs for cancel")
+		return
+	}
+	cancelCh := s.store.CancelChannel()
+	for _, run := range runs {
+		s.store.Client().Do(ctx, s.store.Client().B().Publish().Channel(cancelCh).Message(run.ID).Build())
+	}
+}
+
 func (s *Scheduler) expireSchedule(ctx context.Context, entry *types.ScheduleEntry) {
 	s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: schedule expired")
 
 	// Delete the schedule.
 	s.store.DeleteSchedule(ctx, entry.JobID)
 
-	// Mark the job as completed.
+	// Mark the job as completed if it's not currently running.
+	// Running jobs will be completed by the worker when execution finishes.
 	job, rev, err := s.store.GetJob(ctx, entry.JobID)
 	if err != nil {
 		return
 	}
 	now := time.Now()
-	job.Status = types.JobStatusCompleted
-	job.CompletedAt = &now
-	job.UpdatedAt = now
-	s.store.UpdateJob(ctx, job, rev)
+	if !job.Status.IsTerminal() && job.Status != types.JobStatusRunning {
+		job.Status = types.JobStatusCompleted
+		job.CompletedAt = &now
+		job.UpdatedAt = now
+		s.store.UpdateJob(ctx, job, rev)
+	}
 
 	s.dispatcher.PublishEvent(types.JobEvent{
 		Type:      types.EventScheduleRemoved,

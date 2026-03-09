@@ -18,9 +18,11 @@ package dureq
 
 import (
 	"github.com/FDK0901/dureq/internal/client"
+	"github.com/FDK0901/dureq/internal/monitor"
 	"github.com/FDK0901/dureq/internal/server"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
+	gochainedlog "github.com/FDK0901/go-chainedlog"
 )
 
 // Server options — re-export from internal/server.
@@ -65,6 +67,17 @@ var (
 // NewClient creates a new dureq client for enqueuing jobs.
 func NewClient(opts ...client.Option) (*client.Client, error) {
 	return client.New(opts...)
+}
+
+type RedisStore = store.RedisStore
+
+type APIService = monitor.APIService
+
+type Dispatcher = monitor.Dispatcher
+
+// Re-export APIService
+func NewAPIService(s *RedisStore, disp Dispatcher, logger gochainedlog.Logger) *APIService {
+	return monitor.NewAPIService(s, disp, logger)
 }
 
 // Re-export store types commonly needed by users.

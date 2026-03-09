@@ -64,6 +64,8 @@ var (
 	WithClientRedisStore    = client.WithStore
 )
 
+type Client = client.Client
+
 // NewClient creates a new dureq client for enqueuing jobs.
 func NewClient(opts ...client.Option) (*client.Client, error) {
 	return client.New(opts...)

@@ -79,6 +79,16 @@ type APIService = monitor.APIService
 
 type Dispatcher = monitor.Dispatcher
 
+type BulkRequest = monitor.BulkRequest
+type BulkResult = monitor.BulkResult
+type GroupInfo = monitor.GroupInfo
+type QueueInfo = monitor.QueueInfo
+type StatsResponse = monitor.StatsResponse
+type DailyStatsEntry = monitor.DailyStatsEntry
+type UniqueKeyResult = monitor.UniqueKeyResult
+type WorkflowAuditEntry = monitor.WorkflowAuditEntry
+type ApiError = monitor.ApiError
+
 // Re-export APIService
 func NewAPIService(s *RedisStore, disp Dispatcher, logger gochainedlog.Logger) *APIService {
 	return monitor.NewAPIService(s, disp, logger)

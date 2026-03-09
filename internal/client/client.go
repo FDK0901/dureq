@@ -447,7 +447,14 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (*types.Job, error) {
 // Uses RedisJSON's native JSONPath for efficient field extraction.
 // path is a dot-separated field path (e.g. "user_id", "order.type").
 func (c *Client) GetJobByParamJSONPath(ctx context.Context, path string, value any) (*types.Job, error) {
-	job, _, err := c.store.FindJobByPayloadPath(ctx, path, value)
+	return c.GetJobByParamJSONPathWithTaskType(ctx, path, value, "")
+}
+
+// GetJobByParamJSONPathWithTaskType finds the first job of the given task type whose Payload
+// matches the given JSONPath + value. Only scans jobs of that task type, so it is
+// significantly faster than GetJobByParamJSONPath when the task type is known.
+func (c *Client) GetJobByParamJSONPathWithTaskType(ctx context.Context, path string, value any, taskType string) (*types.Job, error) {
+	job, _, err := c.store.FindJobByPayloadPath(ctx, path, value, taskType)
 	if err != nil {
 		return nil, err
 	}

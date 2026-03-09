@@ -686,7 +686,8 @@ func (a *API) updateJobPayload(w http.ResponseWriter, r *http.Request) {
 // --- Search ---
 
 func (a *API) searchJobs(w http.ResponseWriter, r *http.Request) {
-	job, err := a.svc.SearchJobsByPayload(r.Context(), r.URL.Query().Get("path"), r.URL.Query().Get("value"))
+	q := r.URL.Query()
+	job, err := a.svc.SearchJobsByPayload(r.Context(), q.Get("path"), q.Get("value"), q.Get("task_type"))
 	if err != nil {
 		writeServiceError(w, err)
 		return

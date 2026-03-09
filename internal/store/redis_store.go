@@ -1629,20 +1629,27 @@ func (s *RedisStore) mirrorBatchPayloads(_ context.Context, batch *types.BatchIn
 
 const jsonPathSearchChunkSize = 100
 
-// FindJobByPayloadPath scans all jobs and returns the first whose Payload matches
+// FindJobByPayloadPath scans jobs and returns the first whose Payload matches
 // the given JSONPath + value. Uses RedisJSON's JSON.GET for native path extraction.
-func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, value any) (*types.Job, uint64, error) {
+// If taskType is non-empty, only jobs of that type are scanned (via the by_task_type index).
+func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, value any, taskType string) (*types.Job, uint64, error) {
 	fullPath := "$." + jsonPath
 	valueStr := fmt.Sprintf("%v", value)
 
-	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
+	// Choose scan index: narrow by task type if provided, otherwise scan all.
+	indexKey := JobsByCreatedKey(s.prefix)
+	if taskType != "" {
+		indexKey = JobsByTaskTypeKey(s.prefix, taskType)
+	}
+
+	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64()
 	if err != nil {
 		return nil, 0, fmt.Errorf("count jobs: %w", err)
 	}
 
 	for offset := int64(0); offset < total; offset += jsonPathSearchChunkSize {
 		end := offset + jsonPathSearchChunkSize - 1
-		ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(JobsByCreatedKey(s.prefix)).Start(offset).Stop(end).Build()).AsStrSlice()
+		ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(indexKey).Start(offset).Stop(end).Build()).AsStrSlice()
 		if err != nil || len(ids) == 0 {
 			break
 		}

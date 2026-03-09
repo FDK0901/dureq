@@ -664,11 +664,11 @@ func (a *APIService) GetSyncRetries() any {
 
 // ===================== Search =====================
 
-func (a *APIService) SearchJobsByPayload(ctx context.Context, path, value string) (*types.Job, error) {
+func (a *APIService) SearchJobsByPayload(ctx context.Context, path, value, taskType string) (*types.Job, error) {
 	if path == "" || value == "" {
 		return nil, &ApiError{Msg: "path and value are required", StatusCode: http.StatusBadRequest}
 	}
-	job, _, err := a.store.FindJobByPayloadPath(ctx, path, value)
+	job, _, err := a.store.FindJobByPayloadPath(ctx, path, value, taskType)
 	if err != nil {
 		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
 	}

@@ -87,6 +87,17 @@ func NewAPIService(s *RedisStore, disp Dispatcher, logger gochainedlog.Logger) *
 // Re-export store types commonly needed by users.
 type TierConfig = store.TierConfig
 
+// Re-export filter types for custom API handler composition.
+type JobFilter = store.JobFilter
+type RunFilter = store.RunFilter
+type EventFilter = store.EventFilter
+type ScheduleFilter = store.ScheduleFilter
+type WorkflowFilter = store.WorkflowFilter
+type BatchFilter = store.BatchFilter
+type StatsFilter = store.StatsFilter
+type JobStats = store.JobStats
+type AuditEntry = store.AuditEntry
+
 // Re-export client types commonly needed by users.
 type EnqueueRequest = client.EnqueueRequest
 

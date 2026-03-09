@@ -47,6 +47,8 @@ var (
 	WithShutdownTimeout       = server.WithShutdownTimeout
 )
 
+type Server = server.Server
+
 // NewServer creates a new dureq server node.
 func NewServer(opts ...server.Option) (*server.Server, error) {
 	return server.New(opts...)

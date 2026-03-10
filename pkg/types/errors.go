@@ -103,3 +103,83 @@ func GetRetryAfter(err error) time.Duration {
 	}
 	return 0
 }
+
+// --- Rich handler control flow errors ---
+
+// SkipError signals that the handler wants to skip this execution
+// without changing the job status. Useful when the handler determines
+// that preconditions are not met and the job should simply be ignored
+// for this run.
+type SkipError struct {
+	Reason string
+}
+
+func (e *SkipError) Error() string {
+	if e.Reason != "" {
+		return "skip: " + e.Reason
+	}
+	return "skip"
+}
+
+// RepeatError signals that the handler wants to save current progress
+// and immediately re-enqueue the job for another execution. This is
+// useful for long-running tasks that want to checkpoint periodically.
+type RepeatError struct {
+	Err   error
+	Delay time.Duration // optional delay before re-execution
+}
+
+func (e *RepeatError) Error() string {
+	if e.Err != nil {
+		return "repeat: " + e.Err.Error()
+	}
+	return "repeat"
+}
+
+func (e *RepeatError) Unwrap() error { return e.Err }
+
+// PauseError signals that the handler wants to pause the job.
+// The job transitions to paused status and can be resumed manually
+// or auto-resumed after RetryAfter duration.
+type PauseError struct {
+	Reason     string
+	RetryAfter time.Duration // 0 = manual resume only
+}
+
+func (e *PauseError) Error() string {
+	if e.Reason != "" {
+		return "pause: " + e.Reason
+	}
+	return "pause"
+}
+
+// ClassifyControlFlow returns the extended classification including
+// control flow errors. Returns ErrorClassRetryable for standard errors.
+func ClassifyControlFlow(err error) ErrorClassification {
+	if err == nil {
+		return ErrorClassRetryable
+	}
+
+	var skipErr *SkipError
+	if errors.As(err, &skipErr) {
+		return ErrorClassSkip
+	}
+
+	var repeatErr *RepeatError
+	if errors.As(err, &repeatErr) {
+		return ErrorClassRepeat
+	}
+
+	var pauseErr *PauseError
+	if errors.As(err, &pauseErr) {
+		return ErrorClassPause
+	}
+
+	return ClassifyError(err)
+}
+
+const (
+	ErrorClassSkip   ErrorClassification = iota + 10 // skip execution, no state change
+	ErrorClassRepeat                                  // save and re-enqueue immediately
+	ErrorClassPause                                   // pause the job
+)

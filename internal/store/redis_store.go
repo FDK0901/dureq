@@ -1946,3 +1946,61 @@ func (s *RedisStore) IsNodeDraining(ctx context.Context, nodeID string) (bool, e
 	}
 	return val == "1", nil
 }
+
+// ListPausedJobsDueForResume returns paused jobs whose ResumeAt time has passed.
+func (s *RedisStore) ListPausedJobsDueForResume(ctx context.Context, now time.Time) ([]*types.Job, error) {
+	jobs, err := s.ListJobsByStatus(ctx, types.JobStatusPaused)
+	if err != nil {
+		return nil, err
+	}
+	var due []*types.Job
+	for _, job := range jobs {
+		if job.ResumeAt != nil && !job.ResumeAt.After(now) {
+			due = append(due, job)
+		}
+	}
+	return due, nil
+}
+
+// GetJobRevision returns only the CAS revision for a job (without full deserialization).
+func (s *RedisStore) GetJobRevision(ctx context.Context, jobID string) (uint64, error) {
+	result, err := s.rdb.Do(ctx, s.rdb.B().Hget().Key(JobKey(s.prefix, jobID)).Field("_version").Build()).ToString()
+	if err != nil {
+		if rueidis.IsRedisNil(err) {
+			return 0, types.ErrJobNotFound
+		}
+		return 0, fmt.Errorf("get job revision: %w", err)
+	}
+	return parseVersion(result), nil
+}
+
+// PurgeJobData removes the payload and result data from a job while preserving
+// metadata (status, timestamps, task type, etc.). This supports GDPR
+// "right to erasure" by deleting personal data while maintaining audit trails.
+func (s *RedisStore) PurgeJobData(ctx context.Context, jobID string) error {
+	job, rev, err := s.GetJob(ctx, jobID)
+	if err != nil {
+		return err
+	}
+
+	if !job.Status.IsTerminal() {
+		return fmt.Errorf("dureq: cannot purge data for non-terminal job %s (status: %s)", jobID, job.Status)
+	}
+
+	// Clear payload and personal data fields.
+	job.Payload = nil
+	job.Headers = nil
+	job.UpdatedAt = time.Now()
+
+	if _, err := s.UpdateJob(ctx, job, rev); err != nil {
+		return fmt.Errorf("purge job data: %w", err)
+	}
+
+	// Also clear the mirrored JSON payload used for JSONPath search.
+	s.rdb.Do(ctx, s.rdb.B().Del().Key(JobPayloadKey(s.prefix, jobID)).Build())
+
+	// Clear result data.
+	s.rdb.Do(ctx, s.rdb.B().Del().Key(ResultKey(s.prefix, jobID)).Build())
+
+	return nil
+}

@@ -15,6 +15,8 @@ const (
 	EventJobRetrying   EventType = "job.retrying"
 	EventJobDead       EventType = "job.dead"
 	EventJobCancelled  EventType = "job.cancelled"
+	EventJobPaused     EventType = "job.paused"
+	EventJobResumed    EventType = "job.resumed"
 
 	EventNodeJoined    EventType = "node.joined"
 	EventNodeLeft      EventType = "node.left"
@@ -50,7 +52,15 @@ const (
 	EventNodeCrashDetected         EventType = "node.crash_detected"
 	EventJobAutoRecovered          EventType = "job.auto_recovered"
 
-	EventWorkflowSignalReceived EventType = "workflow.signal.received"
+	EventWorkflowSignalReceived    EventType = "workflow.signal.received"
+	EventWorkflowTaskPanicked      EventType = "workflow.task.panicked"
+
+	EventWorkflowSuspended       EventType = "workflow.suspended"
+	EventWorkflowResumed         EventType = "workflow.resumed"
+
+	EventWorkflowHookDispatched  EventType = "workflow.hook.dispatched"
+	EventWorkflowHookCompleted   EventType = "workflow.hook.completed"
+	EventWorkflowHookFailed      EventType = "workflow.hook.failed"
 )
 
 // JobEvent is the envelope published to the DUREQ_EVENTS stream.

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/internal/workflow"
 	"github.com/FDK0901/dureq/pkg/types"
 	gochainedlog "github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
@@ -291,6 +292,92 @@ func (a *APIService) GetWorkflow(ctx context.Context, wfID string) (*types.Workf
 		return nil, &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
 	return wf, nil
+}
+
+// ValidateResult holds the result of a workflow definition validation.
+type ValidateResult struct {
+	Valid  bool     `json:"valid"`
+	Errors []string `json:"errors,omitempty"`
+}
+
+func (a *APIService) ValidateWorkflowDefinition(_ context.Context, def *types.WorkflowDefinition) *ValidateResult {
+	if err := workflow.ValidateDAG(def); err != nil {
+		return &ValidateResult{Valid: false, Errors: []string{err.Error()}}
+	}
+	return &ValidateResult{Valid: true}
+}
+
+func (a *APIService) SuspendWorkflow(ctx context.Context, wfID string) error {
+	const maxCASRetries = 5
+	for attempt := 0; attempt < maxCASRetries; attempt++ {
+		wf, rev, err := a.store.GetWorkflow(ctx, wfID)
+		if err != nil {
+			return &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+		}
+		if wf.Status != types.WorkflowStatusRunning {
+			return &ApiError{Msg: "can only suspend running workflows", StatusCode: http.StatusBadRequest}
+		}
+		now := time.Now()
+		wf.Status = types.WorkflowStatusSuspended
+		wf.UpdatedAt = now
+		if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+			if attempt < maxCASRetries-1 {
+				continue
+			}
+			return err
+		}
+		a.dispatcher.PublishEvent(types.JobEvent{
+			Type: types.EventWorkflowSuspended, JobID: wfID, Timestamp: now,
+		})
+		return nil
+	}
+	return fmt.Errorf("suspend workflow: max CAS retries exceeded")
+}
+
+func (a *APIService) ResumeWorkflow(ctx context.Context, wfID string) error {
+	const maxCASRetries = 5
+	for attempt := 0; attempt < maxCASRetries; attempt++ {
+		wf, rev, err := a.store.GetWorkflow(ctx, wfID)
+		if err != nil {
+			return &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+		}
+		if wf.Status != types.WorkflowStatusSuspended {
+			return &ApiError{Msg: "can only resume suspended workflows", StatusCode: http.StatusBadRequest}
+		}
+		now := time.Now()
+		wf.Status = types.WorkflowStatusRunning
+		wf.UpdatedAt = now
+		if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+			if attempt < maxCASRetries-1 {
+				continue
+			}
+			return err
+		}
+		a.dispatcher.PublishEvent(types.JobEvent{
+			Type: types.EventWorkflowResumed, JobID: wfID, Timestamp: now,
+		})
+		return nil
+	}
+	return fmt.Errorf("resume workflow: max CAS retries exceeded")
+}
+
+func (a *APIService) GetWorkflowTaskResult(ctx context.Context, wfID, taskName string) (json.RawMessage, error) {
+	wf, _, err := a.store.GetWorkflow(ctx, wfID)
+	if err != nil {
+		return nil, &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	state, ok := wf.Tasks[taskName]
+	if !ok {
+		return nil, &ApiError{Msg: "task not found: " + taskName, StatusCode: http.StatusNotFound}
+	}
+	if state.JobID == "" {
+		return nil, &ApiError{Msg: "task has no job ID (not yet dispatched)", StatusCode: http.StatusNotFound}
+	}
+	result, err := a.store.GetResult(ctx, state.JobID)
+	if err != nil {
+		return nil, &ApiError{Msg: "result not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	return result.Output, nil
 }
 
 func (a *APIService) CancelWorkflow(ctx context.Context, wfID string) error {
@@ -587,10 +674,14 @@ func (a *APIService) ResumeQueue(ctx context.Context, tierName string) error {
 
 // StatsResponse holds overall system statistics.
 type StatsResponse struct {
-	JobCounts       map[types.JobStatus]int `json:"job_counts"`
-	ActiveSchedules int                     `json:"active_schedules"`
-	ActiveRuns      int                     `json:"active_runs"`
-	ActiveNodes     int                     `json:"active_nodes"`
+	JobCounts       map[types.JobStatus]int        `json:"job_counts"`
+	ActiveSchedules int                            `json:"active_schedules"`
+	ActiveRuns      int                            `json:"active_runs"`
+	ActiveNodes     int                            `json:"active_nodes"`
+	WorkflowCounts  map[types.WorkflowStatus]int   `json:"workflow_counts,omitempty"`
+	BatchCounts     map[types.WorkflowStatus]int   `json:"batch_counts,omitempty"`
+	ActiveWorkflows int                            `json:"active_workflows"`
+	ActiveBatches   int                            `json:"active_batches"`
 }
 
 func (a *APIService) GetStats(ctx context.Context) (*StatsResponse, error) {
@@ -603,11 +694,43 @@ func (a *APIService) GetStats(ctx context.Context) (*StatsResponse, error) {
 	runs, _ := a.store.ListRuns(ctx)
 	nodes, _ := a.store.ListNodes(ctx)
 
+	// Count workflows by status.
+	workflowCounts := make(map[types.WorkflowStatus]int)
+	activeWorkflows := 0
+	for _, status := range []types.WorkflowStatus{types.WorkflowStatusPending, types.WorkflowStatusRunning, types.WorkflowStatusCompleted, types.WorkflowStatusFailed, types.WorkflowStatusCancelled, types.WorkflowStatusSuspended} {
+		s := status
+		_, total, _ := a.store.ListWorkflowInstances(ctx, store.WorkflowFilter{Status: &s, Limit: 0})
+		if total > 0 {
+			workflowCounts[status] = total
+		}
+		if status == types.WorkflowStatusRunning {
+			activeWorkflows = total
+		}
+	}
+
+	// Count batches by status.
+	batchCounts := make(map[types.WorkflowStatus]int)
+	activeBatches := 0
+	for _, status := range []types.WorkflowStatus{types.WorkflowStatusPending, types.WorkflowStatusRunning, types.WorkflowStatusCompleted, types.WorkflowStatusFailed, types.WorkflowStatusCancelled} {
+		s := status
+		_, total, _ := a.store.ListBatchInstances(ctx, store.BatchFilter{Status: &s, Limit: 0})
+		if total > 0 {
+			batchCounts[status] = total
+		}
+		if status == types.WorkflowStatusRunning {
+			activeBatches = total
+		}
+	}
+
 	return &StatsResponse{
 		JobCounts:       jobCounts,
 		ActiveSchedules: len(schedules),
 		ActiveRuns:      len(runs),
 		ActiveNodes:     len(nodes),
+		WorkflowCounts:  workflowCounts,
+		BatchCounts:     batchCounts,
+		ActiveWorkflows: activeWorkflows,
+		ActiveBatches:   activeBatches,
 	}, nil
 }
 

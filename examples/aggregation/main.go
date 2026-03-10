@@ -76,7 +76,7 @@ func main() {
 	)
 
 	srv, err := dureq.NewServer(
-		dureq.WithRedisURL("redis://localhost:6379"),
+		dureq.WithRedisURL("redis://localhost:6381"),
 		dureq.WithRedisDB(15),
 		dureq.WithRedisPassword("your-password"),
 		dureq.WithNodeID("aggregation-demo-node-1"),
@@ -135,7 +135,7 @@ func main() {
 	time.Sleep(2 * time.Second) // wait for leader election
 
 	cl, err := dureq.NewClient(
-		dureq.WithClientRedisURL("redis://localhost:6379"),
+		dureq.WithClientRedisURL("redis://localhost:6381"),
 		dureq.WithClientRedisPassword("your-password"),
 		dureq.WithClientRedisDB(15),
 	)

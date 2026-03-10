@@ -23,7 +23,7 @@ func getTestRedis(t *testing.T) rueidis.Client {
 
 	addr := os.Getenv("REDIS_URL")
 	if addr == "" {
-		addr = "localhost:6379"
+		addr = "localhost:6381"
 	}
 	password := os.Getenv("REDIS_PASSWORD")
 	selectDB := 15

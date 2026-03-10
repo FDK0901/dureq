@@ -120,7 +120,7 @@ func (s *Scheduler) tickLoop(ctx context.Context) {
 	}
 }
 
-// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs.
+// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs and paused jobs.
 func (s *Scheduler) tick(ctx context.Context) {
 	now := time.Now()
 
@@ -138,6 +138,50 @@ func (s *Scheduler) tick(ctx context.Context) {
 	if s.orphanInterval > 0 && now.Sub(s.lastOrphanCheck) >= s.orphanInterval {
 		s.lastOrphanCheck = now
 		s.checkOrphanedRuns(ctx)
+		s.resumePausedJobs(ctx, now)
+	}
+}
+
+// resumePausedJobs scans for paused jobs whose ResumeAt has passed and transitions them back to retrying.
+func (s *Scheduler) resumePausedJobs(ctx context.Context, now time.Time) {
+	jobs, err := s.store.ListPausedJobsDueForResume(ctx, now)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.logger.Error().Err(err).Msg("scheduler: failed to list paused jobs for auto-resume")
+		}
+		return
+	}
+
+	for _, job := range jobs {
+		rev, err := s.store.GetJobRevision(ctx, job.ID)
+		if err != nil {
+			continue
+		}
+
+		job.Status = types.JobStatusRetrying
+		job.PausedAt = nil
+		job.ResumeAt = nil
+		job.ConsecutiveErrors = 0
+		job.UpdatedAt = now
+
+		if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+			s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: failed to resume paused job")
+			continue
+		}
+
+		if err := s.dispatcher.Dispatch(ctx, job, job.Attempt); err != nil {
+			s.logger.Error().String("job_id", job.ID).Err(err).Msg("scheduler: failed to dispatch resumed job")
+			continue
+		}
+
+		s.dispatcher.PublishEvent(types.JobEvent{
+			Type:      types.EventJobResumed,
+			JobID:     job.ID,
+			TaskType:  job.TaskType,
+			Timestamp: now,
+		})
+
+		s.logger.Info().String("job_id", job.ID).Msg("scheduler: auto-resumed paused job")
 	}
 }
 

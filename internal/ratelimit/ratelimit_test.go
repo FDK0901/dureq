@@ -11,7 +11,7 @@ import (
 func newTestClient(t *testing.T) rueidis.Client {
 	t.Helper()
 	client, err := rueidis.NewClient(rueidis.ClientOption{
-		InitAddress: []string{"localhost:6379"},
+		InitAddress: []string{"localhost:6381"},
 		SelectDB:    15,
 		Password:    "your-password",
 	})

@@ -425,6 +425,45 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// ResumeJob manually resumes a paused job. The job transitions back to retrying
+// and is immediately dispatched for execution.
+func (c *Client) ResumeJob(ctx context.Context, jobID string) error {
+	job, rev, err := c.store.GetJob(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("get job: %w", err)
+	}
+
+	if job.Status != types.JobStatusPaused {
+		return fmt.Errorf("job %s is in state %s, not paused", jobID, job.Status)
+	}
+
+	now := time.Now()
+	job.Status = types.JobStatusRetrying
+	job.PausedAt = nil
+	job.ResumeAt = nil
+	job.ConsecutiveErrors = 0
+	job.UpdatedAt = now
+
+	newRev, err := c.store.UpdateJob(ctx, job, rev)
+	if err != nil {
+		return fmt.Errorf("update job: %w", err)
+	}
+
+	if err := c.dispatchJob(ctx, job); err != nil {
+		job.Status = types.JobStatusPaused
+		job.UpdatedAt = time.Now()
+		c.store.UpdateJob(ctx, job, newRev)
+		return fmt.Errorf("dispatch: %w", err)
+	}
+
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventJobResumed,
+		JobID:     jobID,
+		Timestamp: now,
+	})
+	return nil
+}
+
 // Status queries the current status of a job.
 func (c *Client) Status(ctx context.Context, jobID string) (*types.Job, error) {
 	job, _, err := c.store.GetJob(ctx, jobID)
@@ -509,6 +548,9 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+
+	// Initialize reference counting for dependency resolution.
+	workflow.InitPendingDeps(wf)
 
 	// Set deadline if execution timeout is configured.
 	if def.ExecutionTimeout != nil {

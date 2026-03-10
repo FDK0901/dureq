@@ -292,17 +292,35 @@ func (g *GRPCServer) GetDailyStats(ctx context.Context, req *pb.GetDailyStatsReq
 
 // GetRedisInfo returns parsed Redis INFO output organized by section.
 func (g *GRPCServer) GetRedisInfo(ctx context.Context, req *pb.GetRedisInfoRequest) (*pb.GetRedisInfoResponse, error) {
-	sections, err := g.svc.GetRedisInfo(ctx, req.GetSection())
+	resp, err := g.svc.GetRedisInfo(ctx, req.GetSection())
 	if err != nil {
 		return nil, toGRPCError(err)
 	}
 
-	out := make(map[string]*pb.RedisInfoSection, len(sections))
-	for name, entries := range sections {
-		out[name] = &pb.RedisInfoSection{Entries: entries}
+	pbNodes := make([]*pb.RedisNodeInfo, 0, len(resp.Nodes))
+	for _, node := range resp.Nodes {
+		pbSections := make(map[string]*pb.RedisInfoSection, len(node.Sections))
+		for name, entries := range node.Sections {
+			pbSections[name] = &pb.RedisInfoSection{Entries: entries}
+		}
+		pbNodes = append(pbNodes, &pb.RedisNodeInfo{
+			Addr:     node.Addr,
+			Role:     node.Role,
+			Sections: pbSections,
+		})
 	}
 
-	return &pb.GetRedisInfoResponse{Sections: out}, nil
+	// Backward compat: populate top-level sections from first node.
+	var legacySections map[string]*pb.RedisInfoSection
+	if len(pbNodes) > 0 {
+		legacySections = pbNodes[0].Sections
+	}
+
+	return &pb.GetRedisInfoResponse{
+		Mode:     resp.Mode,
+		Nodes:    pbNodes,
+		Sections: legacySections,
+	}, nil
 }
 
 // GetSyncRetries returns the current SyncRetrier statistics as an opaque JSON blob.

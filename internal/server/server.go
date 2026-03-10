@@ -369,6 +369,7 @@ func (s *Server) createRedisClient() (rueidis.Client, error) {
 		sc := ropts.SentinelConfig
 		opt := rueidis.ClientOption{
 			InitAddress: sc.SentinelAddrs,
+			Username:    ropts.Username,
 			Password:    ropts.Password,
 			SelectDB:    ropts.DB,
 			Sentinel: rueidis.SentinelOption{
@@ -388,6 +389,7 @@ func (s *Server) createRedisClient() (rueidis.Client, error) {
 	if len(ropts.ClusterAddrs) > 0 {
 		opt := rueidis.ClientOption{
 			InitAddress:      ropts.ClusterAddrs,
+			Username:         ropts.Username,
 			Password:         ropts.Password,
 			BlockingPoolSize: max(ropts.PoolSize, 10),
 		}
@@ -413,7 +415,12 @@ func (s *Server) createRedisClient() (rueidis.Client, error) {
 		BlockingPoolSize: max(ropts.PoolSize, 10),
 	}
 
-	// Password from URL or option.
+	// Username + Password from URL or option.
+	if ropts.Username != "" {
+		opt.Username = ropts.Username
+	} else if u.User != nil {
+		opt.Username = u.User.Username()
+	}
 	if ropts.Password != "" {
 		opt.Password = ropts.Password
 	} else if u.User != nil {

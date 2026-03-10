@@ -11,9 +11,11 @@ import (
 func newTestClient(t *testing.T) rueidis.Client {
 	t.Helper()
 	client, err := rueidis.NewClient(rueidis.ClientOption{
-		InitAddress: []string{"localhost:6381"},
-		SelectDB:    15,
-		Password:    "your-password",
+		InitAddress: []string{
+			"localhost:7001", "localhost:7002", "localhost:7003",
+			"localhost:7004", "localhost:7005", "localhost:7006",
+		},
+		Password: "your-password",
 	})
 	if err != nil {
 		t.Fatalf("failed to connect to Redis: %v", err)

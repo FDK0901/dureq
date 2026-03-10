@@ -111,6 +111,11 @@ func WithRedisURL(url string) Option {
 	return func(c *Config) { c.RedisOptions.URL = url }
 }
 
+// WithRedisUsername sets the Redis ACL username (Redis 6+).
+func WithRedisUsername(username string) Option {
+	return func(c *Config) { c.RedisOptions.Username = username }
+}
+
 // WithRedisPassword sets the Redis password.
 func WithRedisPassword(password string) Option {
 	return func(c *Config) { c.RedisOptions.Password = password }

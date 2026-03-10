@@ -30,6 +30,7 @@ type Option func(*clientConfig)
 
 type clientConfig struct {
 	redisURL      string
+	redisUsername string
 	redisPassword string
 	redisDB       int
 	redisPoolSize int
@@ -44,6 +45,11 @@ type clientConfig struct {
 // WithRedisURL sets the Redis server URL.
 func WithRedisURL(url string) Option {
 	return func(c *clientConfig) { c.redisURL = url }
+}
+
+// WithRedisUsername sets the Redis ACL username (Redis 6+).
+func WithRedisUsername(username string) Option {
+	return func(c *clientConfig) { c.redisUsername = username }
 }
 
 // WithRedisPassword sets the Redis password.
@@ -110,6 +116,7 @@ func New(opts ...Option) (*Client, error) {
 	} else if len(cfg.clusterAddrs) > 0 {
 		opt := rueidis.ClientOption{
 			InitAddress:      cfg.clusterAddrs,
+			Username:         cfg.redisUsername,
 			Password:         cfg.redisPassword,
 			BlockingPoolSize: max(cfg.redisPoolSize, 10),
 		}
@@ -132,6 +139,11 @@ func New(opts ...Option) (*Client, error) {
 			InitAddress:      []string{addr},
 			SelectDB:         cfg.redisDB,
 			BlockingPoolSize: max(cfg.redisPoolSize, 10),
+		}
+		if cfg.redisUsername != "" {
+			opt.Username = cfg.redisUsername
+		} else if u.User != nil {
+			opt.Username = u.User.Username()
 		}
 		if cfg.redisPassword != "" {
 			opt.Password = cfg.redisPassword

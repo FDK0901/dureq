@@ -765,17 +765,71 @@ func (a *APIService) GetDailyStats(ctx context.Context, days int) ([]DailyStatsE
 	return result, nil
 }
 
-func (a *APIService) GetRedisInfo(ctx context.Context, section string) (map[string]map[string]string, error) {
+// RedisNodeInfo holds parsed INFO output for a single Redis node.
+type RedisNodeInfo struct {
+	Addr     string                       `json:"addr"`
+	Role     string                       `json:"role"`
+	Sections map[string]map[string]string `json:"sections"`
+}
+
+// RedisInfoResponse holds Redis INFO for all nodes with mode indicator.
+type RedisInfoResponse struct {
+	Mode  string          `json:"mode"` // "cluster" or "standalone"
+	Nodes []RedisNodeInfo `json:"nodes"`
+}
+
+func (a *APIService) GetRedisInfo(ctx context.Context, section string) (*RedisInfoResponse, error) {
 	if section == "" {
 		section = "all"
 	}
 
-	info, err := a.store.Client().Do(ctx, a.store.Client().B().Info().Section(section).Build()).ToString()
+	rdb := a.store.Client()
+	nodes := rdb.Nodes()
+
+	// Cluster mode: query each node individually.
+	if len(nodes) > 0 {
+		resp := &RedisInfoResponse{Mode: "cluster"}
+		for addr, node := range nodes {
+			info, err := node.Do(ctx, node.B().Info().Section(section).Build()).ToString()
+			if err != nil {
+				continue // skip unreachable nodes
+			}
+			sections := store.ParseRedisInfo(info)
+			role := "unknown"
+			if repl, ok := sections["replication"]; ok {
+				if r, ok := repl["role"]; ok {
+					role = r
+				}
+			}
+			resp.Nodes = append(resp.Nodes, RedisNodeInfo{
+				Addr:     addr,
+				Role:     role,
+				Sections: sections,
+			})
+		}
+		return resp, nil
+	}
+
+	// Standalone mode: single node.
+	info, err := rdb.Do(ctx, rdb.B().Info().Section(section).Build()).ToString()
 	if err != nil {
 		return nil, err
 	}
-
-	return store.ParseRedisInfo(info), nil
+	sections := store.ParseRedisInfo(info)
+	role := "standalone"
+	if repl, ok := sections["replication"]; ok {
+		if r, ok := repl["role"]; ok {
+			role = r
+		}
+	}
+	return &RedisInfoResponse{
+		Mode: "standalone",
+		Nodes: []RedisNodeInfo{{
+			Addr:     "local",
+			Role:     role,
+			Sections: sections,
+		}},
+	}, nil
 }
 
 func (a *APIService) GetSyncRetries() any {

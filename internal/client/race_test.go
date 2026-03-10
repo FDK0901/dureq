@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,25 +18,34 @@ import (
 )
 
 // getTestRedis creates a Redis client for testing.
-// Skips if REDIS_URL is not set or Redis is unreachable.
+// Supports Redis Cluster via REDIS_CLUSTER_ADDRS env var (comma-separated).
+// Falls back to standalone via REDIS_URL. Skips if Redis is unreachable.
 func getTestRedis(t *testing.T) rueidis.Client {
 	t.Helper()
 
-	addr := os.Getenv("REDIS_URL")
-	if addr == "" {
-		addr = "localhost:6381"
-	}
-	password := os.Getenv("REDIS_PASSWORD")
-	selectDB := 15
-	if dbStr := os.Getenv("REDIS_DB"); dbStr != "" {
-		fmt.Sscanf(dbStr, "%d", &selectDB)
+	var opt rueidis.ClientOption
+
+	if clusterEnv := os.Getenv("REDIS_CLUSTER_ADDRS"); clusterEnv != "" {
+		opt = rueidis.ClientOption{
+			InitAddress: strings.Split(clusterEnv, ","),
+			Password:    os.Getenv("REDIS_PASSWORD"),
+		}
+	} else {
+		addr := os.Getenv("REDIS_URL")
+		if addr == "" {
+			addr = "localhost:7001"
+		}
+		password := os.Getenv("REDIS_PASSWORD")
+		if password == "" {
+			password = "your-password"
+		}
+		opt = rueidis.ClientOption{
+			InitAddress: []string{addr},
+			Password:    password,
+		}
 	}
 
-	rdb, err := rueidis.NewClient(rueidis.ClientOption{
-		InitAddress: []string{addr},
-		Password:    password,
-		SelectDB:    selectDB,
-	})
+	rdb, err := rueidis.NewClient(opt)
 	if err != nil {
 		t.Skipf("redis unavailable: %v", err)
 	}

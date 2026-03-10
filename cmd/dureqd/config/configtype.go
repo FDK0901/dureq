@@ -14,8 +14,10 @@ type DureqdConfig struct {
 }
 
 type RedisConfig struct {
-	URL      string `koanf:"url"`
-	Password string `koanf:"password"`
-	DB       int    `koanf:"db"`
-	PoolSize int    `koanf:"poolSize"`
+	URL          string   `koanf:"url"`
+	ClusterAddrs []string `koanf:"clusterAddrs"`
+	Username     string   `koanf:"username"`
+	Password     string   `koanf:"password"`
+	DB           int      `koanf:"db"`
+	PoolSize     int      `koanf:"poolSize"`
 }

@@ -3,9 +3,10 @@ genproto:
 
 test-up:
 	docker compose up -d --wait
+	@echo "Redis Cluster is ready (3 masters + 3 replicas)."
 
 test-down:
-	docker compose down
+	docker compose down -v
 
 test: test-up
 	go test -v -count=1 -timeout=300s ./tests/integration/

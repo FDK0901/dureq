@@ -114,10 +114,8 @@ func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) err
 		return fmt.Errorf("marshal event: %w", err)
 	}
 
-	cmds := make(rueidis.Commands, 0, 4)
-
-	// Pub/Sub for real-time subscribers (orchestrator, clients).
-	cmds = append(cmds, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(data)).Build())
+	// Slot-targeted commands (XADD, ZADD) — safe for cluster DoMulti.
+	cmds := make(rueidis.Commands, 0, 2)
 
 	// Append to durable event stream for history replay.
 	cmds = append(cmds, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
@@ -130,11 +128,6 @@ func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) err
 		FieldValue("data", string(data)).
 		Build())
 
-	// Batch-specific channel for batch progress subscribers.
-	if event.BatchProgress != nil {
-		cmds = append(cmds, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, event.BatchProgress.BatchID)).Message(string(data)).Build())
-	}
-
 	// Per-workflow event index: index workflow-related events by workflow ID.
 	if event.JobID != "" && isWorkflowEventType(event.Type) {
 		score := float64(event.Timestamp.UnixNano()) / 1e9
@@ -146,6 +139,12 @@ func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) err
 		if err := resp.Error(); err != nil {
 			return err
 		}
+	}
+
+	// Pub/Sub (no-slot) — must be sent separately for Redis Cluster compatibility.
+	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(data)).Build())
+	if event.BatchProgress != nil {
+		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, event.BatchProgress.BatchID)).Message(string(data)).Build())
 	}
 	return nil
 }
@@ -182,20 +181,19 @@ func (s *RedisStore) PublishResult(ctx context.Context, result types.WorkResult)
 
 	resultKey := ResultKey(s.prefix, result.JobID)
 
-	cmds := make(rueidis.Commands, 0, 3)
-
-	// Store result as hash with TTL.
+	// Slot-targeted commands.
+	cmds := make(rueidis.Commands, 0, 2)
 	cmds = append(cmds, s.rdb.B().Hset().Key(resultKey).FieldValue().FieldValue("data", string(data)).Build())
 	cmds = append(cmds, s.rdb.B().Expire().Key(resultKey).Seconds(int64(s.cfg.ResultTTL.Seconds())).Build())
-
-	// Notify via Pub/Sub for EnqueueAndWait clients.
-	cmds = append(cmds, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, result.JobID)).Message(string(data)).Build())
 
 	for _, resp := range s.rdb.DoMulti(ctx, cmds...) {
 		if err := resp.Error(); err != nil {
 			return err
 		}
 	}
+
+	// Pub/Sub notify (no-slot) — separate for cluster compatibility.
+	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, result.JobID)).Message(string(data)).Build())
 	return nil
 }
 
@@ -231,7 +229,9 @@ type CompletionBatch struct {
 }
 
 // CompleteRun performs SaveRun + SaveJobRun + DeleteRun + IncrDailyStat +
-// PublishEvent + PublishResult + AckMessage in a single Redis pipeline.
+// PublishEvent + PublishResult + AckMessage.
+// Slot-targeted commands are pipelined via DoMulti; PUBLISH (no-slot)
+// commands are sent separately for Redis Cluster compatibility.
 func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) error {
 	runData, err := sonic.ConfigFastest.Marshal(batch.Run)
 	if err != nil {
@@ -246,7 +246,7 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 		return fmt.Errorf("marshal result: %w", err)
 	}
 
-	cmds := make(rueidis.Commands, 0, 28)
+	cmds := make(rueidis.Commands, 0, 24)
 
 	// 1. SaveRun (terminal status)
 	cmds = append(cmds, s.rdb.B().Hset().Key(RunKey(s.prefix, batch.Run.ID)).FieldValue().FieldValue("data", string(runData)).Build())
@@ -274,8 +274,7 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 	cmds = append(cmds, s.rdb.B().Hincrby().Key(statsKey).Field(batch.DailyStatField).Increment(1).Build())
 	cmds = append(cmds, s.rdb.B().Expire().Key(statsKey).Seconds(int64((91 * 24 * time.Hour).Seconds())).Build())
 
-	// 5. PublishEvent — Pub/Sub + event stream
-	cmds = append(cmds, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(eventData)).Build())
+	// 5. Event stream (slot-targeted)
 	cmds = append(cmds, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
 		Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.EventStreamMaxLen, 10)).
 		Id("*").FieldValue().
@@ -285,15 +284,11 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 		FieldValue("node_id", batch.Event.NodeID).
 		FieldValue("data", string(eventData)).
 		Build())
-	if batch.Event.BatchProgress != nil {
-		cmds = append(cmds, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, batch.Event.BatchProgress.BatchID)).Message(string(eventData)).Build())
-	}
 
-	// 6. PublishResult — hash + TTL + notify
+	// 6. Result hash + TTL (slot-targeted)
 	resultKey := ResultKey(s.prefix, batch.Result.JobID)
 	cmds = append(cmds, s.rdb.B().Hset().Key(resultKey).FieldValue().FieldValue("data", string(resultData)).Build())
 	cmds = append(cmds, s.rdb.B().Expire().Key(resultKey).Seconds(int64(s.cfg.ResultTTL.Seconds())).Build())
-	cmds = append(cmds, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, batch.Result.JobID)).Message(string(resultData)).Build())
 
 	// 7. AckMessage (v1 only — stream message acknowledgment)
 	if batch.AckTierName != "" && batch.AckMessageID != "" {
@@ -305,6 +300,14 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 			return fmt.Errorf("complete run pipeline: %w", err)
 		}
 	}
+
+	// Pub/Sub notifications (no-slot) — sent separately for cluster compatibility.
+	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(eventData)).Build())
+	if batch.Event.BatchProgress != nil {
+		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, batch.Event.BatchProgress.BatchID)).Message(string(eventData)).Build())
+	}
+	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, batch.Result.JobID)).Message(string(resultData)).Build())
+
 	return nil
 }
 

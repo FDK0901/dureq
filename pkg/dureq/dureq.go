@@ -28,6 +28,7 @@ import (
 // Server options — re-export from internal/server.
 var (
 	WithRedisURL              = server.WithRedisURL
+	WithRedisUsername         = server.WithRedisUsername
 	WithRedisPassword         = server.WithRedisPassword
 	WithRedisDB               = server.WithRedisDB
 	WithRedisPoolSize         = server.WithRedisPoolSize
@@ -57,6 +58,7 @@ func NewServer(opts ...server.Option) (*server.Server, error) {
 // Client options — re-export from pkg/client.
 var (
 	WithClientRedisURL      = client.WithRedisURL
+	WithClientRedisUsername = client.WithRedisUsername
 	WithClientRedisPassword = client.WithRedisPassword
 	WithClientRedisDB       = client.WithRedisDB
 	WithClientRedisPoolSize = client.WithRedisPoolSize

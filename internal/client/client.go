@@ -692,6 +692,10 @@ func (c *Client) CancelWorkflow(ctx context.Context, workflowID string) error {
 					}
 					c.signalCancelActiveRuns(ctx, state.JobID)
 				}
+				// Recursively cancel child workflows spawned by this task.
+				if state.ChildWorkflowID != "" {
+					c.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+				}
 			}
 		}
 
@@ -718,6 +722,9 @@ func (c *Client) RetryWorkflow(ctx context.Context, workflowID string) (*types.W
 	wf, rev, err := c.store.GetWorkflow(ctx, workflowID)
 	if err != nil {
 		return nil, err
+	}
+	if !wf.Status.IsTerminal() {
+		return nil, fmt.Errorf("cannot retry: workflow is %s", wf.Status)
 	}
 
 	now := time.Now()
@@ -859,6 +866,21 @@ func (c *Client) CancelBatch(ctx context.Context, batchID string) error {
 				}
 			}
 		}
+		// Cancel onetime task if still running.
+		if batch.OnetimeState != nil && !batch.OnetimeState.Status.IsTerminal() {
+			if batch.OnetimeState.JobID != "" {
+				if childJob, childRev, err := c.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+					if !childJob.Status.IsTerminal() {
+						childJob.Status = types.JobStatusCancelled
+						childJob.UpdatedAt = now
+						c.store.UpdateJob(ctx, childJob, childRev)
+					}
+				}
+				c.signalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+			}
+			batch.OnetimeState.Status = types.JobStatusCancelled
+			batch.OnetimeState.FinishedAt = &now
+		}
 
 		if _, err := c.store.UpdateBatch(ctx, batch, rev); err != nil {
 			if attempt < maxCASRetries-1 {
@@ -882,6 +904,9 @@ func (c *Client) RetryBatch(ctx context.Context, batchID string, retryFailedOnly
 	batch, rev, err := c.store.GetBatch(ctx, batchID)
 	if err != nil {
 		return nil, err
+	}
+	if !batch.Status.IsTerminal() {
+		return nil, fmt.Errorf("cannot retry: batch is %s", batch.Status)
 	}
 
 	now := time.Now()
@@ -1102,6 +1127,35 @@ func (c *Client) signalCancelActiveRuns(ctx context.Context, jobID string) {
 	for _, run := range runs {
 		c.rdb.Do(ctx, c.rdb.B().Publish().Channel(c.store.CancelChannel()).Message(run.ID).Build())
 	}
+}
+
+// cancelChildWorkflow recursively cancels a child workflow and all its tasks.
+func (c *Client) cancelChildWorkflow(ctx context.Context, childWfID string) {
+	childWf, rev, err := c.store.GetWorkflow(ctx, childWfID)
+	if err != nil || childWf.Status.IsTerminal() {
+		return
+	}
+
+	now := time.Now()
+	childWf.Status = types.WorkflowStatusCancelled
+	childWf.CompletedAt = &now
+	childWf.UpdatedAt = now
+
+	for name, state := range childWf.Tasks {
+		if !state.Status.IsTerminal() {
+			if state.JobID != "" {
+				c.signalCancelActiveRuns(ctx, state.JobID)
+			}
+			if state.ChildWorkflowID != "" {
+				c.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+			}
+			state.Status = types.JobStatusCancelled
+			state.FinishedAt = &now
+			childWf.Tasks[name] = state
+		}
+	}
+
+	c.store.UpdateWorkflow(ctx, childWf, rev)
 }
 
 func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowInstance, taskName string, now *time.Time) {

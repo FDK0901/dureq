@@ -238,7 +238,9 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 			case types.OverlapReplace:
 				s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: cancelling active runs for REPLACE overlap")
 				s.cancelActiveRunsForJob(ctx, entry.JobID)
-				// Fall through to dispatch the new run.
+				// NOTE: cancel is async (pub/sub signal). A short overlap window is
+				// possible until the worker processes the cancellation. This is
+				// best-effort by design — a synchronous wait would block the scheduler tick.
 			}
 		}
 	}
@@ -389,6 +391,9 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 	// Pre-fetch per-job heartbeat timeouts to avoid N×GetJob calls.
 	jobTimeouts := make(map[string]time.Duration)
 
+	// Track dead nodes to clean up their drain keys (persistent since TTL was removed).
+	deadNodes := make(map[string]struct{})
+
 	for _, run := range runs {
 		// Only check non-terminal runs.
 		if run.Status.IsTerminal() {
@@ -433,6 +438,7 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 		}
 
 		// This run is orphaned.
+		deadNodes[run.NodeID] = struct{}{}
 		errMsg := "node " + run.NodeID + " crashed or became unresponsive"
 		s.logger.Warn().String("run_id", run.ID).String("job_id", run.JobID).String("node_id", run.NodeID).Msg("scheduler: detected orphaned run")
 
@@ -441,6 +447,8 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 		run.FinishedAt = &now
 		run.Duration = now.Sub(run.StartedAt)
 		s.store.SaveRun(ctx, run)
+		// Record in run history before removing from active set.
+		s.store.SaveJobRun(ctx, run)
 
 		// Load the parent job.
 		job, rev, err := s.store.GetJob(ctx, run.JobID)
@@ -534,6 +542,11 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 
 		// Clean up the orphaned run entry.
 		s.store.DeleteRun(ctx, run.ID)
+	}
+
+	// Clean up persistent drain keys for dead nodes.
+	for nodeID := range deadNodes {
+		s.store.SetNodeDrain(ctx, nodeID, false)
 	}
 }
 

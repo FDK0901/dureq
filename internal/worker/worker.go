@@ -261,7 +261,10 @@ func (w *Worker) priorityFetchLoop() {
 			if tier.RateLimit > 0 {
 				burst := tier.RateBurst
 				if burst <= 0 {
-					burst = int(tier.RateLimit)
+					burst = int(math.Ceil(tier.RateLimit))
+					if burst < 1 {
+						burst = 1
+					}
 				}
 				allowed, err := w.rateLimiter.Allow(w.ctx, tier.Name, batchSize, ratelimit.Config{
 					MaxTokens:  burst,
@@ -464,17 +467,20 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	// Look up handler.
 	def, ok := w.registry.Get(work.TaskType)
 	if !ok {
-		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		// Requeue/DLQ BEFORE ACK to prevent message loss if requeue fails.
 		if sm.Redeliveries >= maxRedeliveries {
 			if w.clusterHasTaskType(work.TaskType) {
 				w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0)
+				w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 				return
 			}
 			w.logger.Warn().String("task_type", string(work.TaskType)).Int("redeliveries", sm.Redeliveries).Msg("worker: no handler in cluster, sending to DLQ")
 			w.disp.DispatchToDLQ(w.ctx, &types.Job{ID: work.JobID, TaskType: work.TaskType, Payload: work.Payload}, "no handler registered for task type: "+string(work.TaskType))
+			w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 			return
 		}
 		w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1)
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		return
 	}
 
@@ -487,8 +493,9 @@ func (w *Worker) processMessage(sm *streamMessage) {
 			String("handler_version", def.Version).
 			String("msg_version", work.Version).
 			Msg("worker: version mismatch, re-enqueuing")
-		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		// Requeue BEFORE ACK to prevent message loss.
 		w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1)
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		return
 	}
 
@@ -869,7 +876,9 @@ func (w *Worker) drainOverlapBuffer(jobID string, job *types.Job) {
 		return
 	}
 
-	w.disp.Dispatch(ctx, job, job.Attempt)
+	if err := w.disp.Dispatch(ctx, job, job.Attempt); err != nil {
+		w.logger.Error().Err(err).String("job_id", jobID).Msg("drainOverlapBuffer: dispatch failed")
+	}
 }
 
 func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types.JobRun, execErr error) {
@@ -964,23 +973,25 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 	case errClass == types.ErrorClassRateLimited:
 		job.Status = types.JobStatusRetrying
 		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		retryAfter := types.GetRetryAfter(execErr)
 		if retryAfter == 0 {
 			retryAfter = retryPolicy.InitialDelay
 		}
 		retryWork := work
 		retryWork.Attempt = job.Attempt
-		w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(retryAfter))
+		// AddDelayed BEFORE ACK to prevent job loss if ACK succeeds but AddDelayed fails.
+		syncRetrySave(w.syncer, func() error { return w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(retryAfter)) }, fmt.Sprintf("add delayed retry %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 
 	default:
 		job.Status = types.JobStatusRetrying
 		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		retryWork := work
 		retryWork.Attempt = job.Attempt
 		delay := calculateBackoff(retryWork.Attempt, retryPolicy)
-		w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(delay))
+		// AddDelayed BEFORE ACK to prevent job loss if ACK succeeds but AddDelayed fails.
+		syncRetrySave(w.syncer, func() error { return w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(delay)) }, fmt.Sprintf("add delayed retry %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 	}
 
 	w.disp.PublishEvent(types.JobEvent{
@@ -1019,12 +1030,17 @@ func (w *Worker) clusterHasTaskType(tt types.TaskType) bool {
 	if err != nil {
 		return false
 	}
+	target := string(tt)
 	for _, node := range nodes {
 		if node.NodeID == w.nodeID {
 			continue
 		}
 		for _, t := range node.TaskTypes {
-			if t == string(tt) {
+			if t == target {
+				return true
+			}
+			// Wildcard pattern match: "email:*" matches "email:send".
+			if strings.HasSuffix(t, "*") && strings.HasPrefix(target, t[:len(t)-1]) {
 				return true
 			}
 		}

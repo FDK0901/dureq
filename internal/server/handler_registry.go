@@ -116,6 +116,21 @@ func (r *HandlerRegistry) Len() int {
 	return len(r.handlers) + len(r.patterns)
 }
 
+// HandlerVersions returns a map of task type → handler version for all
+// registered handlers that have a non-empty Version.
+func (r *HandlerRegistry) HandlerVersions() map[types.TaskType]string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	versions := make(map[types.TaskType]string)
+	for tt, def := range r.handlers {
+		if def.Version != "" {
+			versions[tt] = def.Version
+		}
+	}
+	return versions
+}
+
 // sortPatterns sorts pattern entries by prefix length descending (longest first).
 func sortPatterns(patterns []patternEntry) {
 	// Simple insertion sort — pattern lists are typically very small.

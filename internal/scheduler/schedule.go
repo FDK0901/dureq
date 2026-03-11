@@ -146,8 +146,35 @@ func nextDaily(s types.Schedule, after time.Time, loc *time.Location) (time.Time
 	interval := int(*s.RegularInterval)
 	atTimes := sortAtTimes(s.AtTimes)
 
-	// First pass: check remaining times on the current day (only for interval=1).
+	// Anchor-based calculation: use StartsAt (or midnight of `after`) as the
+	// epoch, then compute the next aligned day boundary to eliminate drift.
+	anchor := time.Date(after.Year(), after.Month(), after.Day(), 0, 0, 0, 0, loc)
+	if s.StartsAt != nil {
+		anchor = time.Date(s.StartsAt.In(loc).Year(), s.StartsAt.In(loc).Month(), s.StartsAt.In(loc).Day(), 0, 0, 0, 0, loc)
+	}
+
+	// dayOffset = number of whole days from anchor to `after`'s midnight.
+	afterMidnight := time.Date(after.Year(), after.Month(), after.Day(), 0, 0, 0, 0, loc)
+	dayOffset := int(afterMidnight.Sub(anchor).Hours() / 24)
+
+	// For interval=1, check remaining times today first.
 	if interval <= 1 {
+		for _, at := range atTimes {
+			candidate := time.Date(after.Year(), after.Month(), after.Day(),
+				int(at.Hour), int(at.Minute), int(at.Second), 0, loc)
+			if candidate.After(after) {
+				return candidate, nil
+			}
+		}
+		// No remaining time today; next day.
+		nextDay := time.Date(after.Year(), after.Month(), after.Day()+1, 0, 0, 0, 0, loc)
+		return time.Date(nextDay.Year(), nextDay.Month(), nextDay.Day(),
+			int(atTimes[0].Hour), int(atTimes[0].Minute), int(atTimes[0].Second), 0, loc), nil
+	}
+
+	// For interval > 1, find the next interval-aligned day relative to anchor.
+	// Check if today is an aligned day (dayOffset % interval == 0) and has remaining atTimes.
+	if dayOffset >= 0 && dayOffset%interval == 0 {
 		for _, at := range atTimes {
 			candidate := time.Date(after.Year(), after.Month(), after.Day(),
 				int(at.Hour), int(at.Minute), int(at.Second), 0, loc)
@@ -157,18 +184,16 @@ func nextDaily(s types.Schedule, after time.Time, loc *time.Location) (time.Time
 		}
 	}
 
-	// Second pass: jump to next interval day.
-	nextDay := time.Date(after.Year(), after.Month(), after.Day()+interval,
-		0, 0, 0, 0, loc)
-	for _, at := range atTimes {
-		candidate := time.Date(nextDay.Year(), nextDay.Month(), nextDay.Day(),
-			int(at.Hour), int(at.Minute), int(at.Second), 0, loc)
-		if !candidate.Before(nextDay) {
-			return candidate, nil
-		}
+	// Jump to next aligned day: smallest N*interval > dayOffset.
+	var n int
+	if dayOffset < 0 {
+		n = 0 // anchor day is in the future
+	} else {
+		n = ((dayOffset / interval) + 1) * interval
 	}
-
-	return time.Time{}, fmt.Errorf("daily: no valid next run time found")
+	nextAligned := anchor.AddDate(0, 0, n)
+	return time.Date(nextAligned.Year(), nextAligned.Month(), nextAligned.Day(),
+		int(atTimes[0].Hour), int(atTimes[0].Minute), int(atTimes[0].Second), 0, loc), nil
 }
 
 // --- Weekly ---
@@ -181,23 +206,49 @@ func nextWeekly(s types.Schedule, after time.Time, loc *time.Location) (time.Tim
 	atTimes := sortAtTimes(s.AtTimes)
 	weekdays := sortInts(s.IncludedDays)
 
-	// First pass: remaining times in the current week (only for interval=1).
-	if interval <= 1 {
-		if next := nextWeekDayAtTime(after, weekdays, atTimes, loc, true); !next.IsZero() {
+	// First pass: remaining times in the current week.
+	if next := nextWeekDayAtTime(after, weekdays, atTimes, loc, true); !next.IsZero() {
+		// For interval > 1, only allow same-week matches if the current week is aligned.
+		if interval <= 1 || isAlignedWeek(s, after, interval, loc) {
 			return next, nil
 		}
 	}
 
-	// Second pass: next interval week.
-	currentWeekday := int(after.Weekday())
-	startOfNextWeek := time.Date(after.Year(), after.Month(),
-		after.Day()-currentWeekday+interval*7, 0, 0, 0, 0, loc)
+	// Anchor-based: find start of the next aligned week.
+	anchor := startOfWeek(after, loc)
+	if s.StartsAt != nil {
+		anchor = startOfWeek(s.StartsAt.In(loc), loc)
+	}
+	current := startOfWeek(after, loc)
+	weeksSinceAnchor := int(current.Sub(anchor).Hours()/(24*7)) + 1
+	if weeksSinceAnchor < 1 {
+		weeksSinceAnchor = 1
+	}
+	n := ((weeksSinceAnchor + interval - 1) / interval) * interval
+	nextWeekStart := anchor.AddDate(0, 0, n*7)
 
-	if next := nextWeekDayAtTime(startOfNextWeek, weekdays, atTimes, loc, false); !next.IsZero() {
+	if next := nextWeekDayAtTime(nextWeekStart, weekdays, atTimes, loc, false); !next.IsZero() {
 		return next, nil
 	}
 
 	return time.Time{}, fmt.Errorf("weekly: no valid next run time found")
+}
+
+// isAlignedWeek checks if `t` falls on a week that is interval-aligned to the anchor.
+func isAlignedWeek(s types.Schedule, t time.Time, interval int, loc *time.Location) bool {
+	anchor := startOfWeek(t, loc)
+	if s.StartsAt != nil {
+		anchor = startOfWeek(s.StartsAt.In(loc), loc)
+	}
+	current := startOfWeek(t, loc)
+	weeks := int(current.Sub(anchor).Hours() / (24 * 7))
+	return weeks%interval == 0
+}
+
+// startOfWeek returns midnight of the Sunday that starts the week containing t.
+func startOfWeek(t time.Time, loc *time.Location) time.Time {
+	wd := int(t.Weekday())
+	return time.Date(t.Year(), t.Month(), t.Day()-wd, 0, 0, 0, 0, loc)
 }
 
 func nextWeekDayAtTime(from time.Time, weekdays []int, atTimes []types.AtTime, loc *time.Location, firstPass bool) time.Time {
@@ -229,21 +280,32 @@ func nextMonthly(s types.Schedule, after time.Time, loc *time.Location) (time.Ti
 	atTimes := sortAtTimes(s.AtTimes)
 	days := sortInts(s.IncludedDays)
 
-	// First pass: check current month (only for interval=1).
-	if interval <= 1 {
+	// Anchor-based: determine month alignment from StartsAt.
+	anchorYear, anchorMonth := after.Year(), after.Month()
+	if s.StartsAt != nil {
+		a := s.StartsAt.In(loc)
+		anchorYear, anchorMonth = a.Year(), a.Month()
+	}
+
+	// Check current month if it's aligned (or interval=1).
+	monthsFromAnchor := max((after.Year()-anchorYear)*12+int(after.Month()-anchorMonth), 0)
+	if interval <= 1 || monthsFromAnchor%interval == 0 {
 		if next := nextMonthDayAtTime(after, days, atTimes, loc, true); !next.IsZero() {
 			return next, nil
 		}
 	}
 
-	// Subsequent months: advance by interval until we find a valid time.
+	// Find next aligned month.
+	n := ((monthsFromAnchor / interval) + 1) * interval
+	from := time.Date(anchorYear, anchorMonth+time.Month(n), 1, 0, 0, 0, 0, loc)
+
 	// Cap at 12 iterations to avoid infinite loops for unreachable days.
-	from := time.Date(after.Year(), after.Month()+time.Month(interval), 1, 0, 0, 0, 0, loc)
 	for i := 0; i < 12; i++ {
 		if next := nextMonthDayAtTime(from, days, atTimes, loc, false); !next.IsZero() {
 			return next, nil
 		}
-		from = time.Date(from.Year(), from.Month()+time.Month(interval), 1, 0, 0, 0, 0, loc)
+		n += interval
+		from = time.Date(anchorYear, anchorMonth+time.Month(n), 1, 0, 0, 0, 0, loc)
 	}
 
 	return time.Time{}, fmt.Errorf("monthly: no valid next run time found within 12 iterations")

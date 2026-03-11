@@ -75,4 +75,7 @@ type JobEvent struct {
 	Timestamp      time.Time      `json:"timestamp"`
 	BatchProgress  *BatchProgress `json:"batch_progress,omitempty"`
 	AffectedRunIDs []string       `json:"affected_run_ids,omitempty"`
+	// WorkflowID is set for task-level workflow events so they can be indexed
+	// under the parent workflow rather than the task's job ID.
+	WorkflowID string `json:"workflow_id,omitempty"`
 }

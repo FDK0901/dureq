@@ -109,6 +109,19 @@ func ValidateDAG(def *types.WorkflowDefinition) error {
 		}
 	}
 
+	// Validate TaskType XOR ChildWorkflowDef: each step must have exactly one.
+	for _, t := range def.Tasks {
+		hasTaskType := t.TaskType != ""
+		hasChild := t.ChildWorkflowDef != nil
+		// Condition and subflow nodes use TaskType for their handler, so they're exempt from XOR.
+		if t.Type == types.WorkflowTaskStatic && !hasTaskType && !hasChild {
+			return fmt.Errorf("workflow %q: task %q must have TaskType or ChildWorkflowDef", def.Name, t.Name)
+		}
+		if hasTaskType && hasChild {
+			return fmt.Errorf("workflow %q: task %q must have exactly one of TaskType or ChildWorkflowDef, not both", def.Name, t.Name)
+		}
+	}
+
 	// Validate subflow tasks don't have condition-specific fields.
 	for _, t := range def.Tasks {
 		if t.Type == types.WorkflowTaskSubflow && len(t.ConditionRoutes) > 0 {

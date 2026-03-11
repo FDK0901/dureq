@@ -107,7 +107,10 @@ func (o *Orchestrator) eventLoop(ctx context.Context) {
 
 		for _, entries := range xStreams {
 			for _, entry := range entries {
-				o.processStreamEvent(ctx, entry)
+				if err := o.processStreamEvent(ctx, entry); err != nil {
+					o.logger.Warn().Err(err).String("stream_id", entry.ID).Msg("orchestrator: event processing failed, leaving for retry")
+					continue
+				}
 				if ctx.Err() == nil {
 					o.store.Client().Do(ctx, o.store.Client().B().Xack().Key(streamKey).Group(store.OrchestratorConsumerGroup).Id(entry.ID).Build())
 				}
@@ -130,7 +133,10 @@ func (o *Orchestrator) drainPending(ctx context.Context, streamKey, consumerName
 			if len(entries) > 0 {
 				empty = false
 				for _, entry := range entries {
-					o.processStreamEvent(ctx, entry)
+					if err := o.processStreamEvent(ctx, entry); err != nil {
+						o.logger.Warn().Err(err).String("stream_id", entry.ID).Msg("orchestrator: pending event processing failed, leaving for retry")
+						continue
+					}
 					if ctx.Err() == nil {
 						o.store.Client().Do(ctx, o.store.Client().B().Xack().Key(streamKey).Group(store.OrchestratorConsumerGroup).Id(entry.ID).Build())
 					}
@@ -144,56 +150,58 @@ func (o *Orchestrator) drainPending(ctx context.Context, streamKey, consumerName
 }
 
 // processStreamEvent extracts the event JSON from a stream message and routes it.
-func (o *Orchestrator) processStreamEvent(ctx context.Context, entry rueidis.XRangeEntry) {
+// Returns an error if the event could not be processed and should be retried.
+func (o *Orchestrator) processStreamEvent(ctx context.Context, entry rueidis.XRangeEntry) error {
 	dataStr, ok := entry.FieldValues["data"]
 	if !ok {
-		return
+		return nil // malformed message, ACK it to avoid infinite loop
 	}
 
 	var event types.JobEvent
 	if err := json.Unmarshal([]byte(dataStr), &event); err != nil {
-		return
+		return nil // unparseable message, ACK it
 	}
 
+	var handlerErr error
 	switch event.Type {
 	case types.EventJobCompleted:
-		o.handleJobCompleted(ctx, event)
+		handlerErr = o.handleJobCompleted(ctx, event)
 	case types.EventJobFailed, types.EventJobDead:
-		o.handleJobFailed(ctx, event)
+		handlerErr = o.handleJobFailed(ctx, event)
 	case types.EventWorkflowCompleted:
-		o.handleChildWorkflowCompleted(ctx, event)
+		handlerErr = o.handleChildWorkflowCompleted(ctx, event)
 	case types.EventWorkflowFailed:
-		o.handleChildWorkflowFailed(ctx, event)
+		handlerErr = o.handleChildWorkflowFailed(ctx, event)
 	case types.EventWorkflowSignalReceived:
 		o.handleWorkflowSignal(ctx, event)
 	case types.EventWorkflowResumed:
 		o.handleWorkflowResumed(ctx, event)
 	case types.EventWorkflowRetrying:
-		o.handleWorkflowRetry(ctx, event)
+		handlerErr = o.handleWorkflowRetry(ctx, event)
 	case types.EventBatchRetrying:
-		o.handleBatchRetry(ctx, event)
+		handlerErr = o.handleBatchRetry(ctx, event)
 	}
+	return handlerErr
 }
 
-func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEvent) {
+func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEvent) error {
 	if event.JobID == "" {
-		return
+		return nil
 	}
 
 	// Load the job to check if it's part of a workflow or batch.
 	job, _, err := o.store.GetJob(ctx, event.JobID)
 	if err != nil {
-		return
+		return err
 	}
 
 	// Route to batch handler if this is a batch job.
 	if job.BatchID != nil {
-		o.handleBatchJobCompleted(ctx, event, job)
-		return
+		return o.handleBatchJobCompleted(ctx, event, job)
 	}
 
 	if job.WorkflowID == nil {
-		return
+		return nil
 	}
 
 	wfID := *job.WorkflowID
@@ -205,7 +213,7 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 	// Check if this is a hook job — if so, update hook state only.
 	if hookName, ok := isHookJob(taskName); ok {
 		o.handleHookCompleted(ctx, wfID, hookName, event.JobID)
-		return
+		return nil
 	}
 
 	o.logger.Info().String("workflow_id", wfID).String("task", taskName).Msg("workflow task completed")
@@ -214,9 +222,10 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 
 	// Publish task completion event (idempotent, safe to call once).
 	o.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventWorkflowTaskCompleted,
-		JobID:     event.JobID,
-		Timestamp: now,
+		Type:       types.EventWorkflowTaskCompleted,
+		JobID:      event.JobID,
+		WorkflowID: wfID,
+		Timestamp:  now,
 	})
 
 	// Retry loop: re-read workflow on CAS conflict to pick up concurrent changes.
@@ -224,10 +233,10 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 		wf, rev, err := o.store.GetWorkflow(ctx, wfID)
 		if err != nil {
 			o.logger.Error().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to get workflow")
-			return
+			return err
 		}
 		if wf.Status.IsTerminal() {
-			return
+			return nil
 		}
 
 		// Find task definition.
@@ -276,7 +285,7 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 					continue
 				}
 				o.logger.Error().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save completed workflow")
-				return
+				return err
 			}
 			o.dispatcher.PublishEvent(types.JobEvent{
 				Type:      types.EventWorkflowCompleted,
@@ -284,7 +293,7 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 				Timestamp: now,
 			})
 			o.logger.Info().String("workflow_id", wfID).Msg("workflow completed")
-			return
+			return nil
 		}
 
 		// Save the task completion first (without dispatching).
@@ -297,13 +306,13 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 				continue
 			}
 			o.logger.Error().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save task completion")
-			return
+			return err
 		}
 
 		// If workflow is suspended, don't dispatch any new tasks.
 		if wf.Status == types.WorkflowStatusSuspended {
 			o.logger.Info().String("workflow_id", wfID).String("task", taskName).Msg("workflow is suspended, not dispatching ready tasks")
-			return
+			return nil
 		}
 
 		// Task completion saved. Now dispatch ready tasks.
@@ -321,7 +330,7 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 			// Check if workflow-level retry is available.
 			if wf.Definition.RetryPolicy != nil && wf.Attempt < wf.Definition.RetryPolicy.MaxAttempts {
 				o.retryWorkflow(ctx, wf, newRev, &now)
-				return
+				return nil
 			}
 
 			wf.Status = types.WorkflowStatusFailed
@@ -333,7 +342,7 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 			}
 			if _, err := o.store.UpdateWorkflow(ctx, wf, newRev); err != nil {
 				o.logger.Error().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save stuck workflow as failed")
-				return
+				return err
 			}
 			o.dispatcher.PublishEvent(types.JobEvent{
 				Type:      types.EventWorkflowFailed,
@@ -342,10 +351,11 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 			})
 			o.logger.Info().String("workflow_id", wfID).Msg("workflow failed: no ready tasks and some tasks failed (stuck)")
 		}
-		return
+		return nil
 	}
 
 	o.logger.Error().String("workflow_id", wfID).String("task", taskName).Msg("orchestrator: exhausted CAS retries for workflow update")
+	return fmt.Errorf("exhausted CAS retries for workflow %s task %s", wfID, taskName)
 }
 
 // processConditionResult reads the condition handler's route selection from the job result
@@ -560,14 +570,14 @@ func findTaskDef(def *types.WorkflowDefinition, name string) *types.WorkflowTask
 	return nil
 }
 
-func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent) {
+func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent) error {
 	if event.JobID == "" {
-		return
+		return nil
 	}
 
 	job, _, err := o.store.GetJob(ctx, event.JobID)
 	if err != nil {
-		return
+		return err
 	}
 
 	// Job is still being retried — update item state to retrying but don't fail the batch/workflow.
@@ -577,17 +587,16 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 		} else if job.WorkflowID != nil {
 			o.updateWorkflowTaskRetrying(ctx, job)
 		}
-		return
+		return nil
 	}
 
 	// Route to batch handler if this is a batch job.
 	if job.BatchID != nil {
-		o.handleBatchJobFailed(ctx, event, job)
-		return
+		return o.handleBatchJobFailed(ctx, event, job)
 	}
 
 	if job.WorkflowID == nil {
-		return
+		return nil
 	}
 
 	wfID := *job.WorkflowID
@@ -599,7 +608,7 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 	// Check if this is a hook job — if so, update hook state only.
 	if hookName, ok := isHookJob(taskName); ok {
 		o.handleHookFailed(ctx, wfID, hookName, event.JobID)
-		return
+		return nil
 	}
 
 	o.logger.Warn().String("workflow_id", wfID).String("task", taskName).Msg("workflow task failed")
@@ -616,8 +625,11 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 	// Retry loop for CAS conflicts.
 	for attempt := 0; attempt < 5; attempt++ {
 		wf, rev, err := o.store.GetWorkflow(ctx, wfID)
-		if err != nil || wf.Status.IsTerminal() {
-			return
+		if err != nil {
+			return err
+		}
+		if wf.Status.IsTerminal() {
+			return nil
 		}
 
 		// Mark the failed task.
@@ -649,7 +661,7 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 						continue
 					}
 					o.logger.Error().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save completed workflow (allow-failure)")
-					return
+					return err
 				}
 				o.dispatcher.PublishEvent(types.JobEvent{
 					Type:      types.EventWorkflowCompleted,
@@ -657,7 +669,7 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 					Timestamp: now,
 				})
 				o.logger.Info().String("workflow_id", wfID).Msg("workflow completed (with allowed failures)")
-				return
+				return nil
 			}
 
 			// Save task failure and dispatch next ready tasks.
@@ -669,7 +681,7 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 					continue
 				}
 				o.logger.Error().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save allow-failure task state")
-				return
+				return err
 			}
 
 			// If workflow is suspended, don't dispatch any new tasks.
@@ -684,18 +696,19 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 			}
 
 			o.dispatcher.PublishEvent(types.JobEvent{
-				Type:      types.EventWorkflowTaskFailed,
-				JobID:     event.JobID,
-				Timestamp: now,
+				Type:       types.EventWorkflowTaskFailed,
+				JobID:      event.JobID,
+				WorkflowID: wfID,
+				Timestamp:  now,
 			})
 			o.logger.Info().String("workflow_id", wfID).String("task", taskName).Msg("task failed (allow_failure=true), workflow continues")
-			return
+			return nil
 		}
 
 		// Check if workflow-level retry is available before marking as failed.
 		if wf.Definition.RetryPolicy != nil && wf.Attempt < wf.Definition.RetryPolicy.MaxAttempts {
 			o.retryWorkflow(ctx, wf, rev, &now)
-			return
+			return nil
 		}
 
 		// Mark workflow as failed.
@@ -712,7 +725,7 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 				continue
 			}
 			o.logger.Error().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save failed workflow")
-			return
+			return err
 		}
 
 		o.dispatcher.PublishEvent(types.JobEvent{
@@ -722,16 +735,18 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 		})
 
 		o.dispatcher.PublishEvent(types.JobEvent{
-			Type:      types.EventWorkflowTaskFailed,
-			JobID:     event.JobID,
-			Timestamp: now,
+			Type:       types.EventWorkflowTaskFailed,
+			JobID:      event.JobID,
+			WorkflowID: wfID,
+			Timestamp:  now,
 		})
 
 		o.logger.Info().String("workflow_id", wfID).String("failed_task", taskName).Msg("workflow failed")
-		return
+		return nil
 	}
 
 	o.logger.Error().String("workflow_id", wfID).String("task", taskName).Msg("orchestrator: exhausted CAS retries for workflow failure update")
+	return fmt.Errorf("exhausted CAS retries for workflow %s task %s failure", wfID, taskName)
 }
 
 // dispatchWorkflowTask creates a job for a workflow task and dispatches it.
@@ -817,10 +832,11 @@ func (o *Orchestrator) dispatchWorkflowTask(ctx context.Context, wf *types.Workf
 	}
 
 	o.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventWorkflowTaskDispatched,
-		JobID:     job.ID,
-		TaskType:  job.TaskType,
-		Timestamp: *now,
+		Type:       types.EventWorkflowTaskDispatched,
+		JobID:      job.ID,
+		WorkflowID: wf.ID,
+		TaskType:   job.TaskType,
+		Timestamp:  *now,
 	})
 
 	o.logger.Info().String("workflow_id", wf.ID).String("task", taskName).String("job_id", job.ID).Msg("workflow task dispatched")
@@ -959,59 +975,58 @@ func (o *Orchestrator) dispatchChildWorkflow(ctx context.Context, parentWf *type
 
 // --- Workflow Signals ---
 
-// handleWorkflowSignal consumes pending signals for a workflow and logs them.
-// Signals are stored on the per-workflow signal stream and can be consumed by
-// handlers via the client's ConsumeSignals API. The orchestrator acknowledges
-// the event to ensure delivery even across leader changes.
+// handleWorkflowSignal is triggered when a signal is sent to a workflow.
+// Signals are stored on the per-workflow signal stream and are consumed by
+// user handlers via the client's ConsumeSignals API. The orchestrator does NOT
+// consume (XDEL) them — that is the responsibility of user code.
 func (o *Orchestrator) handleWorkflowSignal(ctx context.Context, event types.JobEvent) {
 	wfID := event.JobID
 	if wfID == "" {
 		return
 	}
 
-	signals, err := o.store.ConsumeSignals(ctx, wfID)
-	if err != nil {
-		o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to consume signals")
-		return
-	}
-
-	for _, sig := range signals {
-		o.logger.Info().String("workflow_id", wfID).String("signal", sig.Name).Msg("workflow signal received")
-	}
+	o.logger.Info().String("workflow_id", wfID).Msg("workflow signal event received")
 }
 
 // --- Child workflow completion ---
 
 // handleChildWorkflowCompleted is triggered when a workflow completes.
 // If it has a parent workflow, treat the completion as a task completion in the parent.
-func (o *Orchestrator) handleChildWorkflowCompleted(ctx context.Context, event types.JobEvent) {
+func (o *Orchestrator) handleChildWorkflowCompleted(ctx context.Context, event types.JobEvent) error {
 	childWfID := event.JobID
 	if childWfID == "" {
-		return
+		return nil
 	}
 
 	childWf, _, err := o.store.GetWorkflow(ctx, childWfID)
-	if err != nil || childWf.ParentWorkflowID == nil {
-		return // not a child workflow
+	if err != nil {
+		return err
+	}
+	if childWf.ParentWorkflowID == nil {
+		return nil // not a child workflow
 	}
 
 	// Synthesize a job-completed-like event for the parent workflow.
 	o.logger.Info().String("child_workflow_id", childWfID).String("parent_workflow_id", *childWf.ParentWorkflowID).Msg("child workflow completed — progressing parent")
 
 	o.progressParentWorkflowTask(ctx, childWf, types.JobStatusCompleted, nil)
+	return nil
 }
 
 // handleChildWorkflowFailed is triggered when a workflow fails.
 // If it has a parent workflow, treat the failure as a task failure in the parent.
-func (o *Orchestrator) handleChildWorkflowFailed(ctx context.Context, event types.JobEvent) {
+func (o *Orchestrator) handleChildWorkflowFailed(ctx context.Context, event types.JobEvent) error {
 	childWfID := event.JobID
 	if childWfID == "" {
-		return
+		return nil
 	}
 
 	childWf, _, err := o.store.GetWorkflow(ctx, childWfID)
-	if err != nil || childWf.ParentWorkflowID == nil {
-		return // not a child workflow
+	if err != nil {
+		return err
+	}
+	if childWf.ParentWorkflowID == nil {
+		return nil // not a child workflow
 	}
 
 	errStr := "child workflow failed"
@@ -1022,6 +1037,7 @@ func (o *Orchestrator) handleChildWorkflowFailed(ctx context.Context, event type
 	o.logger.Warn().String("child_workflow_id", childWfID).String("parent_workflow_id", *childWf.ParentWorkflowID).Msg("child workflow failed — failing parent task")
 
 	o.progressParentWorkflowTask(ctx, childWf, types.JobStatusFailed, &errStr)
+	return nil
 }
 
 // progressParentWorkflowTask updates the parent workflow task state based on the child outcome.
@@ -1114,7 +1130,7 @@ func (o *Orchestrator) progressParentWorkflowTask(ctx context.Context, childWf *
 
 // --- Batch processing logic ---
 
-func (o *Orchestrator) handleBatchJobCompleted(ctx context.Context, event types.JobEvent, job *types.Job) {
+func (o *Orchestrator) handleBatchJobCompleted(ctx context.Context, event types.JobEvent, job *types.Job) error {
 	batchID := *job.BatchID
 	role := ""
 	if job.BatchRole != nil {
@@ -1124,10 +1140,10 @@ func (o *Orchestrator) handleBatchJobCompleted(ctx context.Context, event types.
 	batch, rev, err := o.store.GetBatch(ctx, batchID)
 	if err != nil {
 		o.logger.Error().String("batch_id", batchID).Err(err).Msg("batch orchestrator: failed to get batch")
-		return
+		return err
 	}
 	if batch.Status.IsTerminal() {
-		return
+		return nil
 	}
 
 	now := time.Now()
@@ -1209,6 +1225,7 @@ func (o *Orchestrator) handleBatchJobCompleted(ctx context.Context, event types.
 			o.store.UpdateBatch(ctx, batch, rev)
 		}
 	}
+	return nil
 }
 
 // updateBatchItemRetrying updates a batch item's status to retrying so the UI
@@ -1249,7 +1266,7 @@ func (o *Orchestrator) updateWorkflowTaskRetrying(ctx context.Context, job *type
 	}
 }
 
-func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.JobEvent, job *types.Job) {
+func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.JobEvent, job *types.Job) error {
 	batchID := *job.BatchID
 	role := ""
 	if job.BatchRole != nil {
@@ -1259,10 +1276,10 @@ func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.Job
 	batch, rev, err := o.store.GetBatch(ctx, batchID)
 	if err != nil {
 		o.logger.Error().String("batch_id", batchID).Err(err).Msg("batch orchestrator: failed to get batch")
-		return
+		return err
 	}
 	if batch.Status.IsTerminal() {
-		return
+		return nil
 	}
 
 	now := time.Now()
@@ -1347,7 +1364,7 @@ func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.Job
 				Timestamp: now,
 			})
 			o.logger.Info().String("batch_id", batchID).Msg("batch failed (fail_fast)")
-			return
+			return nil
 		}
 
 		// continue_on_error: check if batch is done.
@@ -1359,6 +1376,7 @@ func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.Job
 			o.store.UpdateBatch(ctx, batch, rev)
 		}
 	}
+	return nil
 }
 
 // dispatchBatchChunk dispatches the next chunk of batch items.
@@ -1597,15 +1615,18 @@ func (o *Orchestrator) handleWorkflowResumed(ctx context.Context, event types.Jo
 }
 
 // handleWorkflowRetry dispatches root tasks after an API-triggered workflow retry.
-func (o *Orchestrator) handleWorkflowRetry(ctx context.Context, event types.JobEvent) {
+func (o *Orchestrator) handleWorkflowRetry(ctx context.Context, event types.JobEvent) error {
 	wfID := event.JobID
 	if wfID == "" {
-		return
+		return nil
 	}
 
 	wf, rev, err := o.store.GetWorkflow(ctx, wfID)
-	if err != nil || wf.Status.IsTerminal() {
-		return
+	if err != nil {
+		return err
+	}
+	if wf.Status.IsTerminal() {
+		return nil
 	}
 
 	now := time.Now()
@@ -1622,21 +1643,26 @@ func (o *Orchestrator) handleWorkflowRetry(ctx context.Context, event types.JobE
 
 	if _, err := o.store.UpdateWorkflow(ctx, wf, rev); err != nil {
 		o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save workflow after retry dispatch")
+		return err
 	}
 
 	o.logger.Info().String("workflow_id", wfID).Int("ready", len(ready)).Msg("orchestrator: dispatched ready tasks for workflow retry")
+	return nil
 }
 
 // handleBatchRetry dispatches the first chunk after an API-triggered batch retry.
-func (o *Orchestrator) handleBatchRetry(ctx context.Context, event types.JobEvent) {
+func (o *Orchestrator) handleBatchRetry(ctx context.Context, event types.JobEvent) error {
 	batchID := event.JobID
 	if batchID == "" {
-		return
+		return nil
 	}
 
 	batch, rev, err := o.store.GetBatch(ctx, batchID)
-	if err != nil || batch.Status.IsTerminal() {
-		return
+	if err != nil {
+		return err
+	}
+	if batch.Status.IsTerminal() {
+		return nil
 	}
 
 	now := time.Now()
@@ -1649,9 +1675,11 @@ func (o *Orchestrator) handleBatchRetry(ctx context.Context, event types.JobEven
 
 	if _, err := o.store.UpdateBatch(ctx, batch, rev); err != nil {
 		o.logger.Warn().String("batch_id", batchID).Err(err).Msg("orchestrator: failed to save batch after retry dispatch")
+		return err
 	}
 
 	o.logger.Info().String("batch_id", batchID).Msg("orchestrator: dispatched batch retry")
+	return nil
 }
 
 // publishBatchProgress publishes a batch progress event.
@@ -1753,7 +1781,10 @@ func (o *Orchestrator) timeoutWorkflow(ctx context.Context, wf *types.WorkflowIn
 		}
 	}
 
-	o.store.UpdateWorkflow(ctx, wf, rev)
+	if _, err := o.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+		o.logger.Error().String("workflow_id", wf.ID).Err(err).Msg("orchestrator: failed to save workflow timeout")
+		return
+	}
 
 	o.dispatcher.PublishEvent(types.JobEvent{
 		Type:      types.EventWorkflowTimedOut,
@@ -1796,17 +1827,33 @@ func (o *Orchestrator) timeoutBatch(ctx context.Context, batch *types.BatchInsta
 	batch.CompletedAt = &now
 	batch.UpdatedAt = now
 
-	// Signal cancel to running child jobs (items + onetime).
-	for _, state := range batch.ItemStates {
-		if !state.Status.IsTerminal() && state.JobID != "" {
-			o.signalCancelActiveRuns(ctx, state.JobID)
+	// Cancel all non-terminal items and signal running handlers.
+	errStr := types.ErrExecutionTimedOut.Error()
+	for id, state := range batch.ItemStates {
+		if !state.Status.IsTerminal() {
+			if state.JobID != "" {
+				o.signalCancelActiveRuns(ctx, state.JobID)
+			}
+			state.Status = types.JobStatusCancelled
+			state.FinishedAt = &now
+			state.Error = &errStr
+			batch.ItemStates[id] = state
 		}
 	}
-	if batch.OnetimeState != nil && !batch.OnetimeState.Status.IsTerminal() && batch.OnetimeState.JobID != "" {
-		o.signalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+	// Cancel onetime task if still running.
+	if batch.OnetimeState != nil && !batch.OnetimeState.Status.IsTerminal() {
+		if batch.OnetimeState.JobID != "" {
+			o.signalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+		}
+		batch.OnetimeState.Status = types.JobStatusCancelled
+		batch.OnetimeState.FinishedAt = &now
+		batch.OnetimeState.Error = &errStr
 	}
 
-	o.store.UpdateBatch(ctx, batch, rev)
+	if _, err := o.store.UpdateBatch(ctx, batch, rev); err != nil {
+		o.logger.Error().String("batch_id", batch.ID).Err(err).Msg("orchestrator: failed to save batch timeout")
+		return
+	}
 
 	o.dispatcher.PublishEvent(types.JobEvent{
 		Type:      types.EventBatchTimedOut,

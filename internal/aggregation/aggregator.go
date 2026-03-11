@@ -93,9 +93,10 @@ func (p *Processor) flushReady(ctx context.Context) {
 	}
 
 	for _, group := range groups {
-		msgs, err := p.store.FlushGroup(ctx, group)
+		// Read messages WITHOUT deleting — delete only after successful processing.
+		msgs, err := p.store.ReadGroup(ctx, group)
 		if err != nil {
-			p.logger.Warn().String("group", group).Err(err).Msg("aggregation: failed to flush group")
+			p.logger.Warn().String("group", group).Err(err).Msg("aggregation: failed to read group")
 			continue
 		}
 		if len(msgs) == 0 {
@@ -136,6 +137,9 @@ func (p *Processor) flushReady(ctx context.Context) {
 			p.logger.Warn().String("group", group).Err(err).Msg("aggregation: failed to dispatch aggregated job")
 			continue
 		}
+
+		// All processing succeeded — now delete the group messages.
+		p.store.DeleteGroupMessages(ctx, group)
 
 		p.logger.Info().String("group", group).Int("count", len(msgs)).String("job_id", job.ID).Msg("aggregation: flushed and dispatched")
 	}

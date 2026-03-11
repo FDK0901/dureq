@@ -129,10 +129,17 @@ func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) err
 		Build())
 
 	// Per-workflow event index: index workflow-related events by workflow ID.
-	if event.JobID != "" && isWorkflowEventType(event.Type) {
-		score := float64(event.Timestamp.UnixNano()) / 1e9
-		cmds = append(cmds, s.rdb.B().Zadd().Key(WorkflowEventsKey(s.prefix, event.JobID)).
-			ScoreMember().ScoreMember(score, string(data)).Build())
+	// Task-level events use WorkflowID (parent), workflow-level events use JobID (which IS the workflow ID).
+	if isWorkflowEventType(event.Type) {
+		indexID := event.WorkflowID
+		if indexID == "" {
+			indexID = event.JobID
+		}
+		if indexID != "" {
+			score := float64(event.Timestamp.UnixNano()) / 1e9
+			cmds = append(cmds, s.rdb.B().Zadd().Key(WorkflowEventsKey(s.prefix, indexID)).
+				ScoreMember().ScoreMember(score, string(data)).Build())
+		}
 	}
 
 	for _, resp := range s.rdb.DoMulti(ctx, cmds...) {
@@ -317,7 +324,7 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 
 // AddDelayed adds a work message to the delayed sorted set for future re-dispatch.
 func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.WorkMessage, executeAt time.Time) error {
-	data, err := sonic.ConfigFastest.Marshal(map[string]interface{}{
+	m := map[string]interface{}{
 		"run_id":        wm.RunID,
 		"job_id":        wm.JobID,
 		"task_type":     string(wm.TaskType),
@@ -327,7 +334,19 @@ func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.
 		"priority":      int(wm.Priority),
 		"dispatched_at": wm.DispatchedAt.Format(time.RFC3339Nano),
 		"tier":          tierName,
-	})
+		"version":       wm.Version,
+	}
+	if len(wm.Headers) > 0 {
+		if hdr, err := sonic.ConfigFastest.Marshal(wm.Headers); err == nil {
+			m["headers"] = string(hdr)
+		}
+	}
+	if len(wm.Metadata) > 0 {
+		if meta, err := sonic.ConfigFastest.Marshal(wm.Metadata); err == nil {
+			m["metadata"] = string(meta)
+		}
+	}
+	data, err := sonic.ConfigFastest.Marshal(m)
 	if err != nil {
 		return err
 	}
@@ -358,7 +377,7 @@ func (s *RedisStore) MoveDelayedToStream(ctx context.Context, tierName string, m
 // ReenqueueWork re-adds a work message to the stream without dedup.
 // Used when a worker picks up a message for a task type it doesn't handle.
 func (s *RedisStore) ReenqueueWork(ctx context.Context, tierName string, wm *types.WorkMessage, redeliveries int) error {
-	_, err := s.rdb.Do(ctx, s.rdb.B().Xadd().Key(WorkStreamKey(s.prefix, tierName)).Id("*").FieldValue().
+	fv := s.rdb.B().Xadd().Key(WorkStreamKey(s.prefix, tierName)).Id("*").FieldValue().
 		FieldValue("run_id", wm.RunID).
 		FieldValue("job_id", wm.JobID).
 		FieldValue("task_type", string(wm.TaskType)).
@@ -369,7 +388,15 @@ func (s *RedisStore) ReenqueueWork(ctx context.Context, tierName string, wm *typ
 		FieldValue("dispatched_at", wm.DispatchedAt.Format(time.RFC3339Nano)).
 		FieldValue("tier", tierName).
 		FieldValue("redeliveries", strconv.Itoa(redeliveries)).
-		Build()).ToString()
+		FieldValue("version", wm.Version)
+
+	if len(wm.Headers) > 0 {
+		if hdr, err := sonic.ConfigFastest.Marshal(wm.Headers); err == nil {
+			fv = fv.FieldValue("headers", string(hdr))
+		}
+	}
+
+	_, err := s.rdb.Do(ctx, fv.Build()).ToString()
 
 	// Wake blocked workers so they pick up the requeued message immediately.
 	if err == nil {

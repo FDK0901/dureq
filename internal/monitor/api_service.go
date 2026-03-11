@@ -83,6 +83,35 @@ func (a *APIService) signalCancelActiveRuns(ctx context.Context, jobID string) {
 	}
 }
 
+// cancelChildWorkflow recursively cancels a child workflow and all its tasks.
+func (a *APIService) cancelChildWorkflow(ctx context.Context, childWfID string) {
+	childWf, rev, err := a.store.GetWorkflow(ctx, childWfID)
+	if err != nil || childWf.Status.IsTerminal() {
+		return
+	}
+
+	now := time.Now()
+	childWf.Status = types.WorkflowStatusCancelled
+	childWf.CompletedAt = &now
+	childWf.UpdatedAt = now
+
+	for name, state := range childWf.Tasks {
+		if !state.Status.IsTerminal() {
+			if state.JobID != "" {
+				a.signalCancelActiveRuns(ctx, state.JobID)
+			}
+			if state.ChildWorkflowID != "" {
+				a.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+			}
+			state.Status = types.JobStatusCancelled
+			state.FinishedAt = &now
+			childWf.Tasks[name] = state
+		}
+	}
+
+	a.store.UpdateWorkflow(ctx, childWf, rev)
+}
+
 // ===================== Jobs =====================
 
 func (a *APIService) ListJobs(ctx context.Context, filter store.JobFilter) ([]types.Job, int, error) {
@@ -412,6 +441,10 @@ func (a *APIService) CancelWorkflow(ctx context.Context, wfID string) error {
 					}
 					a.signalCancelActiveRuns(ctx, state.JobID)
 				}
+				// Recursively cancel child workflows spawned by this task.
+				if state.ChildWorkflowID != "" {
+					a.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+				}
 			}
 		}
 
@@ -436,6 +469,9 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 	wf, rev, err := a.store.GetWorkflow(ctx, wfID)
 	if err != nil {
 		return &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	if !wf.Status.IsTerminal() {
+		return &ApiError{Msg: "cannot retry: workflow is " + string(wf.Status), StatusCode: http.StatusConflict}
 	}
 
 	now := time.Now()
@@ -532,6 +568,21 @@ func (a *APIService) CancelBatch(ctx context.Context, batchID string) error {
 				}
 			}
 		}
+		// Cancel onetime task if still running.
+		if batch.OnetimeState != nil && !batch.OnetimeState.Status.IsTerminal() {
+			if batch.OnetimeState.JobID != "" {
+				if childJob, childRev, err := a.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+					if !childJob.Status.IsTerminal() {
+						childJob.Status = types.JobStatusCancelled
+						childJob.UpdatedAt = now
+						a.store.UpdateJob(ctx, childJob, childRev)
+					}
+				}
+				a.signalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+			}
+			batch.OnetimeState.Status = types.JobStatusCancelled
+			batch.OnetimeState.FinishedAt = &now
+		}
 
 		if _, err := a.store.UpdateBatch(ctx, batch, rev); err != nil {
 			if attempt < maxCASRetries-1 {
@@ -554,6 +605,9 @@ func (a *APIService) RetryBatch(ctx context.Context, batchID string, retryFailed
 	batch, rev, err := a.store.GetBatch(ctx, batchID)
 	if err != nil {
 		return &ApiError{Msg: "batch not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	if !batch.Status.IsTerminal() {
+		return &ApiError{Msg: "cannot retry: batch is " + string(batch.Status), StatusCode: http.StatusConflict}
 	}
 
 	now := time.Now()
@@ -960,7 +1014,7 @@ func (a *APIService) BulkRetryJobs(ctx context.Context, req BulkRequest) (*BulkR
 	now := time.Now()
 	for _, id := range ids {
 		job, rev, err := a.store.GetJob(ctx, id)
-		if err != nil {
+		if err != nil || !job.Status.IsTerminal() {
 			continue
 		}
 		job.Status = types.JobStatusPending
@@ -998,6 +1052,11 @@ func (a *APIService) BulkDeleteJobs(ctx context.Context, req BulkRequest) (*Bulk
 
 	affected := 0
 	for _, id := range ids {
+		// Only delete terminal jobs to prevent orphaned running work.
+		job, _, err := a.store.GetJob(ctx, id)
+		if err != nil || !job.Status.IsTerminal() {
+			continue
+		}
 		if err := a.store.DeleteJob(ctx, id); err == nil {
 			a.store.DeleteSchedule(ctx, id)
 			affected++
@@ -1123,6 +1182,11 @@ func (a *APIService) BulkDeleteWorkflows(ctx context.Context, req BulkRequest) (
 
 	affected := 0
 	for _, id := range ids {
+		// Only delete terminal workflows to prevent orphaned running tasks.
+		wf, _, err := a.store.GetWorkflow(ctx, id)
+		if err != nil || !wf.Status.IsTerminal() {
+			continue
+		}
 		if err := a.store.DeleteWorkflow(ctx, id); err == nil {
 			affected++
 		}
@@ -1259,6 +1323,11 @@ func (a *APIService) BulkDeleteBatches(ctx context.Context, req BulkRequest) (*B
 
 	affected := 0
 	for _, id := range ids {
+		// Only delete terminal batches to prevent orphaned running items.
+		batch, _, err := a.store.GetBatch(ctx, id)
+		if err != nil || !batch.Status.IsTerminal() {
+			continue
+		}
 		if err := a.store.DeleteBatch(ctx, id); err == nil {
 			affected++
 		}

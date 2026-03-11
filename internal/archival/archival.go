@@ -35,7 +35,7 @@ type Cleaner struct {
 
 // New creates a new archival cleaner.
 func New(cfg Config) *Cleaner {
-	if cfg.RetentionPeriod == 0 {
+	if cfg.RetentionPeriod < 0 {
 		cfg.RetentionPeriod = 7 * 24 * time.Hour
 	}
 	if cfg.ScanInterval == 0 {
@@ -57,7 +57,11 @@ func New(cfg Config) *Cleaner {
 }
 
 // Start begins the archival loop. Non-blocking.
+// If RetentionPeriod is 0, archival is disabled and Start is a no-op.
 func (c *Cleaner) Start(ctx context.Context) {
+	if c.retentionPeriod == 0 {
+		return
+	}
 	ctx, c.cancel = context.WithCancel(ctx)
 	go c.loop(ctx)
 }
@@ -90,7 +94,7 @@ func (c *Cleaner) cleanup(ctx context.Context) {
 	cutoff := time.Now().Add(-c.retentionPeriod)
 	deleted := 0
 
-	for _, status := range []types.JobStatus{types.JobStatusCompleted, types.JobStatusDead, types.JobStatusCancelled} {
+	for _, status := range []types.JobStatus{types.JobStatusCompleted, types.JobStatusFailed, types.JobStatusDead, types.JobStatusCancelled} {
 		jobs, err := c.store.ListJobsByStatus(ctx, status)
 		if err != nil {
 			c.logger.Warn().Err(err).String("status", string(status)).Msg("archival: failed to list jobs")

@@ -167,6 +167,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// Initialize dispatcher.
 	s.disp = dispatcher.New(s.store, s.logger)
 	s.disp.SetHooks(&s.hooks)
+	if versions := s.registry.HandlerVersions(); len(versions) > 0 {
+		s.disp.SetHandlerVersions(versions)
+	}
 
 	// Initialize locker.
 	s.locker = lock.NewLocker(lock.LockerConfig{
@@ -273,18 +276,30 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Stop() error {
 	s.logger.Info().String("node_id", s.cfg.NodeID).Msg("server stopping")
 
-	s.work.Stop()
-	s.cancel()
-
+	if s.work != nil {
+		s.work.Stop()
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.aggProc != nil {
 		s.aggProc.Stop()
 	}
-	s.archCleaner.Stop()
-	s.dynCfg.Stop()
-	s.orch.Stop()
-	s.sched.Stop()
-	s.elector.Stop()
-
+	if s.archCleaner != nil {
+		s.archCleaner.Stop()
+	}
+	if s.dynCfg != nil {
+		s.dynCfg.Stop()
+	}
+	if s.orch != nil {
+		s.orch.Stop()
+	}
+	if s.sched != nil {
+		s.sched.Stop()
+	}
+	if s.elector != nil {
+		s.elector.Stop()
+	}
 	if s.rdb != nil {
 		s.rdb.Close()
 	}

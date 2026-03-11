@@ -14,9 +14,10 @@ import (
 // Dispatcher publishes work messages to Redis Streams
 // and events/results via the RedisStore.
 type Dispatcher struct {
-	store  *store.RedisStore
-	hooks  *types.Hooks
-	logger gochainedlog.Logger
+	store           *store.RedisStore
+	hooks           *types.Hooks
+	logger          gochainedlog.Logger
+	handlerVersions map[types.TaskType]string
 }
 
 // New creates a new dispatcher backed by Redis.
@@ -33,6 +34,12 @@ func New(s *store.RedisStore, logger gochainedlog.Logger) *Dispatcher {
 // SetHooks sets the lifecycle hooks that are fired on each event.
 func (d *Dispatcher) SetHooks(h *types.Hooks) {
 	d.hooks = h
+}
+
+// SetHandlerVersions sets the handler version map used to tag dispatched work messages.
+// This enables version-aware routing: workers with a mismatched version will skip and re-enqueue.
+func (d *Dispatcher) SetHandlerVersions(versions map[types.TaskType]string) {
+	d.handlerVersions = versions
 }
 
 // Dispatch publishes a work message for a job to the tier-appropriate Redis Stream.
@@ -52,6 +59,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) 
 		Headers:      job.Headers,
 		Priority:     priority,
 		DispatchedAt: now,
+	}
+	// Tag with handler version for version-aware routing.
+	if d.handlerVersions != nil {
+		if v, ok := d.handlerVersions[job.TaskType]; ok {
+			msg.Version = v
+		}
 	}
 
 	// Resolve the tier name from priority.

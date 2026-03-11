@@ -1932,7 +1932,7 @@ func (s *RedisStore) DeleteWorkflowEvents(ctx context.Context, workflowID string
 func (s *RedisStore) SetNodeDrain(ctx context.Context, nodeID string, drain bool) error {
 	key := NodeDrainKey(s.prefix, nodeID)
 	if drain {
-		return s.rdb.Do(ctx, s.rdb.B().Set().Key(key).Value("1").Ex(600*time.Second).Build()).Error()
+		return s.rdb.Do(ctx, s.rdb.B().Set().Key(key).Value("1").Build()).Error()
 	}
 	return s.rdb.Do(ctx, s.rdb.B().Del().Key(key).Build()).Error()
 }

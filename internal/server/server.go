@@ -32,6 +32,7 @@ type Server struct {
 	store       *store.RedisStore
 	registry    *HandlerRegistry
 	middlewares []types.MiddlewareFunc
+	hooks       types.Hooks
 	elector     *election.Elector
 	locker      *lock.Locker
 	sched       *scheduler.Scheduler
@@ -90,6 +91,24 @@ func (s *Server) RegisterHandler(def types.HandlerDefinition) error {
 	return s.registry.Register(def)
 }
 
+// Hooks returns the lifecycle hooks for direct manipulation.
+func (s *Server) Hooks() *types.Hooks { return &s.hooks }
+
+// OnJobCompleted registers a hook called when any job completes successfully.
+func (s *Server) OnJobCompleted(fn types.HookFunc) { s.hooks.OnJobCompleted = append(s.hooks.OnJobCompleted, fn) }
+
+// OnJobFailed registers a hook called when a job fails (may be retried).
+func (s *Server) OnJobFailed(fn types.HookFunc) { s.hooks.OnJobFailed = append(s.hooks.OnJobFailed, fn) }
+
+// OnJobDead registers a hook called when a job exhausts all retries.
+func (s *Server) OnJobDead(fn types.HookFunc) { s.hooks.OnJobDead = append(s.hooks.OnJobDead, fn) }
+
+// OnJobPaused registers a hook called when a job is paused.
+func (s *Server) OnJobPaused(fn types.HookFunc) { s.hooks.OnJobPaused = append(s.hooks.OnJobPaused, fn) }
+
+// OnJobResumed registers a hook called when a paused job is resumed.
+func (s *Server) OnJobResumed(fn types.HookFunc) { s.hooks.OnJobResumed = append(s.hooks.OnJobResumed, fn) }
+
 // Store returns the Redis store. Available after Start().
 func (s *Server) Store() *store.RedisStore { return s.store }
 
@@ -147,6 +166,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Initialize dispatcher.
 	s.disp = dispatcher.New(s.store, s.logger)
+	s.disp.SetHooks(&s.hooks)
+	if versions := s.registry.HandlerVersions(); len(versions) > 0 {
+		s.disp.SetHandlerVersions(versions)
+	}
 
 	// Initialize locker.
 	s.locker = lock.NewLocker(lock.LockerConfig{
@@ -253,18 +276,30 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Stop() error {
 	s.logger.Info().String("node_id", s.cfg.NodeID).Msg("server stopping")
 
-	s.work.Stop()
-	s.cancel()
-
+	if s.work != nil {
+		s.work.Stop()
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	if s.aggProc != nil {
 		s.aggProc.Stop()
 	}
-	s.archCleaner.Stop()
-	s.dynCfg.Stop()
-	s.orch.Stop()
-	s.sched.Stop()
-	s.elector.Stop()
-
+	if s.archCleaner != nil {
+		s.archCleaner.Stop()
+	}
+	if s.dynCfg != nil {
+		s.dynCfg.Stop()
+	}
+	if s.orch != nil {
+		s.orch.Stop()
+	}
+	if s.sched != nil {
+		s.sched.Stop()
+	}
+	if s.elector != nil {
+		s.elector.Stop()
+	}
 	if s.rdb != nil {
 		s.rdb.Close()
 	}
@@ -349,6 +384,7 @@ func (s *Server) createRedisClient() (rueidis.Client, error) {
 		sc := ropts.SentinelConfig
 		opt := rueidis.ClientOption{
 			InitAddress: sc.SentinelAddrs,
+			Username:    ropts.Username,
 			Password:    ropts.Password,
 			SelectDB:    ropts.DB,
 			Sentinel: rueidis.SentinelOption{
@@ -368,6 +404,7 @@ func (s *Server) createRedisClient() (rueidis.Client, error) {
 	if len(ropts.ClusterAddrs) > 0 {
 		opt := rueidis.ClientOption{
 			InitAddress:      ropts.ClusterAddrs,
+			Username:         ropts.Username,
 			Password:         ropts.Password,
 			BlockingPoolSize: max(ropts.PoolSize, 10),
 		}
@@ -393,7 +430,12 @@ func (s *Server) createRedisClient() (rueidis.Client, error) {
 		BlockingPoolSize: max(ropts.PoolSize, 10),
 	}
 
-	// Password from URL or option.
+	// Username + Password from URL or option.
+	if ropts.Username != "" {
+		opt.Username = ropts.Username
+	} else if u.User != nil {
+		opt.Username = u.User.Username()
+	}
 	if ropts.Password != "" {
 		opt.Password = ropts.Password
 	} else if u.User != nil {

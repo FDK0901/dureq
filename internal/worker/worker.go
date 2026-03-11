@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -260,7 +261,10 @@ func (w *Worker) priorityFetchLoop() {
 			if tier.RateLimit > 0 {
 				burst := tier.RateBurst
 				if burst <= 0 {
-					burst = int(tier.RateLimit)
+					burst = int(math.Ceil(tier.RateLimit))
+					if burst < 1 {
+						burst = 1
+					}
 				}
 				allowed, err := w.rateLimiter.Allow(w.ctx, tier.Name, batchSize, ratelimit.Config{
 					MaxTokens:  burst,
@@ -463,17 +467,20 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	// Look up handler.
 	def, ok := w.registry.Get(work.TaskType)
 	if !ok {
-		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		// Requeue/DLQ BEFORE ACK to prevent message loss if requeue fails.
 		if sm.Redeliveries >= maxRedeliveries {
 			if w.clusterHasTaskType(work.TaskType) {
 				w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0)
+				w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 				return
 			}
 			w.logger.Warn().String("task_type", string(work.TaskType)).Int("redeliveries", sm.Redeliveries).Msg("worker: no handler in cluster, sending to DLQ")
 			w.disp.DispatchToDLQ(w.ctx, &types.Job{ID: work.JobID, TaskType: work.TaskType, Payload: work.Payload}, "no handler registered for task type: "+string(work.TaskType))
+			w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 			return
 		}
 		w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1)
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		return
 	}
 
@@ -486,8 +493,9 @@ func (w *Worker) processMessage(sm *streamMessage) {
 			String("handler_version", def.Version).
 			String("msg_version", work.Version).
 			Msg("worker: version mismatch, re-enqueuing")
-		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		// Requeue BEFORE ACK to prevent message loss.
 		w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1)
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		return
 	}
 
@@ -604,7 +612,7 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		var output json.RawMessage
 		defer func() {
 			if r := recover(); r != nil {
-				execErr = &types.PanicError{Value: r}
+				execErr = &types.PanicError{Value: r, Stacktrace: string(debug.Stack())}
 			}
 			resCh <- executeResult{err: execErr, output: output}
 		}()
@@ -692,15 +700,95 @@ func (w *Worker) finishProcessMessage(sm *streamMessage, work types.WorkMessage,
 	if res.err == nil {
 		run.Status = types.RunStatusSucceeded
 		w.onSuccess(sm, work, run, res.output)
-	} else {
-		errStr := res.err.Error()
-		run.Status = types.RunStatusFailed
-		run.Error = &errStr
+		return
+	}
+
+	// Check for control flow errors before treating as failure.
+	ctrlClass := types.ClassifyControlFlow(res.err)
+	switch ctrlClass {
+	case types.ErrorClassSkip:
+		// Skip: ack message without changing job status.
+		run.Status = types.RunStatusSucceeded
 		syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(w.ctx, run); return err }, fmt.Sprintf("save run %s", run.ID))
-		w.onFailure(sm, work, run, res.err)
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
 		syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
+		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: handler requested skip")
+		return
+
+	case types.ErrorClassRepeat:
+		// Repeat: re-enqueue for immediate re-execution.
+		run.Status = types.RunStatusSucceeded
+		syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(w.ctx, run); return err }, fmt.Sprintf("save run %s", run.ID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
+		syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
+		var repeatErr *types.RepeatError
+		if errors.As(res.err, &repeatErr) && repeatErr.Delay > 0 {
+			retryWork := work
+			w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(repeatErr.Delay))
+		} else {
+			w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0)
+		}
+		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: handler requested repeat")
+		return
+
+	case types.ErrorClassPause:
+		// Pause: transition job to paused state.
+		run.Status = types.RunStatusFailed
+		errStr := res.err.Error()
+		run.Error = &errStr
+		syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(w.ctx, run); return err }, fmt.Sprintf("save run %s", run.ID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
+		syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
+		w.pauseJob(work, res.err)
+		return
 	}
+
+	// Standard failure path.
+	errStr := res.err.Error()
+	run.Status = types.RunStatusFailed
+	run.Error = &errStr
+	syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(w.ctx, run); return err }, fmt.Sprintf("save run %s", run.ID))
+	w.onFailure(sm, work, run, res.err)
+	syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
+	syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
+}
+
+// pauseJob transitions a job to paused status.
+func (w *Worker) pauseJob(work types.WorkMessage, execErr error) {
+	job, rev, err := w.store.GetJob(w.ctx, work.JobID)
+	if err != nil {
+		w.logger.Error().String("job_id", work.JobID).Err(err).Msg("worker: failed to get job for pause")
+		return
+	}
+
+	now := time.Now()
+	errStr := execErr.Error()
+	job.Status = types.JobStatusPaused
+	job.LastError = &errStr
+	job.PausedAt = &now
+	job.UpdatedAt = now
+
+	var pauseErr *types.PauseError
+	if errors.As(execErr, &pauseErr) && pauseErr.RetryAfter > 0 {
+		resumeAt := now.Add(pauseErr.RetryAfter)
+		job.ResumeAt = &resumeAt
+	}
+
+	syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("pause job %s", work.JobID))
+
+	w.disp.PublishEvent(types.JobEvent{
+		Type:      types.EventJobPaused,
+		JobID:     work.JobID,
+		RunID:     work.RunID,
+		NodeID:    w.nodeID,
+		TaskType:  work.TaskType,
+		Attempt:   work.Attempt,
+		Error:     &errStr,
+		Timestamp: now,
+	})
 }
 
 func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types.JobRun, output json.RawMessage) {
@@ -741,6 +829,7 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 	job.LastRunAt = &now
 	job.Attempt = work.Attempt + 1
 	job.LastError = nil
+	job.ConsecutiveErrors = 0 // reset on success
 	job.UpdatedAt = now
 
 	// Only mark as completed if there's no active schedule.
@@ -787,7 +876,9 @@ func (w *Worker) drainOverlapBuffer(jobID string, job *types.Job) {
 		return
 	}
 
-	w.disp.Dispatch(ctx, job, job.Attempt)
+	if err := w.disp.Dispatch(ctx, job, job.Attempt); err != nil {
+		w.logger.Error().Err(err).String("job_id", jobID).Msg("drainOverlapBuffer: dispatch failed")
+	}
 }
 
 func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types.JobRun, execErr error) {
@@ -820,6 +911,7 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 	job.LastRunAt = &now
 	job.LastError = &errStr
 	job.Attempt = work.Attempt + 1
+	job.ConsecutiveErrors++
 	job.UpdatedAt = now
 
 	// Check NonRetryableErrors list: if the error message contains any of the
@@ -838,12 +930,39 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		maxAttempts = *job.DLQAfter
 	}
 
+	// Check if we should auto-pause instead of going to dead.
+	shouldPause := retryPolicy.PauseAfterErrCount > 0 &&
+		job.ConsecutiveErrors >= retryPolicy.PauseAfterErrCount
+
 	switch {
 	case errClass == types.ErrorClassNonRetryable:
 		job.Status = types.JobStatusDead
 		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
 		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		w.disp.DispatchToDLQ(w.ctx, job, errStr)
+
+	case shouldPause:
+		// Auto-pause: consecutive error threshold reached.
+		job.Status = types.JobStatusPaused
+		job.PausedAt = &now
+		if retryPolicy.PauseRetryDelay > 0 {
+			resumeAt := now.Add(retryPolicy.PauseRetryDelay)
+			job.ResumeAt = &resumeAt
+		}
+		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("pause job %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		w.logger.Warn().String("job_id", work.JobID).Int("consecutive_errors", job.ConsecutiveErrors).Msg("worker: auto-paused after consecutive errors")
+		w.disp.PublishEvent(types.JobEvent{
+			Type:      types.EventJobPaused,
+			JobID:     work.JobID,
+			RunID:     work.RunID,
+			NodeID:    w.nodeID,
+			TaskType:  work.TaskType,
+			Attempt:   work.Attempt,
+			Error:     &errStr,
+			Timestamp: now,
+		})
+		return // skip the generic failed event below
 
 	case job.Attempt >= maxAttempts:
 		job.Status = types.JobStatusDead
@@ -854,23 +973,25 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 	case errClass == types.ErrorClassRateLimited:
 		job.Status = types.JobStatusRetrying
 		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		retryAfter := types.GetRetryAfter(execErr)
 		if retryAfter == 0 {
 			retryAfter = retryPolicy.InitialDelay
 		}
 		retryWork := work
 		retryWork.Attempt = job.Attempt
-		w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(retryAfter))
+		// AddDelayed BEFORE ACK to prevent job loss if ACK succeeds but AddDelayed fails.
+		syncRetrySave(w.syncer, func() error { return w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(retryAfter)) }, fmt.Sprintf("add delayed retry %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 
 	default:
 		job.Status = types.JobStatusRetrying
 		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		retryWork := work
 		retryWork.Attempt = job.Attempt
 		delay := calculateBackoff(retryWork.Attempt, retryPolicy)
-		w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(delay))
+		// AddDelayed BEFORE ACK to prevent job loss if ACK succeeds but AddDelayed fails.
+		syncRetrySave(w.syncer, func() error { return w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(delay)) }, fmt.Sprintf("add delayed retry %s", work.JobID))
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 	}
 
 	w.disp.PublishEvent(types.JobEvent{
@@ -909,12 +1030,17 @@ func (w *Worker) clusterHasTaskType(tt types.TaskType) bool {
 	if err != nil {
 		return false
 	}
+	target := string(tt)
 	for _, node := range nodes {
 		if node.NodeID == w.nodeID {
 			continue
 		}
 		for _, t := range node.TaskTypes {
-			if t == string(tt) {
+			if t == target {
+				return true
+			}
+			// Wildcard pattern match: "email:*" matches "email:send".
+			if strings.HasSuffix(t, "*") && strings.HasPrefix(target, t[:len(t)-1]) {
 				return true
 			}
 		}

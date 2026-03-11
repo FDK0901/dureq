@@ -132,7 +132,7 @@ local moved = 0
 for _, msgJson in ipairs(msgs) do
   local ok, msg = pcall(cjson.decode, msgJson)
   if ok and msg then
-    redis.call('XADD', stream, '*',
+    local args = {
       'run_id', msg.run_id or '',
       'job_id', msg.job_id or '',
       'task_type', msg.task_type or '',
@@ -141,8 +141,18 @@ for _, msgJson in ipairs(msgs) do
       'deadline', msg.deadline or '',
       'priority', tostring(msg.priority or 0),
       'dispatched_at', msg.dispatched_at or '',
-      'tier', msg.tier or ''
-    )
+      'tier', msg.tier or '',
+      'version', msg.version or ''
+    }
+    if msg.headers and msg.headers ~= '' then
+      args[#args+1] = 'headers'
+      args[#args+1] = msg.headers
+    end
+    if msg.metadata and msg.metadata ~= '' then
+      args[#args+1] = 'metadata'
+      args[#args+1] = msg.metadata
+    end
+    redis.call('XADD', stream, '*', unpack(args))
     redis.call('ZREM', delayed, msgJson)
     moved = moved + 1
   end

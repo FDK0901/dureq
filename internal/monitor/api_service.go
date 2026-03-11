@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/FDK0901/dureq/internal/store"
+	"github.com/FDK0901/dureq/internal/workflow"
 	"github.com/FDK0901/dureq/pkg/types"
 	gochainedlog "github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
@@ -80,6 +81,35 @@ func (a *APIService) signalCancelActiveRuns(ctx context.Context, jobID string) {
 	for _, run := range runs {
 		a.store.Client().Do(ctx, a.store.Client().B().Publish().Channel(a.store.CancelChannel()).Message(run.ID).Build())
 	}
+}
+
+// cancelChildWorkflow recursively cancels a child workflow and all its tasks.
+func (a *APIService) cancelChildWorkflow(ctx context.Context, childWfID string) {
+	childWf, rev, err := a.store.GetWorkflow(ctx, childWfID)
+	if err != nil || childWf.Status.IsTerminal() {
+		return
+	}
+
+	now := time.Now()
+	childWf.Status = types.WorkflowStatusCancelled
+	childWf.CompletedAt = &now
+	childWf.UpdatedAt = now
+
+	for name, state := range childWf.Tasks {
+		if !state.Status.IsTerminal() {
+			if state.JobID != "" {
+				a.signalCancelActiveRuns(ctx, state.JobID)
+			}
+			if state.ChildWorkflowID != "" {
+				a.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+			}
+			state.Status = types.JobStatusCancelled
+			state.FinishedAt = &now
+			childWf.Tasks[name] = state
+		}
+	}
+
+	a.store.UpdateWorkflow(ctx, childWf, rev)
 }
 
 // ===================== Jobs =====================
@@ -293,6 +323,92 @@ func (a *APIService) GetWorkflow(ctx context.Context, wfID string) (*types.Workf
 	return wf, nil
 }
 
+// ValidateResult holds the result of a workflow definition validation.
+type ValidateResult struct {
+	Valid  bool     `json:"valid"`
+	Errors []string `json:"errors,omitempty"`
+}
+
+func (a *APIService) ValidateWorkflowDefinition(_ context.Context, def *types.WorkflowDefinition) *ValidateResult {
+	if err := workflow.ValidateDAG(def); err != nil {
+		return &ValidateResult{Valid: false, Errors: []string{err.Error()}}
+	}
+	return &ValidateResult{Valid: true}
+}
+
+func (a *APIService) SuspendWorkflow(ctx context.Context, wfID string) error {
+	const maxCASRetries = 5
+	for attempt := 0; attempt < maxCASRetries; attempt++ {
+		wf, rev, err := a.store.GetWorkflow(ctx, wfID)
+		if err != nil {
+			return &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+		}
+		if wf.Status != types.WorkflowStatusRunning {
+			return &ApiError{Msg: "can only suspend running workflows", StatusCode: http.StatusBadRequest}
+		}
+		now := time.Now()
+		wf.Status = types.WorkflowStatusSuspended
+		wf.UpdatedAt = now
+		if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+			if attempt < maxCASRetries-1 {
+				continue
+			}
+			return err
+		}
+		a.dispatcher.PublishEvent(types.JobEvent{
+			Type: types.EventWorkflowSuspended, JobID: wfID, Timestamp: now,
+		})
+		return nil
+	}
+	return fmt.Errorf("suspend workflow: max CAS retries exceeded")
+}
+
+func (a *APIService) ResumeWorkflow(ctx context.Context, wfID string) error {
+	const maxCASRetries = 5
+	for attempt := 0; attempt < maxCASRetries; attempt++ {
+		wf, rev, err := a.store.GetWorkflow(ctx, wfID)
+		if err != nil {
+			return &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+		}
+		if wf.Status != types.WorkflowStatusSuspended {
+			return &ApiError{Msg: "can only resume suspended workflows", StatusCode: http.StatusBadRequest}
+		}
+		now := time.Now()
+		wf.Status = types.WorkflowStatusRunning
+		wf.UpdatedAt = now
+		if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+			if attempt < maxCASRetries-1 {
+				continue
+			}
+			return err
+		}
+		a.dispatcher.PublishEvent(types.JobEvent{
+			Type: types.EventWorkflowResumed, JobID: wfID, Timestamp: now,
+		})
+		return nil
+	}
+	return fmt.Errorf("resume workflow: max CAS retries exceeded")
+}
+
+func (a *APIService) GetWorkflowTaskResult(ctx context.Context, wfID, taskName string) (json.RawMessage, error) {
+	wf, _, err := a.store.GetWorkflow(ctx, wfID)
+	if err != nil {
+		return nil, &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	state, ok := wf.Tasks[taskName]
+	if !ok {
+		return nil, &ApiError{Msg: "task not found: " + taskName, StatusCode: http.StatusNotFound}
+	}
+	if state.JobID == "" {
+		return nil, &ApiError{Msg: "task has no job ID (not yet dispatched)", StatusCode: http.StatusNotFound}
+	}
+	result, err := a.store.GetResult(ctx, state.JobID)
+	if err != nil {
+		return nil, &ApiError{Msg: "result not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	return result.Output, nil
+}
+
 func (a *APIService) CancelWorkflow(ctx context.Context, wfID string) error {
 	const maxCASRetries = 5
 	for attempt := 0; attempt < maxCASRetries; attempt++ {
@@ -325,6 +441,10 @@ func (a *APIService) CancelWorkflow(ctx context.Context, wfID string) error {
 					}
 					a.signalCancelActiveRuns(ctx, state.JobID)
 				}
+				// Recursively cancel child workflows spawned by this task.
+				if state.ChildWorkflowID != "" {
+					a.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+				}
 			}
 		}
 
@@ -349,6 +469,9 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 	wf, rev, err := a.store.GetWorkflow(ctx, wfID)
 	if err != nil {
 		return &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	if !wf.Status.IsTerminal() {
+		return &ApiError{Msg: "cannot retry: workflow is " + string(wf.Status), StatusCode: http.StatusConflict}
 	}
 
 	now := time.Now()
@@ -445,6 +568,21 @@ func (a *APIService) CancelBatch(ctx context.Context, batchID string) error {
 				}
 			}
 		}
+		// Cancel onetime task if still running.
+		if batch.OnetimeState != nil && !batch.OnetimeState.Status.IsTerminal() {
+			if batch.OnetimeState.JobID != "" {
+				if childJob, childRev, err := a.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+					if !childJob.Status.IsTerminal() {
+						childJob.Status = types.JobStatusCancelled
+						childJob.UpdatedAt = now
+						a.store.UpdateJob(ctx, childJob, childRev)
+					}
+				}
+				a.signalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+			}
+			batch.OnetimeState.Status = types.JobStatusCancelled
+			batch.OnetimeState.FinishedAt = &now
+		}
 
 		if _, err := a.store.UpdateBatch(ctx, batch, rev); err != nil {
 			if attempt < maxCASRetries-1 {
@@ -467,6 +605,9 @@ func (a *APIService) RetryBatch(ctx context.Context, batchID string, retryFailed
 	batch, rev, err := a.store.GetBatch(ctx, batchID)
 	if err != nil {
 		return &ApiError{Msg: "batch not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	if !batch.Status.IsTerminal() {
+		return &ApiError{Msg: "cannot retry: batch is " + string(batch.Status), StatusCode: http.StatusConflict}
 	}
 
 	now := time.Now()
@@ -587,10 +728,14 @@ func (a *APIService) ResumeQueue(ctx context.Context, tierName string) error {
 
 // StatsResponse holds overall system statistics.
 type StatsResponse struct {
-	JobCounts       map[types.JobStatus]int `json:"job_counts"`
-	ActiveSchedules int                     `json:"active_schedules"`
-	ActiveRuns      int                     `json:"active_runs"`
-	ActiveNodes     int                     `json:"active_nodes"`
+	JobCounts       map[types.JobStatus]int        `json:"job_counts"`
+	ActiveSchedules int                            `json:"active_schedules"`
+	ActiveRuns      int                            `json:"active_runs"`
+	ActiveNodes     int                            `json:"active_nodes"`
+	WorkflowCounts  map[types.WorkflowStatus]int   `json:"workflow_counts,omitempty"`
+	BatchCounts     map[types.WorkflowStatus]int   `json:"batch_counts,omitempty"`
+	ActiveWorkflows int                            `json:"active_workflows"`
+	ActiveBatches   int                            `json:"active_batches"`
 }
 
 func (a *APIService) GetStats(ctx context.Context) (*StatsResponse, error) {
@@ -603,11 +748,43 @@ func (a *APIService) GetStats(ctx context.Context) (*StatsResponse, error) {
 	runs, _ := a.store.ListRuns(ctx)
 	nodes, _ := a.store.ListNodes(ctx)
 
+	// Count workflows by status.
+	workflowCounts := make(map[types.WorkflowStatus]int)
+	activeWorkflows := 0
+	for _, status := range []types.WorkflowStatus{types.WorkflowStatusPending, types.WorkflowStatusRunning, types.WorkflowStatusCompleted, types.WorkflowStatusFailed, types.WorkflowStatusCancelled, types.WorkflowStatusSuspended} {
+		s := status
+		_, total, _ := a.store.ListWorkflowInstances(ctx, store.WorkflowFilter{Status: &s, Limit: 0})
+		if total > 0 {
+			workflowCounts[status] = total
+		}
+		if status == types.WorkflowStatusRunning {
+			activeWorkflows = total
+		}
+	}
+
+	// Count batches by status.
+	batchCounts := make(map[types.WorkflowStatus]int)
+	activeBatches := 0
+	for _, status := range []types.WorkflowStatus{types.WorkflowStatusPending, types.WorkflowStatusRunning, types.WorkflowStatusCompleted, types.WorkflowStatusFailed, types.WorkflowStatusCancelled} {
+		s := status
+		_, total, _ := a.store.ListBatchInstances(ctx, store.BatchFilter{Status: &s, Limit: 0})
+		if total > 0 {
+			batchCounts[status] = total
+		}
+		if status == types.WorkflowStatusRunning {
+			activeBatches = total
+		}
+	}
+
 	return &StatsResponse{
 		JobCounts:       jobCounts,
 		ActiveSchedules: len(schedules),
 		ActiveRuns:      len(runs),
 		ActiveNodes:     len(nodes),
+		WorkflowCounts:  workflowCounts,
+		BatchCounts:     batchCounts,
+		ActiveWorkflows: activeWorkflows,
+		ActiveBatches:   activeBatches,
 	}, nil
 }
 
@@ -642,17 +819,71 @@ func (a *APIService) GetDailyStats(ctx context.Context, days int) ([]DailyStatsE
 	return result, nil
 }
 
-func (a *APIService) GetRedisInfo(ctx context.Context, section string) (map[string]map[string]string, error) {
+// RedisNodeInfo holds parsed INFO output for a single Redis node.
+type RedisNodeInfo struct {
+	Addr     string                       `json:"addr"`
+	Role     string                       `json:"role"`
+	Sections map[string]map[string]string `json:"sections"`
+}
+
+// RedisInfoResponse holds Redis INFO for all nodes with mode indicator.
+type RedisInfoResponse struct {
+	Mode  string          `json:"mode"` // "cluster" or "standalone"
+	Nodes []RedisNodeInfo `json:"nodes"`
+}
+
+func (a *APIService) GetRedisInfo(ctx context.Context, section string) (*RedisInfoResponse, error) {
 	if section == "" {
 		section = "all"
 	}
 
-	info, err := a.store.Client().Do(ctx, a.store.Client().B().Info().Section(section).Build()).ToString()
+	rdb := a.store.Client()
+	nodes := rdb.Nodes()
+
+	// Cluster mode: query each node individually.
+	if len(nodes) > 0 {
+		resp := &RedisInfoResponse{Mode: "cluster"}
+		for addr, node := range nodes {
+			info, err := node.Do(ctx, node.B().Info().Section(section).Build()).ToString()
+			if err != nil {
+				continue // skip unreachable nodes
+			}
+			sections := store.ParseRedisInfo(info)
+			role := "unknown"
+			if repl, ok := sections["replication"]; ok {
+				if r, ok := repl["role"]; ok {
+					role = r
+				}
+			}
+			resp.Nodes = append(resp.Nodes, RedisNodeInfo{
+				Addr:     addr,
+				Role:     role,
+				Sections: sections,
+			})
+		}
+		return resp, nil
+	}
+
+	// Standalone mode: single node.
+	info, err := rdb.Do(ctx, rdb.B().Info().Section(section).Build()).ToString()
 	if err != nil {
 		return nil, err
 	}
-
-	return store.ParseRedisInfo(info), nil
+	sections := store.ParseRedisInfo(info)
+	role := "standalone"
+	if repl, ok := sections["replication"]; ok {
+		if r, ok := repl["role"]; ok {
+			role = r
+		}
+	}
+	return &RedisInfoResponse{
+		Mode: "standalone",
+		Nodes: []RedisNodeInfo{{
+			Addr:     "local",
+			Role:     role,
+			Sections: sections,
+		}},
+	}, nil
 }
 
 func (a *APIService) GetSyncRetries() any {
@@ -783,7 +1014,7 @@ func (a *APIService) BulkRetryJobs(ctx context.Context, req BulkRequest) (*BulkR
 	now := time.Now()
 	for _, id := range ids {
 		job, rev, err := a.store.GetJob(ctx, id)
-		if err != nil {
+		if err != nil || !job.Status.IsTerminal() {
 			continue
 		}
 		job.Status = types.JobStatusPending
@@ -821,6 +1052,11 @@ func (a *APIService) BulkDeleteJobs(ctx context.Context, req BulkRequest) (*Bulk
 
 	affected := 0
 	for _, id := range ids {
+		// Only delete terminal jobs to prevent orphaned running work.
+		job, _, err := a.store.GetJob(ctx, id)
+		if err != nil || !job.Status.IsTerminal() {
+			continue
+		}
 		if err := a.store.DeleteJob(ctx, id); err == nil {
 			a.store.DeleteSchedule(ctx, id)
 			affected++
@@ -946,6 +1182,11 @@ func (a *APIService) BulkDeleteWorkflows(ctx context.Context, req BulkRequest) (
 
 	affected := 0
 	for _, id := range ids {
+		// Only delete terminal workflows to prevent orphaned running tasks.
+		wf, _, err := a.store.GetWorkflow(ctx, id)
+		if err != nil || !wf.Status.IsTerminal() {
+			continue
+		}
 		if err := a.store.DeleteWorkflow(ctx, id); err == nil {
 			affected++
 		}
@@ -1082,6 +1323,11 @@ func (a *APIService) BulkDeleteBatches(ctx context.Context, req BulkRequest) (*B
 
 	affected := 0
 	for _, id := range ids {
+		// Only delete terminal batches to prevent orphaned running items.
+		batch, _, err := a.store.GetBatch(ctx, id)
+		if err != nil || !batch.Status.IsTerminal() {
+			continue
+		}
 		if err := a.store.DeleteBatch(ctx, id); err == nil {
 			affected++
 		}

@@ -1,0 +1,49 @@
+services:
+  redis-cluster:
+    image: redis:7-alpine
+    ports:
+      - "7001:7001"
+      - "7002:7002"
+      - "7003:7003"
+      - "7004:7004"
+      - "7005:7005"
+      - "7006:7006"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for port in 7001 7002 7003 7004 7005 7006; do
+          mkdir -p /data/$$port
+          redis-server \
+            --port $$port \
+            --cluster-enabled yes \
+            --cluster-config-file /data/$$port/nodes.conf \
+            --cluster-node-timeout 5000 \
+            --appendonly yes \
+            --appendfilename appendonly-$$port.aof \
+            --dbfilename dump-$$port.rdb \
+            --requirepass your-password \
+            --masterauth your-password \
+            --daemonize yes
+        done
+
+        for port in 7001 7002 7003 7004 7005 7006; do
+          until redis-cli -p $$port -a your-password ping 2>/dev/null | grep -q PONG; do
+            sleep 0.3
+          done
+        done
+
+        if ! redis-cli -p 7001 -a your-password cluster info 2>/dev/null | grep -q 'cluster_state:ok'; then
+          echo yes | redis-cli -a your-password --cluster create \
+            127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 \
+            127.0.0.1:7004 127.0.0.1:7005 127.0.0.1:7006 \
+            --cluster-replicas 1
+        fi
+
+        echo "Redis Cluster ready"
+        tail -f /dev/null
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 7001 -a your-password cluster info 2>/dev/null | grep -q cluster_state:ok"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 10s

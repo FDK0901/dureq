@@ -319,6 +319,67 @@ func (x *GetDailyStatsResponse) GetEntries() []*DailyStatsEntry {
 	return nil
 }
 
+// RedisNodeInfo holds Redis INFO for a single node.
+type RedisNodeInfo struct {
+	state         protoimpl.MessageState       `protogen:"open.v1"`
+	Addr          string                       `protobuf:"bytes,1,opt,name=addr,proto3" json:"addr,omitempty"`
+	Role          string                       `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
+	Sections      map[string]*RedisInfoSection `protobuf:"bytes,3,rep,name=sections,proto3" json:"sections,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RedisNodeInfo) Reset() {
+	*x = RedisNodeInfo{}
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RedisNodeInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RedisNodeInfo) ProtoMessage() {}
+
+func (x *RedisNodeInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RedisNodeInfo.ProtoReflect.Descriptor instead.
+func (*RedisNodeInfo) Descriptor() ([]byte, []int) {
+	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *RedisNodeInfo) GetAddr() string {
+	if x != nil {
+		return x.Addr
+	}
+	return ""
+}
+
+func (x *RedisNodeInfo) GetRole() string {
+	if x != nil {
+		return x.Role
+	}
+	return ""
+}
+
+func (x *RedisNodeInfo) GetSections() map[string]*RedisInfoSection {
+	if x != nil {
+		return x.Sections
+	}
+	return nil
+}
+
 type GetRedisInfoRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Section       string                 `protobuf:"bytes,1,opt,name=section,proto3" json:"section,omitempty"`
@@ -328,7 +389,7 @@ type GetRedisInfoRequest struct {
 
 func (x *GetRedisInfoRequest) Reset() {
 	*x = GetRedisInfoRequest{}
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[6]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -340,7 +401,7 @@ func (x *GetRedisInfoRequest) String() string {
 func (*GetRedisInfoRequest) ProtoMessage() {}
 
 func (x *GetRedisInfoRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[6]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -353,7 +414,7 @@ func (x *GetRedisInfoRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRedisInfoRequest.ProtoReflect.Descriptor instead.
 func (*GetRedisInfoRequest) Descriptor() ([]byte, []int) {
-	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{6}
+	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetRedisInfoRequest) GetSection() string {
@@ -364,15 +425,18 @@ func (x *GetRedisInfoRequest) GetSection() string {
 }
 
 type GetRedisInfoResponse struct {
-	state         protoimpl.MessageState       `protogen:"open.v1"`
-	Sections      map[string]*RedisInfoSection `protobuf:"bytes,1,rep,name=sections,proto3" json:"sections,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Mode  string                 `protobuf:"bytes,1,opt,name=mode,proto3" json:"mode,omitempty"` // "cluster" or "standalone"
+	Nodes []*RedisNodeInfo       `protobuf:"bytes,2,rep,name=nodes,proto3" json:"nodes,omitempty"`
+	// Deprecated: use nodes[0].sections for single-node compat.
+	Sections      map[string]*RedisInfoSection `protobuf:"bytes,3,rep,name=sections,proto3" json:"sections,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetRedisInfoResponse) Reset() {
 	*x = GetRedisInfoResponse{}
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[7]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -384,7 +448,7 @@ func (x *GetRedisInfoResponse) String() string {
 func (*GetRedisInfoResponse) ProtoMessage() {}
 
 func (x *GetRedisInfoResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[7]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -397,7 +461,21 @@ func (x *GetRedisInfoResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRedisInfoResponse.ProtoReflect.Descriptor instead.
 func (*GetRedisInfoResponse) Descriptor() ([]byte, []int) {
-	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{7}
+	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GetRedisInfoResponse) GetMode() string {
+	if x != nil {
+		return x.Mode
+	}
+	return ""
+}
+
+func (x *GetRedisInfoResponse) GetNodes() []*RedisNodeInfo {
+	if x != nil {
+		return x.Nodes
+	}
+	return nil
 }
 
 func (x *GetRedisInfoResponse) GetSections() map[string]*RedisInfoSection {
@@ -415,7 +493,7 @@ type GetSyncRetriesRequest struct {
 
 func (x *GetSyncRetriesRequest) Reset() {
 	*x = GetSyncRetriesRequest{}
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[8]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -427,7 +505,7 @@ func (x *GetSyncRetriesRequest) String() string {
 func (*GetSyncRetriesRequest) ProtoMessage() {}
 
 func (x *GetSyncRetriesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[8]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -440,7 +518,7 @@ func (x *GetSyncRetriesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSyncRetriesRequest.ProtoReflect.Descriptor instead.
 func (*GetSyncRetriesRequest) Descriptor() ([]byte, []int) {
-	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{8}
+	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{9}
 }
 
 type GetSyncRetriesResponse struct {
@@ -453,7 +531,7 @@ type GetSyncRetriesResponse struct {
 
 func (x *GetSyncRetriesResponse) Reset() {
 	*x = GetSyncRetriesResponse{}
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[9]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -465,7 +543,7 @@ func (x *GetSyncRetriesResponse) String() string {
 func (*GetSyncRetriesResponse) ProtoMessage() {}
 
 func (x *GetSyncRetriesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[9]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -478,7 +556,7 @@ func (x *GetSyncRetriesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSyncRetriesResponse.ProtoReflect.Descriptor instead.
 func (*GetSyncRetriesResponse) Descriptor() ([]byte, []int) {
-	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{9}
+	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GetSyncRetriesResponse) GetData() []byte {
@@ -496,7 +574,7 @@ type HealthRequest struct {
 
 func (x *HealthRequest) Reset() {
 	*x = HealthRequest{}
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[10]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -508,7 +586,7 @@ func (x *HealthRequest) String() string {
 func (*HealthRequest) ProtoMessage() {}
 
 func (x *HealthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[10]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -521,7 +599,7 @@ func (x *HealthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthRequest.ProtoReflect.Descriptor instead.
 func (*HealthRequest) Descriptor() ([]byte, []int) {
-	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{10}
+	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{11}
 }
 
 type HealthResponse struct {
@@ -533,7 +611,7 @@ type HealthResponse struct {
 
 func (x *HealthResponse) Reset() {
 	*x = HealthResponse{}
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[11]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -545,7 +623,7 @@ func (x *HealthResponse) String() string {
 func (*HealthResponse) ProtoMessage() {}
 
 func (x *HealthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[11]
+	mi := &file_dureq_monitor_v1_stats_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -558,7 +636,7 @@ func (x *HealthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthResponse.ProtoReflect.Descriptor instead.
 func (*HealthResponse) Descriptor() ([]byte, []int) {
-	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{11}
+	return file_dureq_monitor_v1_stats_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *HealthResponse) GetStatus() string {
@@ -596,11 +674,20 @@ const file_dureq_monitor_v1_stats_proto_rawDesc = "" +
 	"\x14GetDailyStatsRequest\x12\x12\n" +
 	"\x04days\x18\x01 \x01(\x05R\x04days\"T\n" +
 	"\x15GetDailyStatsResponse\x12;\n" +
-	"\aentries\x18\x01 \x03(\v2!.dureq.monitor.v1.DailyStatsEntryR\aentries\"/\n" +
+	"\aentries\x18\x01 \x03(\v2!.dureq.monitor.v1.DailyStatsEntryR\aentries\"\xe3\x01\n" +
+	"\rRedisNodeInfo\x12\x12\n" +
+	"\x04addr\x18\x01 \x01(\tR\x04addr\x12\x12\n" +
+	"\x04role\x18\x02 \x01(\tR\x04role\x12I\n" +
+	"\bsections\x18\x03 \x03(\v2-.dureq.monitor.v1.RedisNodeInfo.SectionsEntryR\bsections\x1a_\n" +
+	"\rSectionsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x128\n" +
+	"\x05value\x18\x02 \x01(\v2\".dureq.monitor.v1.RedisInfoSectionR\x05value:\x028\x01\"/\n" +
 	"\x13GetRedisInfoRequest\x12\x18\n" +
-	"\asection\x18\x01 \x01(\tR\asection\"\xc9\x01\n" +
-	"\x14GetRedisInfoResponse\x12P\n" +
-	"\bsections\x18\x01 \x03(\v24.dureq.monitor.v1.GetRedisInfoResponse.SectionsEntryR\bsections\x1a_\n" +
+	"\asection\x18\x01 \x01(\tR\asection\"\x94\x02\n" +
+	"\x14GetRedisInfoResponse\x12\x12\n" +
+	"\x04mode\x18\x01 \x01(\tR\x04mode\x125\n" +
+	"\x05nodes\x18\x02 \x03(\v2\x1f.dureq.monitor.v1.RedisNodeInfoR\x05nodes\x12P\n" +
+	"\bsections\x18\x03 \x03(\v24.dureq.monitor.v1.GetRedisInfoResponse.SectionsEntryR\bsections\x1a_\n" +
 	"\rSectionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x128\n" +
 	"\x05value\x18\x02 \x01(\v2\".dureq.monitor.v1.RedisInfoSectionR\x05value:\x028\x01\"\x17\n" +
@@ -623,7 +710,7 @@ func file_dureq_monitor_v1_stats_proto_rawDescGZIP() []byte {
 	return file_dureq_monitor_v1_stats_proto_rawDescData
 }
 
-var file_dureq_monitor_v1_stats_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_dureq_monitor_v1_stats_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_dureq_monitor_v1_stats_proto_goTypes = []any{
 	(*RedisInfoSection)(nil),       // 0: dureq.monitor.v1.RedisInfoSection
 	(*DailyStatsEntry)(nil),        // 1: dureq.monitor.v1.DailyStatsEntry
@@ -631,27 +718,32 @@ var file_dureq_monitor_v1_stats_proto_goTypes = []any{
 	(*GetStatsResponse)(nil),       // 3: dureq.monitor.v1.GetStatsResponse
 	(*GetDailyStatsRequest)(nil),   // 4: dureq.monitor.v1.GetDailyStatsRequest
 	(*GetDailyStatsResponse)(nil),  // 5: dureq.monitor.v1.GetDailyStatsResponse
-	(*GetRedisInfoRequest)(nil),    // 6: dureq.monitor.v1.GetRedisInfoRequest
-	(*GetRedisInfoResponse)(nil),   // 7: dureq.monitor.v1.GetRedisInfoResponse
-	(*GetSyncRetriesRequest)(nil),  // 8: dureq.monitor.v1.GetSyncRetriesRequest
-	(*GetSyncRetriesResponse)(nil), // 9: dureq.monitor.v1.GetSyncRetriesResponse
-	(*HealthRequest)(nil),          // 10: dureq.monitor.v1.HealthRequest
-	(*HealthResponse)(nil),         // 11: dureq.monitor.v1.HealthResponse
-	nil,                            // 12: dureq.monitor.v1.RedisInfoSection.EntriesEntry
-	nil,                            // 13: dureq.monitor.v1.GetStatsResponse.JobCountsEntry
-	nil,                            // 14: dureq.monitor.v1.GetRedisInfoResponse.SectionsEntry
+	(*RedisNodeInfo)(nil),          // 6: dureq.monitor.v1.RedisNodeInfo
+	(*GetRedisInfoRequest)(nil),    // 7: dureq.monitor.v1.GetRedisInfoRequest
+	(*GetRedisInfoResponse)(nil),   // 8: dureq.monitor.v1.GetRedisInfoResponse
+	(*GetSyncRetriesRequest)(nil),  // 9: dureq.monitor.v1.GetSyncRetriesRequest
+	(*GetSyncRetriesResponse)(nil), // 10: dureq.monitor.v1.GetSyncRetriesResponse
+	(*HealthRequest)(nil),          // 11: dureq.monitor.v1.HealthRequest
+	(*HealthResponse)(nil),         // 12: dureq.monitor.v1.HealthResponse
+	nil,                            // 13: dureq.monitor.v1.RedisInfoSection.EntriesEntry
+	nil,                            // 14: dureq.monitor.v1.GetStatsResponse.JobCountsEntry
+	nil,                            // 15: dureq.monitor.v1.RedisNodeInfo.SectionsEntry
+	nil,                            // 16: dureq.monitor.v1.GetRedisInfoResponse.SectionsEntry
 }
 var file_dureq_monitor_v1_stats_proto_depIdxs = []int32{
-	12, // 0: dureq.monitor.v1.RedisInfoSection.entries:type_name -> dureq.monitor.v1.RedisInfoSection.EntriesEntry
-	13, // 1: dureq.monitor.v1.GetStatsResponse.job_counts:type_name -> dureq.monitor.v1.GetStatsResponse.JobCountsEntry
+	13, // 0: dureq.monitor.v1.RedisInfoSection.entries:type_name -> dureq.monitor.v1.RedisInfoSection.EntriesEntry
+	14, // 1: dureq.monitor.v1.GetStatsResponse.job_counts:type_name -> dureq.monitor.v1.GetStatsResponse.JobCountsEntry
 	1,  // 2: dureq.monitor.v1.GetDailyStatsResponse.entries:type_name -> dureq.monitor.v1.DailyStatsEntry
-	14, // 3: dureq.monitor.v1.GetRedisInfoResponse.sections:type_name -> dureq.monitor.v1.GetRedisInfoResponse.SectionsEntry
-	0,  // 4: dureq.monitor.v1.GetRedisInfoResponse.SectionsEntry.value:type_name -> dureq.monitor.v1.RedisInfoSection
-	5,  // [5:5] is the sub-list for method output_type
-	5,  // [5:5] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	15, // 3: dureq.monitor.v1.RedisNodeInfo.sections:type_name -> dureq.monitor.v1.RedisNodeInfo.SectionsEntry
+	6,  // 4: dureq.monitor.v1.GetRedisInfoResponse.nodes:type_name -> dureq.monitor.v1.RedisNodeInfo
+	16, // 5: dureq.monitor.v1.GetRedisInfoResponse.sections:type_name -> dureq.monitor.v1.GetRedisInfoResponse.SectionsEntry
+	0,  // 6: dureq.monitor.v1.RedisNodeInfo.SectionsEntry.value:type_name -> dureq.monitor.v1.RedisInfoSection
+	0,  // 7: dureq.monitor.v1.GetRedisInfoResponse.SectionsEntry.value:type_name -> dureq.monitor.v1.RedisInfoSection
+	8,  // [8:8] is the sub-list for method output_type
+	8,  // [8:8] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_dureq_monitor_v1_stats_proto_init() }
@@ -665,7 +757,7 @@ func file_dureq_monitor_v1_stats_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_dureq_monitor_v1_stats_proto_rawDesc), len(file_dureq_monitor_v1_stats_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   15,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

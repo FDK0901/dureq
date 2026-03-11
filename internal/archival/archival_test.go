@@ -6,10 +6,18 @@ import (
 )
 
 func TestConfig_DefaultRetentionPeriod(t *testing.T) {
-	c := New(Config{})
+	// Negative value triggers the 7-day default.
+	c := New(Config{RetentionPeriod: -1})
 	expected := 7 * 24 * time.Hour
 	if c.retentionPeriod != expected {
 		t.Fatalf("expected default RetentionPeriod %v, got %v", expected, c.retentionPeriod)
+	}
+}
+
+func TestConfig_ZeroRetentionDisablesArchival(t *testing.T) {
+	c := New(Config{})
+	if c.retentionPeriod != 0 {
+		t.Fatalf("expected RetentionPeriod 0 (disabled), got %v", c.retentionPeriod)
 	}
 }
 

@@ -65,6 +65,8 @@ func (s *RedisStore) ListJobsPaginated(ctx context.Context, filter JobFilter) ([
 	}
 
 	// Apply search filter (substring match on ID or TaskType) in memory.
+	// When search is active, total from the index is inaccurate because
+	// filtering happens post-fetch. Signal this with total=-1.
 	if filter.Search != nil && *filter.Search != "" {
 		search := strings.ToLower(*filter.Search)
 		filtered := jobs[:0]
@@ -75,6 +77,7 @@ func (s *RedisStore) ListJobsPaginated(ctx context.Context, filter JobFilter) ([
 			}
 		}
 		jobs = filtered
+		total = -1
 	}
 
 	return jobs, int(total), nil
@@ -269,6 +272,7 @@ func (s *RedisStore) ListWorkflowInstances(ctx context.Context, filter WorkflowF
 	}
 
 	// In-memory filter by workflow name if specified.
+	// When filtering is active, total from the index is inaccurate. Signal with -1.
 	if filter.WorkflowName != nil && *filter.WorkflowName != "" {
 		name := *filter.WorkflowName
 		filtered := wfs[:0]
@@ -278,6 +282,7 @@ func (s *RedisStore) ListWorkflowInstances(ctx context.Context, filter WorkflowF
 			}
 		}
 		wfs = filtered
+		total = -1
 	}
 
 	return wfs, int(total), nil
@@ -336,6 +341,7 @@ func (s *RedisStore) ListBatchInstances(ctx context.Context, filter BatchFilter)
 	}
 
 	// In-memory filter by name if specified.
+	// When filtering is active, total from the index is inaccurate. Signal with -1.
 	if filter.Name != nil && *filter.Name != "" {
 		name := *filter.Name
 		filtered := batches[:0]
@@ -345,6 +351,7 @@ func (s *RedisStore) ListBatchInstances(ctx context.Context, filter BatchFilter)
 			}
 		}
 		batches = filtered
+		total = -1
 	}
 
 	return batches, int(total), nil

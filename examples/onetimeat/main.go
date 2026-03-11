@@ -17,6 +17,7 @@ import (
 
 	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
 
+	"github.com/FDK0901/dureq/examples/shared"
 	"github.com/FDK0901/dureq/pkg/dureq"
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/rs/xid"
@@ -39,12 +40,11 @@ func main() {
 	// --- Server Side ---
 
 	srv, err := dureq.NewServer(
-		dureq.WithRedisURL("redis://localhost:6379"),
-		dureq.WithRedisDB(15),
-		dureq.WithRedisPassword("your-password"),
-		dureq.WithNodeID("onetimeat-node-1"),
-		dureq.WithMaxConcurrency(10),
-		dureq.WithLogger(logger),
+		append(shared.ServerOptions(),
+			dureq.WithNodeID("onetimeat-node-1"),
+			dureq.WithMaxConcurrency(10),
+			dureq.WithLogger(logger),
+		)...,
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create server")
@@ -92,11 +92,7 @@ func main() {
 
 	// --- Client Side ---
 
-	cli, err := dureq.NewClient(
-		dureq.WithClientRedisURL("redis://localhost:6379"),
-		dureq.WithClientRedisPassword("your-password"),
-		dureq.WithClientRedisDB(15),
-	)
+	cli, err := dureq.NewClient(shared.ClientOptions()...)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create client")
 		os.Exit(1)

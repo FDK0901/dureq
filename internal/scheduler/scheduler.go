@@ -120,7 +120,7 @@ func (s *Scheduler) tickLoop(ctx context.Context) {
 	}
 }
 
-// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs.
+// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs and paused jobs.
 func (s *Scheduler) tick(ctx context.Context) {
 	now := time.Now()
 
@@ -138,6 +138,50 @@ func (s *Scheduler) tick(ctx context.Context) {
 	if s.orphanInterval > 0 && now.Sub(s.lastOrphanCheck) >= s.orphanInterval {
 		s.lastOrphanCheck = now
 		s.checkOrphanedRuns(ctx)
+		s.resumePausedJobs(ctx, now)
+	}
+}
+
+// resumePausedJobs scans for paused jobs whose ResumeAt has passed and transitions them back to retrying.
+func (s *Scheduler) resumePausedJobs(ctx context.Context, now time.Time) {
+	jobs, err := s.store.ListPausedJobsDueForResume(ctx, now)
+	if err != nil {
+		if ctx.Err() == nil {
+			s.logger.Error().Err(err).Msg("scheduler: failed to list paused jobs for auto-resume")
+		}
+		return
+	}
+
+	for _, job := range jobs {
+		rev, err := s.store.GetJobRevision(ctx, job.ID)
+		if err != nil {
+			continue
+		}
+
+		job.Status = types.JobStatusRetrying
+		job.PausedAt = nil
+		job.ResumeAt = nil
+		job.ConsecutiveErrors = 0
+		job.UpdatedAt = now
+
+		if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+			s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: failed to resume paused job")
+			continue
+		}
+
+		if err := s.dispatcher.Dispatch(ctx, job, job.Attempt); err != nil {
+			s.logger.Error().String("job_id", job.ID).Err(err).Msg("scheduler: failed to dispatch resumed job")
+			continue
+		}
+
+		s.dispatcher.PublishEvent(types.JobEvent{
+			Type:      types.EventJobResumed,
+			JobID:     job.ID,
+			TaskType:  job.TaskType,
+			Timestamp: now,
+		})
+
+		s.logger.Info().String("job_id", job.ID).Msg("scheduler: auto-resumed paused job")
 	}
 }
 
@@ -194,7 +238,9 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 			case types.OverlapReplace:
 				s.logger.Info().String("job_id", entry.JobID).Msg("scheduler: cancelling active runs for REPLACE overlap")
 				s.cancelActiveRunsForJob(ctx, entry.JobID)
-				// Fall through to dispatch the new run.
+				// NOTE: cancel is async (pub/sub signal). A short overlap window is
+				// possible until the worker processes the cancellation. This is
+				// best-effort by design — a synchronous wait would block the scheduler tick.
 			}
 		}
 	}
@@ -345,6 +391,9 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 	// Pre-fetch per-job heartbeat timeouts to avoid N×GetJob calls.
 	jobTimeouts := make(map[string]time.Duration)
 
+	// Track dead nodes to clean up their drain keys (persistent since TTL was removed).
+	deadNodes := make(map[string]struct{})
+
 	for _, run := range runs {
 		// Only check non-terminal runs.
 		if run.Status.IsTerminal() {
@@ -389,6 +438,7 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 		}
 
 		// This run is orphaned.
+		deadNodes[run.NodeID] = struct{}{}
 		errMsg := "node " + run.NodeID + " crashed or became unresponsive"
 		s.logger.Warn().String("run_id", run.ID).String("job_id", run.JobID).String("node_id", run.NodeID).Msg("scheduler: detected orphaned run")
 
@@ -397,6 +447,8 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 		run.FinishedAt = &now
 		run.Duration = now.Sub(run.StartedAt)
 		s.store.SaveRun(ctx, run)
+		// Record in run history before removing from active set.
+		s.store.SaveJobRun(ctx, run)
 
 		// Load the parent job.
 		job, rev, err := s.store.GetJob(ctx, run.JobID)
@@ -490,6 +542,11 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 
 		// Clean up the orphaned run entry.
 		s.store.DeleteRun(ctx, run.ID)
+	}
+
+	// Clean up persistent drain keys for dead nodes.
+	for nodeID := range deadNodes {
+		s.store.SetNodeDrain(ctx, nodeID, false)
 	}
 }
 

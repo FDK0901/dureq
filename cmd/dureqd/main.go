@@ -29,14 +29,19 @@ func main() {
 	opts := []server.Option{
 		server.WithLogger(logger),
 	}
-	if cfg.RedisConfig.URL != "" {
+	if len(cfg.RedisConfig.ClusterAddrs) > 0 {
+		opts = append(opts, server.WithRedisCluster(cfg.RedisConfig.ClusterAddrs))
+	} else if cfg.RedisConfig.URL != "" {
 		opts = append(opts, server.WithRedisURL(cfg.RedisConfig.URL))
+		if cfg.RedisConfig.DB != 0 {
+			opts = append(opts, server.WithRedisDB(cfg.RedisConfig.DB))
+		}
+	}
+	if cfg.RedisConfig.Username != "" {
+		opts = append(opts, server.WithRedisUsername(cfg.RedisConfig.Username))
 	}
 	if cfg.RedisConfig.Password != "" {
 		opts = append(opts, server.WithRedisPassword(cfg.RedisConfig.Password))
-	}
-	if cfg.RedisConfig.DB != 0 {
-		opts = append(opts, server.WithRedisDB(cfg.RedisConfig.DB))
 	}
 	if cfg.RedisConfig.PoolSize > 0 {
 		opts = append(opts, server.WithRedisPoolSize(cfg.RedisConfig.PoolSize))

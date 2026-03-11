@@ -75,7 +75,10 @@ func (s *RedisStore) FlushGroup(ctx context.Context, group string) ([]types.Grou
 	).AsStrSlice()
 	if err != nil {
 		// rueidis returns error for empty array from Lua; treat as no messages.
-		return nil, nil
+		if rueidis.IsRedisNil(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("flush group %s: %w", group, err)
 	}
 
 	if len(raw) == 0 {
@@ -145,6 +148,50 @@ func (s *RedisStore) ListReadyGroups(ctx context.Context, gracePeriod, maxDelay 
 	}
 
 	return ready, nil
+}
+
+// ReadGroup reads all messages from a group WITHOUT deleting them.
+// Use DeleteGroupMessages after successful processing to remove them.
+func (s *RedisStore) ReadGroup(ctx context.Context, group string) ([]types.GroupMessage, error) {
+	msgKey := GroupMessagesKey(s.prefix, group)
+
+	raw, err := s.rdb.Do(ctx, s.rdb.B().Lrange().Key(msgKey).Start(0).Stop(-1).Build()).AsStrSlice()
+	if err != nil {
+		if rueidis.IsRedisNil(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read group %s: %w", group, err)
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+
+	messages := make([]types.GroupMessage, 0, len(raw))
+	for _, r := range raw {
+		var msg types.GroupMessage
+		if sonic.ConfigFastest.Unmarshal([]byte(r), &msg) == nil {
+			messages = append(messages, msg)
+		}
+	}
+	return messages, nil
+}
+
+// DeleteGroupMessages atomically deletes all messages for a group and cleans up metadata.
+// Should be called only after successful processing of ReadGroup results.
+func (s *RedisStore) DeleteGroupMessages(ctx context.Context, group string) {
+	msgKey := GroupMessagesKey(s.prefix, group)
+
+	// Atomic read+delete to ensure concurrent callers don't double-process.
+	s.scriptFlushGroup.Exec(ctx, s.rdb, []string{msgKey}, []string{})
+
+	// Cleanup metadata and active set.
+	metaKey := GroupMetaKey(s.prefix, group)
+	setKey := GroupSetKey(s.prefix)
+	cleanup := rueidis.Commands{
+		s.rdb.B().Del().Key(metaKey).Build(),
+		s.rdb.B().Zrem().Key(setKey).Member(group).Build(),
+	}
+	s.rdb.DoMulti(ctx, cleanup...)
 }
 
 // GetGroupSize returns the number of messages in a group.

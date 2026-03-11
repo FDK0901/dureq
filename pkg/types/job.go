@@ -77,6 +77,14 @@ type RetryPolicy struct {
 	// If a task fails with an error containing any of these strings, it is immediately
 	// moved to dead status without retrying.
 	NonRetryableErrors []string `json:"non_retryable_errors,omitempty"`
+	// PauseAfterErrCount pauses the job instead of moving to dead when
+	// N consecutive errors are reached. 0 = disabled (go directly to dead).
+	// When set, the job transitions to "paused" instead of "dead" after
+	// this many consecutive failures, giving operators a chance to investigate.
+	PauseAfterErrCount int `json:"pause_after_err_count,omitempty"`
+	// PauseRetryDelay is the duration after which a paused job is automatically
+	// resumed. 0 = manual resume only.
+	PauseRetryDelay time.Duration `json:"pause_retry_delay,omitempty"`
 }
 
 // DefaultRetryPolicy returns a sensible default retry policy.
@@ -334,12 +342,15 @@ type Job struct {
 	RetryPolicy *RetryPolicy    `json:"retry_policy,omitempty"`
 
 	// State
-	Status      JobStatus  `json:"status"`
-	Attempt     int        `json:"attempt"`
-	LastError   *string    `json:"last_error,omitempty"`
-	LastRunAt   *time.Time `json:"last_run_at,omitempty"`
-	NextRunAt   *time.Time `json:"next_run_at,omitempty"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	Status            JobStatus  `json:"status"`
+	Attempt           int        `json:"attempt"`
+	ConsecutiveErrors int        `json:"consecutive_errors,omitempty"`
+	LastError         *string    `json:"last_error,omitempty"`
+	LastRunAt         *time.Time `json:"last_run_at,omitempty"`
+	NextRunAt         *time.Time `json:"next_run_at,omitempty"`
+	CompletedAt       *time.Time `json:"completed_at,omitempty"`
+	PausedAt          *time.Time `json:"paused_at,omitempty"`
+	ResumeAt          *time.Time `json:"resume_at,omitempty"` // auto-resume time (nil = manual only)
 
 	// Metadata
 	Tags      []string          `json:"tags,omitempty"`
@@ -453,6 +464,7 @@ const (
 	WorkflowStatusCompleted WorkflowStatus = "completed"
 	WorkflowStatusFailed    WorkflowStatus = "failed"
 	WorkflowStatusCancelled WorkflowStatus = "cancelled"
+	WorkflowStatusSuspended WorkflowStatus = "suspended"
 )
 
 func (s WorkflowStatus) IsTerminal() bool {
@@ -472,21 +484,94 @@ type WorkflowDefinition struct {
 	ExecutionTimeout *Duration      `json:"execution_timeout,omitempty"`
 	RetryPolicy      *RetryPolicy   `json:"retry_policy,omitempty"`
 	DefaultPriority  *Priority      `json:"default_priority,omitempty"`
+	Hooks            *WorkflowHooks `json:"hooks,omitempty"`
 }
 
+// WorkflowHooks defines lifecycle hooks that are automatically dispatched
+// at specific workflow lifecycle events.
+type WorkflowHooks struct {
+	OnInit    *WorkflowHookDef `json:"on_init,omitempty"`
+	OnSuccess *WorkflowHookDef `json:"on_success,omitempty"`
+	OnFailure *WorkflowHookDef `json:"on_failure,omitempty"`
+	OnExit    *WorkflowHookDef `json:"on_exit,omitempty"`
+}
+
+// WorkflowHookDef defines a single lifecycle hook job.
+type WorkflowHookDef struct {
+	TaskType TaskType        `json:"task_type"`
+	Payload  json.RawMessage `json:"payload,omitempty"`
+	Timeout  Duration        `json:"timeout,omitempty"`
+}
+
+// Precondition defines a condition that must be true before a task is dispatched.
+type Precondition struct {
+	Type     string `json:"type"`          // "upstream_output"
+	Task     string `json:"task,omitempty"` // upstream task name
+	Path     string `json:"path"`          // JSONPath in upstream output
+	Expected string `json:"expected"`      // expected value (string comparison)
+}
+
+// WorkflowTaskType distinguishes static tasks, condition nodes, and subflow generators.
+type WorkflowTaskType string
+
+const (
+	// WorkflowTaskStatic is a regular task dispatched as a job (default).
+	WorkflowTaskStatic WorkflowTaskType = ""
+	// WorkflowTaskCondition is a condition node whose handler returns a route index.
+	// The orchestrator evaluates the condition and branches to the corresponding successor.
+	WorkflowTaskCondition WorkflowTaskType = "condition"
+	// WorkflowTaskSubflow is a dynamic subflow node whose handler returns []WorkflowTask
+	// at runtime. The orchestrator injects these tasks into the workflow instance.
+	WorkflowTaskSubflow WorkflowTaskType = "subflow"
+)
+
 // WorkflowTask is one step in a workflow DAG.
-// A task is either a regular task (TaskType set) or a child workflow
-// (ChildWorkflowDef set). Exactly one of TaskType or ChildWorkflowDef should be set.
+// A task is either a regular task (TaskType set), a child workflow
+// (ChildWorkflowDef set), a condition node, or a dynamic subflow generator.
 type WorkflowTask struct {
 	Name      string          `json:"name"`
 	TaskType  TaskType        `json:"task_type"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 	DependsOn []string        `json:"depends_on,omitempty"`
 
+	// Priority controls dispatch order among concurrently ready tasks.
+	// Higher values are dispatched first. Default is 0.
+	Priority int `json:"priority,omitempty"`
+
+	// AllowFailure makes this task's failure non-fatal for the workflow.
+	// When true, the task's failure is logged but does not block downstream
+	// tasks or cause the workflow to fail. Downstream dependencies are
+	// considered "satisfied" even if this task fails.
+	AllowFailure bool `json:"allow_failure,omitempty"`
+
+	// ResultFrom specifies which upstream task's output should be injected
+	// as this task's payload when dispatching. The referenced task must be
+	// in DependsOn. If set, the original Payload field is ignored and
+	// replaced with the upstream task's result at dispatch time.
+	ResultFrom string `json:"result_from,omitempty"`
+
+	// Type distinguishes static tasks, condition nodes, and subflow generators.
+	// Empty string (default) means a regular static task.
+	Type WorkflowTaskType `json:"type,omitempty"`
+
+	// ConditionRoutes maps condition handler return values (0, 1, 2, ...)
+	// to successor task names. Only used when Type == WorkflowTaskCondition.
+	// The condition handler returns a uint; the orchestrator looks up the
+	// corresponding task name and marks only that branch as "satisfied".
+	ConditionRoutes map[uint]string `json:"condition_routes,omitempty"`
+
+	// MaxIterations limits how many times a condition node can be re-evaluated
+	// (to prevent infinite loops). Default 0 means use system default (100).
+	MaxIterations int `json:"max_iterations,omitempty"`
+
 	// ChildWorkflowDef, when set, makes this task spawn a child workflow
 	// instead of dispatching a regular job. The child runs independently
 	// and the parent task completes when the child workflow completes.
 	ChildWorkflowDef *WorkflowDefinition `json:"child_workflow_def,omitempty"`
+
+	// Preconditions define conditions that must be true before this task is dispatched.
+	// If any precondition fails, the task is skipped.
+	Preconditions []Precondition `json:"preconditions,omitempty"`
 }
 
 // WorkflowInstance is a running instance of a workflow definition.
@@ -501,11 +586,27 @@ type WorkflowInstance struct {
 	Attempt      int                          `json:"attempt,omitempty"`
 	MaxAttempts  int                          `json:"max_attempts,omitempty"`
 
+	// PendingDeps tracks the number of unresolved dependencies per task.
+	// Initialized at workflow start, decremented on dependency completion.
+	// A task with PendingDeps[name] == 0 and status == pending is ready.
+	PendingDeps map[string]int `json:"pending_deps,omitempty"`
+
+	// ConditionIterations tracks how many times each condition node has been
+	// evaluated, to enforce MaxIterations limits.
+	ConditionIterations map[string]int `json:"condition_iterations,omitempty"`
+
 	// ParentWorkflowID links this workflow to a parent workflow that spawned it
 	// as a child workflow task.
 	ParentWorkflowID *string `json:"parent_workflow_id,omitempty"`
 	// ParentTaskName is the task name in the parent workflow that this child represents.
 	ParentTaskName *string `json:"parent_task_name,omitempty"`
+
+	// HookStates tracks the state of lifecycle hooks dispatched for this workflow.
+	HookStates map[string]WorkflowTaskState `json:"hook_states,omitempty"`
+
+	// Output is the result of the final (leaf) task, copied here when the
+	// workflow completes so callers can retrieve the workflow-level result.
+	Output json.RawMessage `json:"output,omitempty"`
 
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
@@ -522,6 +623,15 @@ type WorkflowTaskState struct {
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 	// ChildWorkflowID is set when this task spawned a child workflow.
 	ChildWorkflowID string `json:"child_workflow_id,omitempty"`
+	// ConditionRoute is set when a condition node completes, indicating
+	// which route index was selected by the handler.
+	ConditionRoute *uint `json:"condition_route,omitempty"`
+	// SubflowTasks lists the task names that were dynamically injected
+	// by a subflow generator node.
+	SubflowTasks []string `json:"subflow_tasks,omitempty"`
+	// Skipped indicates the task was skipped due to a failed precondition.
+	Skipped    bool   `json:"skipped,omitempty"`
+	SkipReason string `json:"skip_reason,omitempty"`
 }
 
 // --- Batch Processing Types ---

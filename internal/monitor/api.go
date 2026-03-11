@@ -88,6 +88,16 @@ func (a *API) registerRoutes() {
 	a.mux.HandleFunc("POST /api/workflows/{workflowID}/cancel", a.cancelWorkflow)
 	a.mux.HandleFunc("POST /api/workflows/{workflowID}/retry", a.retryWorkflow)
 
+	// Workflow task result
+	a.mux.HandleFunc("GET /api/workflows/{workflowID}/tasks/{taskName}/result", a.getWorkflowTaskResult)
+
+	// Workflow validate
+	a.mux.HandleFunc("POST /api/workflows/validate", a.validateWorkflow)
+
+	// Workflow suspend/resume
+	a.mux.HandleFunc("POST /api/workflows/{workflowID}/suspend", a.suspendWorkflow)
+	a.mux.HandleFunc("POST /api/workflows/{workflowID}/resume", a.resumeWorkflow)
+
 	// Batches
 	a.mux.HandleFunc("GET /api/batches", a.listBatches)
 	a.mux.HandleFunc("GET /api/batches/{batchID}", a.getBatch)
@@ -500,6 +510,43 @@ func (a *API) retryWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]string{"status": "retried", "workflow_id": wfID})
+}
+
+func (a *API) getWorkflowTaskResult(w http.ResponseWriter, r *http.Request) {
+	output, err := a.svc.GetWorkflowTaskResult(r.Context(), r.PathValue("workflowID"), r.PathValue("taskName"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]json.RawMessage{"output": output})
+}
+
+func (a *API) validateWorkflow(w http.ResponseWriter, r *http.Request) {
+	var def types.WorkflowDefinition
+	if err := json.NewDecoder(r.Body).Decode(&def); err != nil {
+		writeServiceError(w, &ApiError{Msg: "invalid request body: " + err.Error(), StatusCode: http.StatusBadRequest})
+		return
+	}
+	result := a.svc.ValidateWorkflowDefinition(r.Context(), &def)
+	jsonOK(w, result)
+}
+
+func (a *API) suspendWorkflow(w http.ResponseWriter, r *http.Request) {
+	wfID := r.PathValue("workflowID")
+	if err := a.svc.SuspendWorkflow(r.Context(), wfID); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "suspended", "workflow_id": wfID})
+}
+
+func (a *API) resumeWorkflow(w http.ResponseWriter, r *http.Request) {
+	wfID := r.PathValue("workflowID")
+	if err := a.svc.ResumeWorkflow(r.Context(), wfID); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "resumed", "workflow_id": wfID})
 }
 
 // --- Batches ---

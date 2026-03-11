@@ -25,6 +25,7 @@ import (
 
 	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
 
+	"github.com/FDK0901/dureq/examples/shared"
 	"github.com/FDK0901/dureq/pkg/dureq"
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/rs/zerolog"
@@ -76,18 +77,17 @@ func main() {
 	)
 
 	srv, err := dureq.NewServer(
-		dureq.WithRedisURL("redis://localhost:6379"),
-		dureq.WithRedisDB(15),
-		dureq.WithRedisPassword("your-password"),
-		dureq.WithNodeID("aggregation-demo-node-1"),
-		dureq.WithMaxConcurrency(10),
-		dureq.WithLogger(logger),
-		dureq.WithGroupAggregation(types.GroupConfig{
-			Aggregator:  aggregator,
-			GracePeriod: 3 * time.Second,  // flush 3s after last item added
-			MaxDelay:    15 * time.Second, // force flush after 15s regardless
-			MaxSize:     10,               // flush immediately when 10 items in group
-		}),
+		append(shared.ServerOptions(),
+			dureq.WithNodeID("aggregation-demo-node-1"),
+			dureq.WithMaxConcurrency(10),
+			dureq.WithLogger(logger),
+			dureq.WithGroupAggregation(types.GroupConfig{
+				Aggregator:  aggregator,
+				GracePeriod: 3 * time.Second,  // flush 3s after last item added
+				MaxDelay:    15 * time.Second, // force flush after 15s regardless
+				MaxSize:     10,               // flush immediately when 10 items in group
+			}),
+		)...,
 	)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create server")
@@ -134,11 +134,7 @@ func main() {
 
 	time.Sleep(2 * time.Second) // wait for leader election
 
-	cl, err := dureq.NewClient(
-		dureq.WithClientRedisURL("redis://localhost:6379"),
-		dureq.WithClientRedisPassword("your-password"),
-		dureq.WithClientRedisDB(15),
-	)
+	cl, err := dureq.NewClient(shared.ClientOptions()...)
 	if err != nil {
 		logger.Error().Err(err).Msg("failed to create client")
 		os.Exit(1)

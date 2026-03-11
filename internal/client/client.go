@@ -30,6 +30,7 @@ type Option func(*clientConfig)
 
 type clientConfig struct {
 	redisURL      string
+	redisUsername string
 	redisPassword string
 	redisDB       int
 	redisPoolSize int
@@ -44,6 +45,11 @@ type clientConfig struct {
 // WithRedisURL sets the Redis server URL.
 func WithRedisURL(url string) Option {
 	return func(c *clientConfig) { c.redisURL = url }
+}
+
+// WithRedisUsername sets the Redis ACL username (Redis 6+).
+func WithRedisUsername(username string) Option {
+	return func(c *clientConfig) { c.redisUsername = username }
 }
 
 // WithRedisPassword sets the Redis password.
@@ -110,6 +116,7 @@ func New(opts ...Option) (*Client, error) {
 	} else if len(cfg.clusterAddrs) > 0 {
 		opt := rueidis.ClientOption{
 			InitAddress:      cfg.clusterAddrs,
+			Username:         cfg.redisUsername,
 			Password:         cfg.redisPassword,
 			BlockingPoolSize: max(cfg.redisPoolSize, 10),
 		}
@@ -132,6 +139,11 @@ func New(opts ...Option) (*Client, error) {
 			InitAddress:      []string{addr},
 			SelectDB:         cfg.redisDB,
 			BlockingPoolSize: max(cfg.redisPoolSize, 10),
+		}
+		if cfg.redisUsername != "" {
+			opt.Username = cfg.redisUsername
+		} else if u.User != nil {
+			opt.Username = u.User.Username()
 		}
 		if cfg.redisPassword != "" {
 			opt.Password = cfg.redisPassword
@@ -425,6 +437,45 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// ResumeJob manually resumes a paused job. The job transitions back to retrying
+// and is immediately dispatched for execution.
+func (c *Client) ResumeJob(ctx context.Context, jobID string) error {
+	job, rev, err := c.store.GetJob(ctx, jobID)
+	if err != nil {
+		return fmt.Errorf("get job: %w", err)
+	}
+
+	if job.Status != types.JobStatusPaused {
+		return fmt.Errorf("job %s is in state %s, not paused", jobID, job.Status)
+	}
+
+	now := time.Now()
+	job.Status = types.JobStatusRetrying
+	job.PausedAt = nil
+	job.ResumeAt = nil
+	job.ConsecutiveErrors = 0
+	job.UpdatedAt = now
+
+	newRev, err := c.store.UpdateJob(ctx, job, rev)
+	if err != nil {
+		return fmt.Errorf("update job: %w", err)
+	}
+
+	if err := c.dispatchJob(ctx, job); err != nil {
+		job.Status = types.JobStatusPaused
+		job.UpdatedAt = time.Now()
+		c.store.UpdateJob(ctx, job, newRev)
+		return fmt.Errorf("dispatch: %w", err)
+	}
+
+	c.publishEvent(ctx, types.JobEvent{
+		Type:      types.EventJobResumed,
+		JobID:     jobID,
+		Timestamp: now,
+	})
+	return nil
+}
+
 // Status queries the current status of a job.
 func (c *Client) Status(ctx context.Context, jobID string) (*types.Job, error) {
 	job, _, err := c.store.GetJob(ctx, jobID)
@@ -509,6 +560,9 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+
+	// Initialize reference counting for dependency resolution.
+	workflow.InitPendingDeps(wf)
 
 	// Set deadline if execution timeout is configured.
 	if def.ExecutionTimeout != nil {
@@ -638,6 +692,10 @@ func (c *Client) CancelWorkflow(ctx context.Context, workflowID string) error {
 					}
 					c.signalCancelActiveRuns(ctx, state.JobID)
 				}
+				// Recursively cancel child workflows spawned by this task.
+				if state.ChildWorkflowID != "" {
+					c.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+				}
 			}
 		}
 
@@ -664,6 +722,9 @@ func (c *Client) RetryWorkflow(ctx context.Context, workflowID string) (*types.W
 	wf, rev, err := c.store.GetWorkflow(ctx, workflowID)
 	if err != nil {
 		return nil, err
+	}
+	if !wf.Status.IsTerminal() {
+		return nil, fmt.Errorf("cannot retry: workflow is %s", wf.Status)
 	}
 
 	now := time.Now()
@@ -805,6 +866,21 @@ func (c *Client) CancelBatch(ctx context.Context, batchID string) error {
 				}
 			}
 		}
+		// Cancel onetime task if still running.
+		if batch.OnetimeState != nil && !batch.OnetimeState.Status.IsTerminal() {
+			if batch.OnetimeState.JobID != "" {
+				if childJob, childRev, err := c.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+					if !childJob.Status.IsTerminal() {
+						childJob.Status = types.JobStatusCancelled
+						childJob.UpdatedAt = now
+						c.store.UpdateJob(ctx, childJob, childRev)
+					}
+				}
+				c.signalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+			}
+			batch.OnetimeState.Status = types.JobStatusCancelled
+			batch.OnetimeState.FinishedAt = &now
+		}
 
 		if _, err := c.store.UpdateBatch(ctx, batch, rev); err != nil {
 			if attempt < maxCASRetries-1 {
@@ -828,6 +904,9 @@ func (c *Client) RetryBatch(ctx context.Context, batchID string, retryFailedOnly
 	batch, rev, err := c.store.GetBatch(ctx, batchID)
 	if err != nil {
 		return nil, err
+	}
+	if !batch.Status.IsTerminal() {
+		return nil, fmt.Errorf("cannot retry: batch is %s", batch.Status)
 	}
 
 	now := time.Now()
@@ -1048,6 +1127,35 @@ func (c *Client) signalCancelActiveRuns(ctx context.Context, jobID string) {
 	for _, run := range runs {
 		c.rdb.Do(ctx, c.rdb.B().Publish().Channel(c.store.CancelChannel()).Message(run.ID).Build())
 	}
+}
+
+// cancelChildWorkflow recursively cancels a child workflow and all its tasks.
+func (c *Client) cancelChildWorkflow(ctx context.Context, childWfID string) {
+	childWf, rev, err := c.store.GetWorkflow(ctx, childWfID)
+	if err != nil || childWf.Status.IsTerminal() {
+		return
+	}
+
+	now := time.Now()
+	childWf.Status = types.WorkflowStatusCancelled
+	childWf.CompletedAt = &now
+	childWf.UpdatedAt = now
+
+	for name, state := range childWf.Tasks {
+		if !state.Status.IsTerminal() {
+			if state.JobID != "" {
+				c.signalCancelActiveRuns(ctx, state.JobID)
+			}
+			if state.ChildWorkflowID != "" {
+				c.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+			}
+			state.Status = types.JobStatusCancelled
+			state.FinishedAt = &now
+			childWf.Tasks[name] = state
+		}
+	}
+
+	c.store.UpdateWorkflow(ctx, childWf, rev)
 }
 
 func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowInstance, taskName string, now *time.Time) {

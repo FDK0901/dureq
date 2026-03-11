@@ -14,8 +14,10 @@ import (
 // Dispatcher publishes work messages to Redis Streams
 // and events/results via the RedisStore.
 type Dispatcher struct {
-	store  *store.RedisStore
-	logger gochainedlog.Logger
+	store           *store.RedisStore
+	hooks           *types.Hooks
+	logger          gochainedlog.Logger
+	handlerVersions map[types.TaskType]string
 }
 
 // New creates a new dispatcher backed by Redis.
@@ -27,6 +29,17 @@ func New(s *store.RedisStore, logger gochainedlog.Logger) *Dispatcher {
 		store:  s,
 		logger: logger,
 	}
+}
+
+// SetHooks sets the lifecycle hooks that are fired on each event.
+func (d *Dispatcher) SetHooks(h *types.Hooks) {
+	d.hooks = h
+}
+
+// SetHandlerVersions sets the handler version map used to tag dispatched work messages.
+// This enables version-aware routing: workers with a mismatched version will skip and re-enqueue.
+func (d *Dispatcher) SetHandlerVersions(versions map[types.TaskType]string) {
+	d.handlerVersions = versions
 }
 
 // Dispatch publishes a work message for a job to the tier-appropriate Redis Stream.
@@ -46,6 +59,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) 
 		Headers:      job.Headers,
 		Priority:     priority,
 		DispatchedAt: now,
+	}
+	// Tag with handler version for version-aware routing.
+	if d.handlerVersions != nil {
+		if v, ok := d.handlerVersions[job.TaskType]; ok {
+			msg.Version = v
+		}
 	}
 
 	// Resolve the tier name from priority.
@@ -91,7 +110,8 @@ func (d *Dispatcher) DispatchToDLQ(ctx context.Context, job *types.Job, lastErr 
 	return nil
 }
 
-// PublishEvent publishes a monitoring event via Pub/Sub + event stream.
+// PublishEvent publishes a monitoring event via Pub/Sub + event stream,
+// and fires any registered lifecycle hooks.
 func (d *Dispatcher) PublishEvent(event types.JobEvent) {
 	ctx := context.Background()
 	if err := d.store.PublishEvent(ctx, event); err != nil {
@@ -100,6 +120,7 @@ func (d *Dispatcher) PublishEvent(event types.JobEvent) {
 			Err(err).
 			Msg("failed to publish event")
 	}
+	d.hooks.Fire(ctx, event)
 }
 
 // PublishResult stores a completion result and notifies waiting clients.

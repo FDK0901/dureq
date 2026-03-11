@@ -34,12 +34,22 @@ message GetDailyStatsResponse {
   repeated DailyStatsEntry entries = 1;
 }
 
+// RedisNodeInfo holds Redis INFO for a single node.
+message RedisNodeInfo {
+  string addr = 1;
+  string role = 2;
+  map<string, RedisInfoSection> sections = 3;
+}
+
 message GetRedisInfoRequest {
   string section = 1;
 }
 
 message GetRedisInfoResponse {
-  map<string, RedisInfoSection> sections = 1;
+  string mode = 1; // "cluster" or "standalone"
+  repeated RedisNodeInfo nodes = 2;
+  // Deprecated: use nodes[0].sections for single-node compat.
+  map<string, RedisInfoSection> sections = 3;
 }
 
 message GetSyncRetriesRequest {}

@@ -7,6 +7,9 @@ type RedisOptions struct {
 	// URL is the Redis server URL (e.g., "redis://localhost:6379", "rediss://host:6380/0").
 	URL string
 
+	// Username for Redis ACL authentication (Redis 6+). Leave empty for legacy auth.
+	Username string
+
 	// Password for Redis authentication. Overridden if set in URL.
 	Password string
 

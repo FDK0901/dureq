@@ -15,6 +15,8 @@ const (
 	EventJobRetrying   EventType = "job.retrying"
 	EventJobDead       EventType = "job.dead"
 	EventJobCancelled  EventType = "job.cancelled"
+	EventJobPaused     EventType = "job.paused"
+	EventJobResumed    EventType = "job.resumed"
 
 	EventNodeJoined    EventType = "node.joined"
 	EventNodeLeft      EventType = "node.left"
@@ -50,7 +52,15 @@ const (
 	EventNodeCrashDetected         EventType = "node.crash_detected"
 	EventJobAutoRecovered          EventType = "job.auto_recovered"
 
-	EventWorkflowSignalReceived EventType = "workflow.signal.received"
+	EventWorkflowSignalReceived    EventType = "workflow.signal.received"
+	EventWorkflowTaskPanicked      EventType = "workflow.task.panicked"
+
+	EventWorkflowSuspended       EventType = "workflow.suspended"
+	EventWorkflowResumed         EventType = "workflow.resumed"
+
+	EventWorkflowHookDispatched  EventType = "workflow.hook.dispatched"
+	EventWorkflowHookCompleted   EventType = "workflow.hook.completed"
+	EventWorkflowHookFailed      EventType = "workflow.hook.failed"
 )
 
 // JobEvent is the envelope published to the DUREQ_EVENTS stream.
@@ -65,4 +75,7 @@ type JobEvent struct {
 	Timestamp      time.Time      `json:"timestamp"`
 	BatchProgress  *BatchProgress `json:"batch_progress,omitempty"`
 	AffectedRunIDs []string       `json:"affected_run_ids,omitempty"`
+	// WorkflowID is set for task-level workflow events so they can be indexed
+	// under the parent workflow rather than the task's job ID.
+	WorkflowID string `json:"workflow_id,omitempty"`
 }

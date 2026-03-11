@@ -36,3 +36,7 @@ go.work.sum
 configs/
 
 tests/
+
+# IDE & Editor files
+.vscode
+.idea

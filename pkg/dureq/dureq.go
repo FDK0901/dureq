@@ -78,6 +78,7 @@ func NewClient(opts ...client.Option) (*client.Client, error) {
 type RedisStore = store.RedisStore
 
 type APIService = monitor.APIService
+type Hub = monitor.Hub
 
 type Dispatcher = monitor.Dispatcher
 
@@ -94,6 +95,13 @@ type ApiError = monitor.ApiError
 // Re-export APIService
 func NewAPIService(s *RedisStore, disp Dispatcher, logger gochainedlog.Logger) *APIService {
 	return monitor.NewAPIService(s, disp, logger)
+}
+
+// Re-export WSClient
+type WSClient = monitor.WSClient
+
+func NewWSClient() *WSClient {
+	return monitor.NewWSClient()
 }
 
 // Re-export store types commonly needed by users.

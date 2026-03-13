@@ -413,6 +413,7 @@ type ScheduleEntry struct {
 	NextRunAt       time.Time  `json:"next_run_at"`
 	Schedule        Schedule   `json:"schedule"`
 	LastProcessedAt *time.Time `json:"last_processed_at,omitempty"` // last successful processing time
+	LastFiringID    string     `json:"last_firing_id,omitempty"`    // FiringID of the last dispatched firing
 }
 
 // WorkMessage is the message published to DUREQ_WORK stream.
@@ -430,6 +431,11 @@ type WorkMessage struct {
 	// Version is the handler version this message was dispatched with.
 	// Workers with a mismatched version will skip and re-enqueue the message.
 	Version string `json:"version,omitempty"`
+
+	// FiringID is a deterministic identifier for schedule firings: "{jobID}:{firingTime.UnixMilli()}".
+	// When set, DispatchWork performs an additional SET NX dedup check to prevent
+	// duplicate dispatches of the same schedule firing under leader failover.
+	FiringID string `json:"firing_id,omitempty"`
 
 	// ConcurrencyKeys carried from the Job at dispatch time.
 	ConcurrencyKeys []ConcurrencyKey `json:"concurrency_keys,omitempty"`

@@ -47,3 +47,20 @@ services:
       timeout: 2s
       retries: 20
       start_period: 10s
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: dureq
+      POSTGRES_PASSWORD: dureq
+      POSTGRES_DB: dureq
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dureq"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+      start_period: 5s

@@ -570,6 +570,18 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		}()
 	}
 
+	// --- Durable cancel check (before handler start) ---
+	// If a cancel was requested while this message was pending (e.g., worker was offline),
+	// skip execution immediately.
+	if cancelled, _ := w.store.IsCancelRequested(w.ctx, work.RunID); cancelled {
+		w.logger.Info().String("run_id", work.RunID).Msg("worker: cancel flag set before handler start, skipping")
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		w.store.ClearCancelFlag(w.ctx, work.RunID)
+		return
+	}
+	// Clean up cancel flag when the run finishes (regardless of outcome).
+	defer w.store.ClearCancelFlag(w.ctx, work.RunID)
+
 	now := time.Now()
 
 	// Track active run for heartbeat/crash detection.
@@ -638,6 +650,25 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		w.logger.Warn().String("run_id", work.RunID).Msg("worker: run lock lost, cancelling handler")
 		execCancel()
 	})
+
+	// Durable cancel flag polling (fallback for missed Pub/Sub signals).
+	// Polls every 10s alongside the heartbeat lifecycle.
+	go func() {
+		pollTicker := time.NewTicker(10 * time.Second)
+		defer pollTicker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-pollTicker.C:
+				if cancelled, _ := w.store.IsCancelRequested(w.ctx, work.RunID); cancelled {
+					w.logger.Info().String("run_id", work.RunID).Msg("worker: cancel flag detected via polling")
+					execCancel()
+					return
+				}
+			}
+		}
+	}()
 
 	// Inject metadata into the execution context.
 	execCtx = types.WithJobID(execCtx, work.JobID)

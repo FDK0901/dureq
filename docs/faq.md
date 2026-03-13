@@ -42,12 +42,15 @@ The scheduler runs only on the elected leader. During failover:
 4. **Gap**: Schedules due during the failover window are processed on B's first tick
 
 **Risk**: If A dispatched a job but crashed before advancing the schedule,
-B will re-dispatch the same schedule entry with a new RunID.
-Both RunIDs execute (different locks), so the job fires twice.
+B will attempt to re-dispatch the same schedule entry.
 
-**Mitigation**: Use `UniqueKey` on the job, or make the handler idempotent.
+**Protection**: Each schedule firing generates a deterministic **FiringID** (`"{jobID}:{firingTime.UnixMilli()}"`).
+The dispatcher performs `SET NX` on the FiringID key before publishing to the work stream.
+If Leader A already dispatched the same firing, the `SET NX` fails and Leader B skips the dispatch.
 
-**Important**: This is not a duplicate of the same RunID — it is a second RunID for the same schedule firing. Use business-level idempotency, not just per-run locking, to protect against it.
+**Fallback**: If the FiringID key expires (1-hour TTL) before Leader B processes the schedule,
+the firing may dispatch twice. Use `UniqueKey` on the job or handler-level idempotency as
+additional protection for long failover gaps.
 
 ## What Happens When a Worker Crashes?
 
@@ -73,10 +76,11 @@ idempotent where possible, and design workflows to tolerate a missed signal
 
 ## Are Cancellation Signals Reliable?
 
-No. Cancellation uses Redis Pub/Sub (fire-and-forget). If the target worker is offline
-when the PUBLISH arrives, the cancellation is permanently lost. The job continues until
-completion or timeout. There is currently no cancellation flag polling mechanism —
-cancellation relies solely on the Pub/Sub delivery.
+Yes. Cancellation uses a dual-write pattern: a **persisted cancel flag** (`SET EX`)
+plus **Pub/Sub** for instant delivery. If the worker is offline when the Pub/Sub signal
+arrives, the durable flag is picked up by polling (every 10 seconds during handler
+execution, and once before handler start). The cancel flag has a 24-hour TTL for
+automatic cleanup.
 
 ## How Does dureq Compare to River?
 
@@ -86,7 +90,7 @@ cancellation relies solely on the Pub/Sub delivery.
 | Delivery | At-least-once + lock dedup | Exactly-once via SQL transaction |
 | Completion | Pipelined Redis commands | Single SQL transaction |
 | Workflows | Built-in DAG orchestration | Not built-in |
-| Cancellation | Best-effort Pub/Sub | Reliable (polled from DB) |
+| Cancellation | Durable flag + Pub/Sub fast path | Reliable (polled from DB) |
 
 River achieves true exactly-once because job state and completion are in the same
 PostgreSQL transaction. dureq trades this for Redis's speed and built-in workflow

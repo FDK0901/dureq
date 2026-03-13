@@ -603,6 +603,40 @@ func (s *RedisStore) CancelChannel() string {
 	return CancelChannelKey(s.prefix)
 }
 
+// RequestCancel sets a durable cancel flag for a run and publishes a Pub/Sub
+// signal for immediate delivery. The flag has a 24-hour TTL for auto-cleanup.
+// This dual-write pattern ensures cancellation survives worker disconnects:
+// Pub/Sub is the fast path; the persisted flag is the durable fallback.
+func (s *RedisStore) RequestCancel(ctx context.Context, runID string) error {
+	flagKey := CancelFlagKey(s.prefix, runID)
+	// SET with 24h TTL — auto-cleanup for completed runs
+	setCmd := s.rdb.B().Set().Key(flagKey).Value("1").Ex(24 * time.Hour).Build()
+	pubCmd := s.rdb.B().Publish().Channel(CancelChannelKey(s.prefix)).Message(runID).Build()
+	results := s.rdb.DoMulti(ctx, setCmd, pubCmd)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return fmt.Errorf("request cancel for run %s: %w", runID, err)
+		}
+	}
+	return nil
+}
+
+// IsCancelRequested checks the durable cancel flag for a run.
+func (s *RedisStore) IsCancelRequested(ctx context.Context, runID string) (bool, error) {
+	flagKey := CancelFlagKey(s.prefix, runID)
+	result := s.rdb.Do(ctx, s.rdb.B().Exists().Key(flagKey).Build())
+	count, err := result.AsInt64()
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// ClearCancelFlag removes the durable cancel flag after a run completes.
+func (s *RedisStore) ClearCancelFlag(ctx context.Context, runID string) {
+	s.rdb.Do(ctx, s.rdb.B().Del().Key(CancelFlagKey(s.prefix, runID)).Build())
+}
+
 // HasActiveRunForJob returns true if any non-terminal run exists for the given jobID.
 // Uses the per-job active run set for O(1) check.
 func (s *RedisStore) HasActiveRunForJob(ctx context.Context, jobID string) (bool, error) {
@@ -1754,6 +1788,7 @@ func WorkMessageFromStreamValues(values map[string]string) types.WorkMessage {
 	}
 	// Worker versioning.
 	wm.Version = values["version"]
+	wm.FiringID = values["firing_id"]
 	// Concurrency keys (JSON-encoded slice).
 	if ck := values["concurrency_keys"]; ck != "" {
 		var keys []types.ConcurrencyKey
@@ -2035,6 +2070,7 @@ func (s *RedisStore) AckSignals(ctx context.Context, workflowID string, streamID
 // This method is retained for backward compatibility but is lossy — if the
 // caller crashes after this call returns, the signals are permanently lost.
 func (s *RedisStore) ConsumeSignals(ctx context.Context, workflowID string) ([]types.WorkflowSignal, error) {
+	s.logger.Warn().Msg("ConsumeSignals is deprecated: use ReadSignals+AckSignals for crash-safe signal processing")
 	signals, err := s.ReadSignals(ctx, workflowID)
 	if err != nil {
 		return nil, err
@@ -2049,6 +2085,48 @@ func (s *RedisStore) ConsumeSignals(ctx context.Context, workflowID string) ([]t
 		s.rdb.Do(ctx, s.rdb.B().Xdel().Key(WorkflowSignalStreamKey(s.prefix, workflowID)).Id(ids...).Build())
 	}
 	return signals, nil
+}
+
+// SignalStats holds signal stream statistics for a workflow.
+type SignalStats struct {
+	PendingCount     int64 `json:"pending_count"`
+	OldestUnackedMs  int64 `json:"oldest_unacked_age_ms"`
+}
+
+// GetSignalStats returns the number of pending signals and the age of the oldest
+// unacked signal for a workflow. Uses XLEN + XRANGE COUNT 1.
+func (s *RedisStore) GetSignalStats(ctx context.Context, workflowID string) (*SignalStats, error) {
+	key := WorkflowSignalStreamKey(s.prefix, workflowID)
+
+	// Pipeline: XLEN + XRANGE - + COUNT 1
+	xlenCmd := s.rdb.B().Xlen().Key(key).Build()
+	xrangeCmd := s.rdb.B().Xrange().Key(key).Start("-").End("+").Count(1).Build()
+
+	results := s.rdb.DoMulti(ctx, xlenCmd, xrangeCmd)
+
+	count, err := results[0].AsInt64()
+	if err != nil {
+		return &SignalStats{}, nil // stream doesn't exist
+	}
+
+	stats := &SignalStats{PendingCount: count}
+	entries, err := results[1].AsXRange()
+	if err == nil && len(entries) > 0 {
+		// Parse Redis stream ID: "{milliseconds}-{seq}"
+		id := entries[0].ID
+		var tsMs int64
+		for i := 0; i < len(id); i++ {
+			if id[i] == '-' {
+				break
+			}
+			tsMs = tsMs*10 + int64(id[i]-'0')
+		}
+		stats.OldestUnackedMs = time.Now().UnixMilli() - tsMs
+		if stats.OldestUnackedMs < 0 {
+			stats.OldestUnackedMs = 0
+		}
+	}
+	return stats, nil
 }
 
 // DeleteSignalStream removes the signal stream for a workflow (cleanup).

@@ -622,8 +622,9 @@ func (c *Client) BackfillSchedule(ctx context.Context, jobID string, startTime, 
 
 // SignalWorkflow sends an asynchronous signal to a running workflow.
 // The signal is appended to a per-workflow signal stream. User code
-// consumes signals via ConsumeSignals(); the orchestrator does not
-// consume them directly.
+// reads signals via ReadSignals() + AckSignals() (at-least-once delivery);
+// the deprecated ConsumeSignals() provides at-most-once delivery.
+// The orchestrator does not consume signals directly.
 //
 // Returns ErrWorkflowTerminal if the workflow has already completed,
 // failed, or been cancelled.
@@ -1144,7 +1145,11 @@ func (c *Client) publishEvent(ctx context.Context, event types.JobEvent) {
 func (c *Client) signalCancelActiveRuns(ctx context.Context, jobID string) {
 	runs, _ := c.store.ListActiveRunsByJobID(ctx, jobID)
 	for _, run := range runs {
-		c.rdb.Do(ctx, c.rdb.B().Publish().Channel(c.store.CancelChannel()).Message(run.ID).Build())
+		// Dual-write: durable flag (SET EX) + Pub/Sub fast path.
+		// RequestCancel handles both; fall back to Pub/Sub only on error.
+		if err := c.store.RequestCancel(ctx, run.ID); err != nil {
+			c.rdb.Do(ctx, c.rdb.B().Publish().Channel(c.store.CancelChannel()).Message(run.ID).Build())
+		}
 	}
 }
 

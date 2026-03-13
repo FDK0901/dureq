@@ -91,6 +91,9 @@ func (a *API) registerRoutes() {
 	// Workflow task result
 	a.mux.HandleFunc("GET /api/workflows/{workflowID}/tasks/{taskName}/result", a.getWorkflowTaskResult)
 
+	// Workflow signal stats
+	a.mux.HandleFunc("GET /api/workflows/{workflowID}/signals/stats", a.getWorkflowSignalStats)
+
 	// Workflow validate
 	a.mux.HandleFunc("POST /api/workflows/validate", a.validateWorkflow)
 
@@ -498,6 +501,15 @@ func (a *API) getWorkflow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, wf)
+}
+
+func (a *API) getWorkflowSignalStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := a.svc.GetWorkflowSignalStats(r.Context(), r.PathValue("workflowID"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, stats)
 }
 
 func (a *API) cancelWorkflow(w http.ResponseWriter, r *http.Request) {

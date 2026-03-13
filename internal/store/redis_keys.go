@@ -107,6 +107,12 @@ func JobNotifyChannel(prefix string) string { return prefix + ":job:notify" }
 // Task Cancellation Pub/Sub
 func CancelChannelKey(prefix string) string { return prefix + ":cancel" }
 
+// Durable Cancel Flag (per-run, SET with EX for auto-cleanup)
+func CancelFlagKey(prefix, runID string) string { return fmt.Sprintf("%s:cancel_flag:%s", prefix, runID) }
+
+// Firing Dedup (prevents duplicate dispatch of the same schedule firing under leader failover)
+func FiringDedupKey(prefix, firingID string) string { return fmt.Sprintf("%s:firing:%s", prefix, firingID) }
+
 // Job Audit Trail (per-job state transition history)
 func JobAuditKey(prefix, jobID string) string { return fmt.Sprintf("%s:job:%s:audit", prefix, jobID) }
 

@@ -59,6 +59,16 @@ sender side.
 For scenarios requiring stronger guarantees, combine signals with an external
 state check (e.g., poll a database flag) as a fallback.
 
+## API Comparison
+
+| API | Delivery Guarantee | Crash Safety | Recommendation |
+|-----|-------------------|--------------|----------------|
+| `ReadSignals` + `AckSignals` | At-least-once | Safe — unacked signals survive crash | **Recommended** |
+| `ConsumeSignals` (deprecated) | At-most-once | Lossy — crash after call loses signals | Migrate away |
+
+> **Monitor endpoint**: `GET /api/workflows/{id}/signals/stats` returns
+> `pending_count` and `oldest_unacked_age_ms` for observability.
+
 ## Deduplication
 
 Use `WithDedupeKey` to prevent duplicate signals:

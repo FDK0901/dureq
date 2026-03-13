@@ -79,7 +79,10 @@ func (a *APIService) Shutdown() {
 func (a *APIService) signalCancelActiveRuns(ctx context.Context, jobID string) {
 	runs, _ := a.store.ListActiveRunsByJobID(ctx, jobID)
 	for _, run := range runs {
-		a.store.Client().Do(ctx, a.store.Client().B().Publish().Channel(a.store.CancelChannel()).Message(run.ID).Build())
+		// Dual-write: durable flag + Pub/Sub fast path.
+		if err := a.store.RequestCancel(ctx, run.ID); err != nil {
+			a.store.Client().Do(ctx, a.store.Client().B().Publish().Channel(a.store.CancelChannel()).Message(run.ID).Build())
+		}
 	}
 }
 
@@ -329,6 +332,15 @@ func (a *APIService) GetWorkflow(ctx context.Context, wfID string) (*types.Workf
 		return nil, &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
 	return wf, nil
+}
+
+// GetWorkflowSignalStats returns signal stream statistics for a workflow.
+func (a *APIService) GetWorkflowSignalStats(ctx context.Context, wfID string) (*store.SignalStats, error) {
+	// Verify workflow exists.
+	if _, _, err := a.store.GetWorkflow(ctx, wfID); err != nil {
+		return nil, &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	return a.store.GetSignalStats(ctx, wfID)
 }
 
 // ValidateResult holds the result of a workflow definition validation.

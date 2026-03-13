@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -319,11 +320,17 @@ func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint
 		return 0, false
 	}
 
+	// Generate deterministic FiringID for schedule firing dedup.
+	// This prevents duplicate dispatches when leader failover causes the same
+	// schedule entry to be processed by two leaders.
+	if job.Headers == nil {
+		job.Headers = make(map[string]string)
+	}
+	firingID := fmt.Sprintf("%s:%d", job.ID, firingTime.UnixMilli())
+	job.Headers["x-dureq-firing-id"] = firingID
+
 	// Add backfill headers for missed firings being caught up.
 	if isBackfill {
-		if job.Headers == nil {
-			job.Headers = make(map[string]string)
-		}
 		job.Headers["x-dureq-backfill"] = "true"
 		job.Headers["x-dureq-scheduled-at"] = firingTime.Format(time.RFC3339Nano)
 	}

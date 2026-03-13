@@ -124,15 +124,26 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
 	})
 
-	// Readiness check: returns 200 only after the server is fully started.
+	// Readiness check: returns 200 when server is started, handlers registered, and Redis reachable.
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		if !ready.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(map[string]string{"status": "not ready"})
 			return
 		}
+		// Verify Redis is still reachable (lightweight ping).
+		pingCtx, pingCancel := context.WithTimeout(r.Context(), 1*time.Second)
+		defer pingCancel()
+		if err := srv.Store().Ping(pingCtx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "reason": "redis unreachable"})
+			return
+		}
 		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":   "ready",
+			"handlers": registered,
+		})
 	})
 
 	// All other routes go to the monitoring API.
@@ -179,9 +190,22 @@ func main() {
 	// Mark not ready immediately to fail readiness probes during drain.
 	ready.Store(false)
 
+	// Graceful drain: allow in-flight jobs to complete within the timeout.
+	drainTimeout := 30 * time.Second
+	if cfg.DureqdConfig.DrainTimeoutMs > 0 {
+		drainTimeout = time.Duration(cfg.DureqdConfig.DrainTimeoutMs) * time.Millisecond
+	}
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), drainTimeout)
+	defer drainCancel()
+
+	logger.Info().Int("timeout_ms", int(drainTimeout.Milliseconds())).Msg("draining in-flight jobs")
+
+	// Stop accepting new work first, then drain.
 	grpcSrv.GracefulStop()
-	httpSrv.Close()
+	httpSrv.Shutdown(drainCtx)
 	srv.Stop()
+
+	logger.Info().Msg("dureqd shutdown complete")
 }
 
 // parseMode converts a config string like "queue,scheduler" into a server.Mode bitmask.

@@ -46,6 +46,20 @@ func (s *RedisStore) EnsureStreams(ctx context.Context) error {
 func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *types.WorkMessage) (string, error) {
 	streamKey := WorkStreamKey(s.prefix, tierName)
 
+	// FiringID dedup: prevents duplicate dispatch of the same schedule firing
+	// under leader failover (deterministic key = "{jobID}:{firingTime.UnixMilli()}").
+	if wm.FiringID != "" {
+		firingKey := FiringDedupKey(s.prefix, wm.FiringID)
+		err := s.rdb.Do(ctx, s.rdb.B().Set().Key(firingKey).Value(wm.RunID).Nx().Ex(1 * time.Hour).Build()).Error()
+		if err != nil {
+			if rueidis.IsRedisNil(err) {
+				// Same firing already dispatched — idempotent skip.
+				return "", nil
+			}
+			return "", fmt.Errorf("firing dedup check: %w", err)
+		}
+	}
+
 	// Use run ID as dedup key (prevents double-dispatch).
 	dedupKey := DedupKey(s.prefix, wm.RunID)
 	err := s.rdb.Do(ctx, s.rdb.B().Set().Key(dedupKey).Value("1").Nx().Ex(s.cfg.DedupTTL).Build()).Error()
@@ -69,6 +83,9 @@ func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *type
 		FieldValue("tier", tierName).
 		FieldValue("version", wm.Version)
 
+	if wm.FiringID != "" {
+		fv = fv.FieldValue("firing_id", wm.FiringID)
+	}
 	if len(wm.Headers) > 0 {
 		if hdr, err := sonic.ConfigFastest.Marshal(wm.Headers); err == nil {
 			fv = fv.FieldValue("headers", string(hdr))

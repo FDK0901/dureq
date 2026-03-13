@@ -61,6 +61,10 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) 
 		DispatchedAt:    now,
 		ConcurrencyKeys: job.ConcurrencyKeys,
 	}
+	// Extract FiringID from headers (set by scheduler for schedule firing dedup).
+	if fid, ok := job.Headers["x-dureq-firing-id"]; ok {
+		msg.FiringID = fid
+	}
 	// Tag with handler version for version-aware routing.
 	if d.handlerVersions != nil {
 		if v, ok := d.handlerVersions[job.TaskType]; ok {

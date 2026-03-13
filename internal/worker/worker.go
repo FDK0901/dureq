@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/FDK0901/dureq/internal/dispatcher"
+	"github.com/FDK0901/dureq/internal/dynconfig"
 	"github.com/FDK0901/dureq/internal/lock"
 	"github.com/FDK0901/dureq/internal/ratelimit"
 	"github.com/FDK0901/dureq/internal/store"
@@ -40,6 +41,7 @@ type Config struct {
 	MaxConcurrency    int
 	ShutdownTimeout   time.Duration // Grace period before aborting in-flight tasks. Default: 30s.
 	GlobalMiddlewares []types.MiddlewareFunc
+	DynConfig         *dynconfig.Manager // Optional: runtime config overrides (timeout, maxAttempts).
 	Logger            gochainedlog.Logger
 }
 
@@ -65,6 +67,7 @@ type Worker struct {
 	pool              *ants.Pool                    // global pool for tasks without dedicated concurrency
 	subpools          map[types.TaskType]*ants.Pool // per-TaskType pools
 	globalMiddlewares []types.MiddlewareFunc
+	dynCfg            *dynconfig.Manager
 	tiers             []store.TierConfig
 	logger            gochainedlog.Logger
 
@@ -121,6 +124,7 @@ func New(cfg Config) (*Worker, error) {
 		pool:              pool,
 		subpools:          subpools,
 		globalMiddlewares: cfg.GlobalMiddlewares,
+		dynCfg:            cfg.DynConfig,
 		tiers:             cfg.Store.Config().Tiers,
 		rateLimiter:       ratelimit.New(cfg.Store.Client(), cfg.Store.Prefix()),
 		logger:            cfg.Logger,
@@ -470,7 +474,10 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		// Requeue/DLQ BEFORE ACK to prevent message loss if requeue fails.
 		if sm.Redeliveries >= maxRedeliveries {
 			if w.clusterHasTaskType(work.TaskType) {
-				w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0)
+				if err := w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0); err != nil {
+					w.logger.Error().Err(err).String("job_id", work.JobID).Msg("worker: requeue failed, leaving for XAUTOCLAIM")
+					return
+				}
 				w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 				return
 			}
@@ -479,7 +486,10 @@ func (w *Worker) processMessage(sm *streamMessage) {
 			w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 			return
 		}
-		w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1)
+		if err := w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1); err != nil {
+			w.logger.Error().Err(err).String("job_id", work.JobID).Msg("worker: requeue failed, leaving for XAUTOCLAIM")
+			return
+		}
 		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		return
 	}
@@ -493,8 +503,11 @@ func (w *Worker) processMessage(sm *streamMessage) {
 			String("handler_version", def.Version).
 			String("msg_version", work.Version).
 			Msg("worker: version mismatch, re-enqueuing")
-		// Requeue BEFORE ACK to prevent message loss.
-		w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1)
+		// Requeue BEFORE ACK — only ACK if requeue succeeds.
+		if err := w.store.ReenqueueWork(w.ctx, sm.TierName, &work, sm.Redeliveries+1); err != nil {
+			w.logger.Error().Err(err).String("job_id", work.JobID).Msg("worker: requeue failed, leaving for XAUTOCLAIM")
+			return
+		}
 		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		return
 	}
@@ -515,6 +528,47 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		return
 	}
 	defer rl.Unlock(w.ctx)
+
+	// --- Concurrency key slot acquisition ---
+	// If the job has concurrency keys, acquire a slot for each.
+	// If any slot is unavailable, re-enqueue with a short delay.
+	if len(work.ConcurrencyKeys) > 0 {
+		var acquired []types.ConcurrencyKey
+		var blocked bool
+		for _, ck := range work.ConcurrencyKeys {
+			ok, err := w.store.AcquireConcurrencySlot(w.ctx, ck.Key, work.RunID, ck.MaxConcurrency)
+			if err != nil {
+				w.logger.Warn().String("run_id", work.RunID).String("conc_key", ck.Key).Err(err).Msg("worker: concurrency slot acquire error")
+				blocked = true
+				break
+			}
+			if !ok {
+				w.logger.Debug().String("run_id", work.RunID).String("conc_key", ck.Key).Int("max", ck.MaxConcurrency).Msg("worker: concurrency key at capacity, re-enqueuing")
+				blocked = true
+				break
+			}
+			acquired = append(acquired, ck)
+		}
+		if blocked {
+			// Release any slots we acquired before the blocking one.
+			for _, ck := range acquired {
+				w.store.ReleaseConcurrencySlot(w.ctx, ck.Key, work.RunID)
+			}
+			// Re-enqueue with 1s delay — only ACK if AddDelayed succeeds.
+			if err := w.store.AddDelayed(w.ctx, sm.TierName, &work, time.Now().Add(1*time.Second)); err != nil {
+				w.logger.Error().Err(err).String("job_id", work.JobID).Msg("worker: delayed requeue failed, leaving for XAUTOCLAIM")
+				return
+			}
+			w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+			return
+		}
+		// Ensure all slots are released when the handler finishes.
+		defer func() {
+			for _, ck := range work.ConcurrencyKeys {
+				w.store.ReleaseConcurrencySlot(w.ctx, ck.Key, work.RunID)
+			}
+		}()
+	}
 
 	now := time.Now()
 
@@ -556,10 +610,17 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	})
 
 	// Set up execution context with deadline.
+	// Dynamic config overrides take precedence over static handler config.
+	timeout := def.Timeout
+	if w.dynCfg != nil {
+		if ho, ok := w.dynCfg.GetHandler(string(work.TaskType)); ok && ho.Timeout > 0 {
+			timeout = ho.Timeout
+		}
+	}
 	execCtx := w.ctx
 	var execCancel context.CancelFunc
-	if def.Timeout > 0 {
-		execCtx, execCancel = context.WithTimeout(w.ctx, def.Timeout)
+	if timeout > 0 {
+		execCtx, execCancel = context.WithTimeout(w.ctx, timeout)
 	} else if !work.Deadline.IsZero() {
 		execCtx, execCancel = context.WithDeadline(w.ctx, work.Deadline)
 	}
@@ -585,6 +646,8 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	execCtx = types.WithTaskType(execCtx, work.TaskType)
 	execCtx = types.WithPriority(execCtx, work.Priority)
 	execCtx = types.WithNodeID(execCtx, w.nodeID)
+	execCtx = types.WithSideEffectStore(execCtx, w.store)
+	execCtx = types.WithSideEffectTTL(execCtx, int(w.store.Config().SideEffectTTL.Seconds()))
 	if work.Headers != nil {
 		execCtx = types.WithHeaders(execCtx, work.Headers)
 	}
@@ -718,18 +781,19 @@ func (w *Worker) finishProcessMessage(sm *streamMessage, work types.WorkMessage,
 
 	case types.ErrorClassRepeat:
 		// Repeat: re-enqueue for immediate re-execution.
+		// Requeue BEFORE ACK — if requeue fails, leave original for XAUTOCLAIM.
 		run.Status = types.RunStatusSucceeded
 		syncRetrySave(w.syncer, func() error { _, err := w.store.SaveRun(w.ctx, run); return err }, fmt.Sprintf("save run %s", run.ID))
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
-		syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
-		syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
 		var repeatErr *types.RepeatError
 		if errors.As(res.err, &repeatErr) && repeatErr.Delay > 0 {
 			retryWork := work
-			w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(repeatErr.Delay))
+			syncRetrySave(w.syncer, func() error { return w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(repeatErr.Delay)) }, fmt.Sprintf("add delayed repeat %s", work.JobID))
 		} else {
-			w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0)
+			syncRetrySave(w.syncer, func() error { return w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0) }, fmt.Sprintf("requeue repeat %s", work.JobID))
 		}
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
+		syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
 		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: handler requested repeat")
 		return
 
@@ -743,6 +807,18 @@ func (w *Worker) finishProcessMessage(sm *streamMessage, work types.WorkMessage,
 		syncRetrySave(w.syncer, func() error { return w.store.SaveJobRun(w.ctx, run) }, fmt.Sprintf("save job run %s", run.ID))
 		syncRetrySave(w.syncer, func() error { return w.store.DeleteRun(w.ctx, run.ID) }, fmt.Sprintf("delete run %s", run.ID))
 		w.pauseJob(work, res.err)
+		return
+
+	case types.ErrorClassContinueAsNew:
+		// Continue-as-new: treat as success but embed the new input in the result
+		// so the orchestrator can spawn a replacement workflow.
+		run.Status = types.RunStatusSucceeded
+		var contInput json.RawMessage
+		var contErr *types.ContinueAsNewError
+		if errors.As(res.err, &contErr) {
+			contInput = contErr.Input
+		}
+		w.onSuccessContinueAsNew(sm, work, run, contInput)
 		return
 	}
 
@@ -791,6 +867,60 @@ func (w *Worker) pauseJob(work types.WorkMessage, execErr error) {
 	})
 }
 
+func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessage, run *types.JobRun, contInput json.RawMessage) {
+	batch := &store.CompletionBatch{
+		Run: run,
+		Event: types.JobEvent{
+			Type:      types.EventJobCompleted,
+			JobID:     work.JobID,
+			RunID:     work.RunID,
+			NodeID:    w.nodeID,
+			TaskType:  work.TaskType,
+			Attempt:   work.Attempt,
+			Timestamp: time.Now(),
+		},
+		Result: types.WorkResult{
+			RunID:              work.RunID,
+			JobID:              work.JobID,
+			Success:            true,
+			ContinueAsNewInput: contInput,
+		},
+		DailyStatField: "processed",
+		AckTierName:    sm.TierName,
+		AckMessageID:   sm.StreamMsgID,
+	}
+
+	syncRetrySave(w.syncer, func() error { return w.store.CompleteRun(w.ctx, batch) }, fmt.Sprintf("complete run %s (continue-as-new)", run.ID))
+
+	// Retryable GetJob + UpdateJob as a unit to prevent stuck jobs.
+	var hasWorkflow bool
+	syncRetrySave(w.syncer, func() error {
+		job, rev, err := w.store.GetJob(w.ctx, work.JobID)
+		if err != nil {
+			return fmt.Errorf("get job: %w", err)
+		}
+		now := time.Now()
+		job.LastRunAt = &now
+		job.Attempt = work.Attempt + 1
+		job.LastError = nil
+		job.ConsecutiveErrors = 0
+		job.Status = types.JobStatusCompleted
+		job.CompletedAt = &now
+		job.UpdatedAt = now
+		if _, err := w.store.UpdateJob(w.ctx, job, rev); err != nil {
+			return fmt.Errorf("update job: %w", err)
+		}
+		hasWorkflow = job.WorkflowID != nil
+		return nil
+	}, fmt.Sprintf("update job %s (continue-as-new)", work.JobID))
+
+	if hasWorkflow {
+		w.store.ExtendResultTTL(w.ctx, work.JobID, w.store.Config().WorkflowResultTTL)
+	}
+
+	w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: handler requested continue-as-new")
+}
+
 func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types.JobRun, output json.RawMessage) {
 	// Batched completion: SaveRun + SaveJobRun + DeleteRun + IncrDailyStat +
 	// PublishEvent + PublishResult + AckMessage in a single Redis pipeline.
@@ -818,34 +948,45 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 
 	syncRetrySave(w.syncer, func() error { return w.store.CompleteRun(w.ctx, batch) }, fmt.Sprintf("complete run %s", run.ID))
 
-	// Update job state (GetJob + UpdateJob CAS must remain separate).
-	job, rev, err := w.store.GetJob(w.ctx, work.JobID)
-	if err != nil {
-		w.logger.Warn().String("job_id", work.JobID).Err(err).Msg("worker: failed to get job for success update")
-		return
+	// Update job state as a retryable unit. GetJob + UpdateJob are wrapped
+	// together so a transient GetJob failure doesn't leave the job stuck in
+	// "running" with no active run (which orphan recovery can't find).
+	var jobForPostUpdate *types.Job
+	syncRetrySave(w.syncer, func() error {
+		job, rev, err := w.store.GetJob(w.ctx, work.JobID)
+		if err != nil {
+			return fmt.Errorf("get job: %w", err)
+		}
+		now := time.Now()
+		job.LastRunAt = &now
+		job.Attempt = work.Attempt + 1
+		job.LastError = nil
+		job.ConsecutiveErrors = 0
+		job.UpdatedAt = now
+
+		_, _, schedErr := w.store.GetSchedule(w.ctx, work.JobID)
+		if schedErr == nil {
+			job.Status = types.JobStatusScheduled
+		} else {
+			job.Status = types.JobStatusCompleted
+			job.CompletedAt = &now
+		}
+		if _, err := w.store.UpdateJob(w.ctx, job, rev); err != nil {
+			return fmt.Errorf("update job: %w", err)
+		}
+		jobForPostUpdate = job
+		return nil
+	}, fmt.Sprintf("update job %s after success", work.JobID))
+
+	// Extend result TTL for workflow-associated jobs so results survive
+	// for the entire workflow execution, not just the default ResultTTL.
+	if jobForPostUpdate != nil && jobForPostUpdate.WorkflowID != nil {
+		w.store.ExtendResultTTL(w.ctx, work.JobID, w.store.Config().WorkflowResultTTL)
 	}
-
-	now := time.Now()
-	job.LastRunAt = &now
-	job.Attempt = work.Attempt + 1
-	job.LastError = nil
-	job.ConsecutiveErrors = 0 // reset on success
-	job.UpdatedAt = now
-
-	// Only mark as completed if there's no active schedule.
-	_, _, schedErr := w.store.GetSchedule(w.ctx, work.JobID)
-	if schedErr == nil {
-		job.Status = types.JobStatusScheduled
-	} else {
-		job.Status = types.JobStatusCompleted
-		job.CompletedAt = &now
-	}
-
-	syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
 
 	// Drain overlap buffer if the job has a buffer policy.
-	if job.Schedule.OverlapPolicy == types.OverlapBufferOne || job.Schedule.OverlapPolicy == types.OverlapBufferAll {
-		go w.drainOverlapBuffer(work.JobID, job)
+	if jobForPostUpdate != nil && (jobForPostUpdate.Schedule.OverlapPolicy == types.OverlapBufferOne || jobForPostUpdate.Schedule.OverlapPolicy == types.OverlapBufferAll) {
+		go w.drainOverlapBuffer(work.JobID, jobForPostUpdate)
 	}
 }
 
@@ -926,6 +1067,12 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 	}
 
 	maxAttempts := retryPolicy.MaxAttempts
+	// Dynamic config override for maxAttempts.
+	if w.dynCfg != nil {
+		if ho, ok := w.dynCfg.GetHandler(string(work.TaskType)); ok && ho.MaxAttempts > 0 {
+			maxAttempts = ho.MaxAttempts
+		}
+	}
 	if job.DLQAfter != nil && *job.DLQAfter < maxAttempts {
 		maxAttempts = *job.DLQAfter
 	}

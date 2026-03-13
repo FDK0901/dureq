@@ -116,8 +116,31 @@ func WorkflowEventsKey(prefix, wfID string) string { return fmt.Sprintf("%s:work
 // Workflow Signals
 func WorkflowSignalStreamKey(prefix, wfID string) string { return fmt.Sprintf("%s:workflow:%s:signals", prefix, wfID) }
 
+// Workflow Task Archive (hash: field=taskName, value=taskStateJSON)
+func WorkflowArchiveKey(prefix, wfID string) string { return fmt.Sprintf("%s:workflow:%s:archive", prefix, wfID) }
+
+// Deadline indexes (sorted set: score=deadline unix, member=ID)
+func WorkflowDeadlinesKey(prefix string) string { return prefix + ":deadlines:workflows" }
+func BatchDeadlinesKey(prefix string) string     { return prefix + ":deadlines:batches" }
+
 // Node Drain Flag
 func NodeDrainKey(prefix, nodeID string) string { return fmt.Sprintf("%s:node:%s:drain", prefix, nodeID) }
+
+// Side-effect steps (per-run, single-key for Cluster compatibility)
+func SideEffectKey(prefix, runID, stepKey string) string {
+	return fmt.Sprintf("%s:sideeffect:%s:%s", prefix, runID, stepKey)
+}
+
+// Concurrency slots (sorted set: member=runID, score=acquireTime)
+// Hash-tagged with {concKey} for Redis Cluster slot co-location.
+func ConcurrencySlotKey(prefix, concKey string) string {
+	return fmt.Sprintf("%s:conc:{%s}", prefix, concKey)
+}
+
+// Signal dedup key (SET NX with TTL)
+func SignalDedupKey(prefix, wfID, dedupeKey string) string {
+	return fmt.Sprintf("%s:sigdedup:%s:%s", prefix, wfID, dedupeKey)
+}
 
 // JSON Payload mirrors (RedisJSON) — used for JSONPath-based search.
 func JobPayloadKey(prefix, id string) string       { return fmt.Sprintf("%s:jparam:job:%s", prefix, id) }

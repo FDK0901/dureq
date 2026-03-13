@@ -20,6 +20,20 @@ func WithRetentionPeriod(d time.Duration) Option {
 	return func(c *Config) { c.RetentionPeriod = &d }
 }
 
+// Mode controls which subsystems are started.
+type Mode int
+
+const (
+	ModeQueue    Mode = 1 << 0 // worker + dispatcher
+	ModeScheduler Mode = 1 << 1 // scheduler (leader-only)
+	ModeWorkflow Mode = 1 << 2 // workflow orchestrator (leader-only)
+	ModeMonitor  Mode = 1 << 3 // HTTP monitoring API
+	ModeFull     Mode = ModeQueue | ModeScheduler | ModeWorkflow | ModeMonitor
+)
+
+// Has returns true if the mode includes the given flag.
+func (m Mode) Has(flag Mode) bool { return m&flag != 0 }
+
 // Option configures the server.
 type Option func(*Config)
 
@@ -69,9 +83,15 @@ type Config struct {
 
 	// Logger is the structured logger. Default: slog.Default().
 	Logger gochainedlog.Logger
+
+	// Mode selects which subsystems are active. Default: ModeFull.
+	Mode Mode
 }
 
 func (c *Config) defaults() {
+	if c.Mode == 0 {
+		c.Mode = ModeFull
+	}
 	if c.MaxConcurrency == 0 {
 		c.MaxConcurrency = 100
 	}
@@ -170,6 +190,12 @@ func WithPriorityTiers(tiers []store.TierConfig) Option {
 
 func WithKeyPrefix(prefix string) Option {
 	return func(c *Config) { c.StoreConfig.KeyPrefix = prefix }
+}
+
+// WithMode sets which subsystems are active on this node.
+// Default: ModeFull. Example: WithMode(ModeQueue | ModeScheduler).
+func WithMode(m Mode) Option {
+	return func(c *Config) { c.Mode = m }
 }
 
 // WithRedisSentinel configures Redis Sentinel failover mode.

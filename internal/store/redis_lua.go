@@ -152,6 +152,10 @@ for _, msgJson in ipairs(msgs) do
       args[#args+1] = 'metadata'
       args[#args+1] = msg.metadata
     end
+    if msg.concurrency_keys and msg.concurrency_keys ~= '' then
+      args[#args+1] = 'concurrency_keys'
+      args[#args+1] = msg.concurrency_keys
+    end
     redis.call('XADD', stream, '*', unpack(args))
     redis.call('ZREM', delayed, msgJson)
     moved = moved + 1
@@ -206,6 +210,64 @@ if #msgs == 0 then
 end
 redis.call('DEL', KEYS[1])
 return msgs
+`
+
+// luaClaimSideEffect atomically claims a side-effect step or returns the cached result.
+// KEYS[1] = side effect key (prefix:sideeffect:{runID}:{stepKey})
+// ARGV[1] = TTL in seconds
+// Returns:
+//   "claimed"  — step was not started; caller should execute then call CompleteSideEffect
+//   "pending"  — step was claimed by another caller (concurrent execution)
+//   result     — step already completed; return cached result (prefixed with "done:")
+const luaClaimSideEffect = `
+local key = KEYS[1]
+local status = redis.call('HGET', key, 'status')
+if status == 'done' then
+  return 'done:' .. (redis.call('HGET', key, 'result') or '')
+end
+if status == 'pending' then
+  return 'pending'
+end
+redis.call('HSET', key, 'status', 'pending')
+redis.call('EXPIRE', key, tonumber(ARGV[1]))
+return 'claimed'
+`
+
+// luaAcquireConcurrencySlot atomically acquires a concurrency slot if capacity allows.
+// Uses a sorted set as a semaphore: member=runID, score=acquireTime (for orphan detection).
+// KEYS[1] = concurrency slot key (prefix:conc:{concKey})
+// ARGV[1] = runID
+// ARGV[2] = maxConcurrency
+// ARGV[3] = current timestamp (score)
+// Returns:
+//   1 — slot acquired
+//   0 — at capacity, slot not acquired
+const luaAcquireConcurrencySlot = `
+local key = KEYS[1]
+local runID = ARGV[1]
+local maxConc = tonumber(ARGV[2])
+local now = ARGV[3]
+
+-- Check if this runID already holds a slot (idempotent).
+if redis.call('ZSCORE', key, runID) then
+  return 1
+end
+
+local current = redis.call('ZCARD', key)
+if current >= maxConc then
+  return 0
+end
+
+redis.call('ZADD', key, now, runID)
+return 1
+`
+
+// luaReleaseConcurrencySlot releases a concurrency slot.
+// KEYS[1] = concurrency slot key
+// ARGV[1] = runID
+// Returns 1 if removed, 0 if not found.
+const luaReleaseConcurrencySlot = `
+return redis.call('ZREM', KEYS[1], ARGV[1])
 `
 
 // Public accessors for Lua scripts needed by external packages (election, lock).

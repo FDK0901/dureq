@@ -51,14 +51,15 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) 
 
 	now := time.Now()
 	msg := types.WorkMessage{
-		RunID:        xid.New().String(),
-		JobID:        job.ID,
-		TaskType:     job.TaskType,
-		Payload:      job.Payload,
-		Attempt:      attempt,
-		Headers:      job.Headers,
-		Priority:     priority,
-		DispatchedAt: now,
+		RunID:           xid.New().String(),
+		JobID:           job.ID,
+		TaskType:        job.TaskType,
+		Payload:         job.Payload,
+		Attempt:         attempt,
+		Headers:         job.Headers,
+		Priority:        priority,
+		DispatchedAt:    now,
+		ConcurrencyKeys: job.ConcurrencyKeys,
 	}
 	// Tag with handler version for version-aware routing.
 	if d.handlerVersions != nil {

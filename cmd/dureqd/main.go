@@ -2,14 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/FDK0901/dureq/cmd/dureqd/config"
+	"github.com/FDK0901/dureq/cmd/dureqd/handlers"
 	"github.com/FDK0901/dureq/internal/monitor"
 	"github.com/FDK0901/dureq/internal/server"
 	"github.com/FDK0901/go-chainedlog/impl/chainedzerolog"
@@ -56,6 +61,9 @@ func main() {
 	if cfg.DureqdConfig.Prefix != "" {
 		opts = append(opts, server.WithKeyPrefix(cfg.DureqdConfig.Prefix))
 	}
+	if m := parseMode(cfg.DureqdConfig.Mode); m != 0 {
+		opts = append(opts, server.WithMode(m))
+	}
 	apiAddr := ":8080"
 	if cfg.DureqdConfig.ApiAddress != "" {
 		apiAddr = cfg.DureqdConfig.ApiAddress
@@ -70,9 +78,19 @@ func main() {
 		logger.Fatal().Err(err).Msg("failed to create server")
 	}
 
-	// TODO: Register handlers from a plugin/config system.
-	// For now, this is a skeleton. Users would import this and add:
-	//   srv.RegisterHandler(types.HandlerDefinition{...})
+	// Register built-in handlers from the static registry.
+	var enabledHandlers map[string]bool
+	if len(cfg.DureqdConfig.Handlers) > 0 {
+		enabledHandlers = make(map[string]bool, len(cfg.DureqdConfig.Handlers))
+		for _, h := range cfg.DureqdConfig.Handlers {
+			enabledHandlers[h] = true
+		}
+	}
+	registered, skipped := handlers.RegisterFiltered(srv, enabledHandlers)
+	if skipped > 0 {
+		logger.Info().Int("skipped", skipped).Int("registered", registered).Msg("some handlers skipped (filtered or failed)")
+	}
+	logger.Info().Int("count", registered).Strs("available", handlers.List()).Msg("registered built-in handlers")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -81,12 +99,46 @@ func main() {
 		logger.Fatal().Err(err).Msg("failed to start server")
 	}
 
+	// Track readiness — set after server + APIs are fully initialized.
+	var ready atomic.Bool
+
 	// Start monitoring API — HTTP (wired to server's store and dispatcher).
 	api := monitor.NewAPI(srv.Store(), srv.Dispatcher(), logger)
 	if w := srv.Worker(); w != nil {
 		api.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
 	}
-	httpSrv := &http.Server{Addr: apiAddr, Handler: api.Handler()}
+
+	mux := http.NewServeMux()
+
+	// Health check: returns 200 if Redis is reachable.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		pingCtx, pingCancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer pingCancel()
+
+		if err := srv.Store().Ping(pingCtx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+	})
+
+	// Readiness check: returns 200 only after the server is fully started.
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		if !ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"status": "not ready"})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+	})
+
+	// All other routes go to the monitoring API.
+	mux.Handle("/", api.Handler())
+
+	httpSrv := &http.Server{Addr: apiAddr, Handler: mux}
 	go func() {
 		logger.Info().String("addr", apiAddr).Msg("monitoring HTTP API listening")
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -94,21 +146,27 @@ func main() {
 		}
 	}()
 
-	// Start monitoring API — gRPC (shares the same APIService).
+	// Start monitoring API — gRPC. Listen synchronously before spawning Serve
+	// goroutine so that readiness is not set until the port is bound.
 	grpcSrv := grpc.NewServer()
 	grpcMonitor := monitor.NewGRPCServer(api.Service())
 	grpcMonitor.RegisterServer(grpcSrv)
 	reflection.Register(grpcSrv)
+
+	grpcLis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("failed to listen for gRPC")
+	}
 	go func() {
-		lis, err := net.Listen("tcp", grpcAddr)
-		if err != nil {
-			logger.Fatal().Err(err).Msg("failed to listen for gRPC")
-		}
 		logger.Info().String("addr", grpcAddr).Msg("monitoring gRPC API listening")
-		if err := grpcSrv.Serve(lis); err != nil {
+		if err := grpcSrv.Serve(grpcLis); err != nil {
 			logger.Fatal().Err(err).Msg("gRPC server error")
 		}
 	}()
+
+	// Mark as ready after all components are up and listening.
+	ready.Store(true)
+	logger.Info().Msg("dureqd ready")
 
 	// Wait for shutdown signal.
 	sigCh := make(chan os.Signal, 1)
@@ -118,7 +176,39 @@ func main() {
 	fmt.Println() // newline after ^C
 	logger.Info().String("signal", sig.String()).Msg("received signal, shutting down")
 
+	// Mark not ready immediately to fail readiness probes during drain.
+	ready.Store(false)
+
 	grpcSrv.GracefulStop()
 	httpSrv.Close()
 	srv.Stop()
+}
+
+// parseMode converts a config string like "queue,scheduler" into a server.Mode bitmask.
+// Returns 0 (caller uses default ModeFull) for empty or unrecognized input.
+func parseMode(s string) server.Mode {
+	if s == "" {
+		return 0
+	}
+
+	modeMap := map[string]server.Mode{
+		"full":      server.ModeFull,
+		"queue":     server.ModeQueue,
+		"scheduler": server.ModeScheduler,
+		"workflow":  server.ModeWorkflow,
+		"monitor":   server.ModeMonitor,
+	}
+
+	if m, ok := modeMap[strings.ToLower(strings.TrimSpace(s))]; ok {
+		return m
+	}
+
+	// Comma-separated combination: "queue,scheduler"
+	var combined server.Mode
+	for _, part := range strings.Split(s, ",") {
+		if m, ok := modeMap[strings.ToLower(strings.TrimSpace(part))]; ok {
+			combined |= m
+		}
+	}
+	return combined
 }

@@ -348,10 +348,10 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 		})
 	}
 
-	// Cache request ID → job ID for idempotent retries (5 minute TTL).
+	// Cache request ID → job ID for idempotent retries.
 	if req.RequestID != nil && *req.RequestID != "" {
 		dedupKey := store.RequestDedupKey(c.store.Prefix(), *req.RequestID)
-		c.rdb.Do(ctx, c.rdb.B().Set().Key(dedupKey).Value(job.ID).Ex(5*time.Minute).Build())
+		c.rdb.Do(ctx, c.rdb.B().Set().Key(dedupKey).Value(job.ID).Ex(c.store.Config().RequestDedupTTL).Build())
 	}
 
 	return job, nil
@@ -405,8 +405,8 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 		return fmt.Errorf("get job: %w", err)
 	}
 
-	if !job.Status.IsTerminal() {
-		return fmt.Errorf("job %s is in non-terminal state %s, cannot retry", jobID, job.Status)
+	if !job.Status.IsRetryable() {
+		return fmt.Errorf("job %s is %s, cannot retry (only failed/dead/cancelled)", jobID, job.Status)
 	}
 
 	now := time.Now()
@@ -621,9 +621,22 @@ func (c *Client) BackfillSchedule(ctx context.Context, jobID string, startTime, 
 }
 
 // SignalWorkflow sends an asynchronous signal to a running workflow.
-// The signal is appended to a per-workflow signal stream and consumed
-// by the orchestrator on the next event loop tick.
-func (c *Client) SignalWorkflow(ctx context.Context, workflowID string, signalName string, payload any) error {
+// The signal is appended to a per-workflow signal stream. User code
+// consumes signals via ConsumeSignals(); the orchestrator does not
+// consume them directly.
+//
+// Returns ErrWorkflowTerminal if the workflow has already completed,
+// failed, or been cancelled.
+func (c *Client) SignalWorkflow(ctx context.Context, workflowID string, signalName string, payload any, opts ...types.SignalOption) error {
+	// Terminal guard: reject signals to workflows that can no longer process them.
+	wf, _, err := c.store.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		return fmt.Errorf("get workflow for signal: %w", err)
+	}
+	if wf.Status.IsTerminal() {
+		return types.ErrWorkflowTerminal
+	}
+
 	var payloadBytes json.RawMessage
 	if payload != nil {
 		var err error
@@ -638,6 +651,11 @@ func (c *Client) SignalWorkflow(ctx context.Context, workflowID string, signalNa
 		Payload:    payloadBytes,
 		SentAt:     time.Now(),
 		WorkflowID: workflowID,
+	}
+
+	// Apply options.
+	for _, opt := range opts {
+		opt(signal)
 	}
 
 	if err := c.store.SendSignal(ctx, signal); err != nil {
@@ -723,8 +741,8 @@ func (c *Client) RetryWorkflow(ctx context.Context, workflowID string) (*types.W
 	if err != nil {
 		return nil, err
 	}
-	if !wf.Status.IsTerminal() {
-		return nil, fmt.Errorf("cannot retry: workflow is %s", wf.Status)
+	if !wf.Status.IsRetryable() {
+		return nil, fmt.Errorf("cannot retry: workflow is %s (only failed/cancelled)", wf.Status)
 	}
 
 	now := time.Now()
@@ -905,8 +923,8 @@ func (c *Client) RetryBatch(ctx context.Context, batchID string, retryFailedOnly
 	if err != nil {
 		return nil, err
 	}
-	if !batch.Status.IsTerminal() {
-		return nil, fmt.Errorf("cannot retry: batch is %s", batch.Status)
+	if !batch.Status.IsRetryable() {
+		return nil, fmt.Errorf("cannot retry: batch is %s (only failed/cancelled)", batch.Status)
 	}
 
 	now := time.Now()
@@ -1104,13 +1122,14 @@ func (c *Client) dispatchJob(ctx context.Context, job *types.Job) error {
 
 	now := time.Now()
 	msg := &types.WorkMessage{
-		RunID:        xid.New().String(),
-		JobID:        job.ID,
-		TaskType:     job.TaskType,
-		Payload:      job.Payload,
-		Attempt:      job.Attempt,
-		Priority:     priority,
-		DispatchedAt: now,
+		RunID:           xid.New().String(),
+		JobID:           job.ID,
+		TaskType:        job.TaskType,
+		Payload:         job.Payload,
+		Attempt:         job.Attempt,
+		Priority:        priority,
+		DispatchedAt:    now,
+		ConcurrencyKeys: job.ConcurrencyKeys,
 	}
 
 	tierName := resolveTier(c.store.Config().Tiers, priority)

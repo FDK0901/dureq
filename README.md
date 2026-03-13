@@ -112,7 +112,7 @@ Client (Go)
 - **Overlap Policies** — Control concurrent runs for recurring jobs (allow all, skip, buffer one, buffer all, replace)
 - **Catchup / Backfill** — Recover missed executions within a configurable window
 - **Schedule Jitter** — Random offset on scheduled execution times to prevent thundering herd
-- **Exactly-Once Execution** — Per-run distributed locks prevent duplicate handler invocation
+- **Duplicate-Suppressed Execution** — Per-run distributed locks prevent concurrent handler invocation; external side effects require idempotency ([details](docs/guarantees.md))
 - **Unique Keys** — Deduplication via unique keys with lookup and manual deletion
 - **Worker Versioning** — BuildID-style safe deployments; version-mismatched work is re-enqueued for matching workers
 - **ScheduleToStart Timeout** — Fail jobs that wait too long in the queue before starting
@@ -133,6 +133,21 @@ Client (Go)
 - **Monitoring APIs** — HTTP REST, gRPC, and WebSocket for full cluster observability
 - **Payload Search** — JSONPath-based search across jobs, workflows, and batches
 - **Multi-Tenancy** — Key prefix isolation per tenant
+
+### Execution Guarantees
+
+dureq provides **at-least-once delivery with duplicate-suppressed handler start**.
+
+| Aspect | Guarantee | Details |
+|--------|-----------|---------|
+| Enqueue | At-most-once per UniqueKey | `SET NX` dedup guard |
+| Dispatch | At-least-once per RunID | Dedup key prevents re-add to stream |
+| Handler start | Duplicate-suppressed | Per-run lock prevents concurrent execution |
+| Completion | Pipelined (not atomic) | Partial failure recovered by orphan detection |
+| Cancellation | Best-effort | Pub/Sub (lost if worker offline) |
+| Workflow signals | At-most-once | Durable Redis Stream; XDEL after read (crash between read and consumer processing loses signal) |
+
+For full details including failure scenarios, see [docs/guarantees.md](docs/guarantees.md) and [docs/faq.md](docs/faq.md).
 
 ## Getting Started
 

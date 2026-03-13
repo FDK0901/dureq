@@ -93,10 +93,11 @@ func (p *Processor) flushReady(ctx context.Context) {
 	}
 
 	for _, group := range groups {
-		// Read messages WITHOUT deleting — delete only after successful processing.
-		msgs, err := p.store.ReadGroup(ctx, group)
+		// Atomic read+delete via Lua script. Only one node wins the flush;
+		// concurrent callers on other nodes get an empty result.
+		msgs, err := p.store.FlushGroup(ctx, group)
 		if err != nil {
-			p.logger.Warn().String("group", group).Err(err).Msg("aggregation: failed to read group")
+			p.logger.Warn().String("group", group).Err(err).Msg("aggregation: failed to flush group")
 			continue
 		}
 		if len(msgs) == 0 {
@@ -127,9 +128,9 @@ func (p *Processor) flushReady(ctx context.Context) {
 			CreatedAt: now,
 		}
 
-		// Save the job to Redis so the worker can update its status after processing.
-		if _, err := p.store.SaveJob(ctx, job); err != nil {
-			p.logger.Warn().String("group", group).Err(err).Msg("aggregation: failed to save aggregated job")
+		// CreateJob (not SaveJob) to prevent upsert overwrites from duplicate flushes.
+		if _, err := p.store.CreateJob(ctx, job); err != nil {
+			p.logger.Warn().String("group", group).Err(err).Msg("aggregation: failed to create aggregated job")
 			continue
 		}
 
@@ -137,9 +138,6 @@ func (p *Processor) flushReady(ctx context.Context) {
 			p.logger.Warn().String("group", group).Err(err).Msg("aggregation: failed to dispatch aggregated job")
 			continue
 		}
-
-		// All processing succeeded — now delete the group messages.
-		p.store.DeleteGroupMessages(ctx, group)
 
 		p.logger.Info().String("group", group).Int("count", len(msgs)).String("job_id", job.ID).Msg("aggregation: flushed and dispatched")
 	}

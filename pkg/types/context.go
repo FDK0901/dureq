@@ -19,6 +19,8 @@ const (
 	ctxKeyNodeID
 	ctxKeyHeaders
 	ctxKeyProgressReporter
+	ctxKeySideEffectStore
+	ctxKeySideEffectTTL
 )
 
 // WithJobID stores the job ID in the context.
@@ -115,6 +117,39 @@ type ProgressReporterFunc func(ctx context.Context, data json.RawMessage) error
 // WithProgressReporter stores the progress reporter function in the context.
 func WithProgressReporter(ctx context.Context, fn ProgressReporterFunc) context.Context {
 	return context.WithValue(ctx, ctxKeyProgressReporter, fn)
+}
+
+// SideEffectStore is a minimal interface for side-effect step persistence.
+// Implemented by internal/store.RedisStore and injected via context by the worker.
+type SideEffectStore interface {
+	// ClaimSideEffect atomically claims a side-effect step for the given run.
+	// Returns (result, true) if already done, ("", false) if newly claimed.
+	ClaimSideEffect(ctx context.Context, runID, stepKey string, ttlSeconds int) (string, bool, error)
+	// CompleteSideEffect marks a step as done and stores the result.
+	CompleteSideEffect(ctx context.Context, runID, stepKey string, result string) error
+}
+
+// WithSideEffectStore stores the SideEffectStore in the context.
+func WithSideEffectStore(ctx context.Context, s SideEffectStore) context.Context {
+	return context.WithValue(ctx, ctxKeySideEffectStore, s)
+}
+
+// GetSideEffectStore extracts the SideEffectStore from the context.
+func GetSideEffectStore(ctx context.Context) SideEffectStore {
+	v, _ := ctx.Value(ctxKeySideEffectStore).(SideEffectStore)
+	return v
+}
+
+// WithSideEffectTTL stores the side-effect step cache TTL (in seconds) in the context.
+func WithSideEffectTTL(ctx context.Context, seconds int) context.Context {
+	return context.WithValue(ctx, ctxKeySideEffectTTL, seconds)
+}
+
+// GetSideEffectTTL extracts the side-effect TTL from the context.
+// Returns 0 if not set (caller should use a default).
+func GetSideEffectTTL(ctx context.Context) int {
+	v, _ := ctx.Value(ctxKeySideEffectTTL).(int)
+	return v
 }
 
 // ReportProgress reports user-defined progress data for the current run.

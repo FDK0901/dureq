@@ -82,3 +82,6 @@ type Store interface {
 
 // Compile-time check that RedisStore implements Store.
 var _ Store = (*RedisStore)(nil)
+
+// Compile-time check that RedisStore implements SideEffectStore.
+var _ types.SideEffectStore = (*RedisStore)(nil)

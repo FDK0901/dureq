@@ -38,8 +38,6 @@ go.work.sum
 # Configuration files
 configs/
 
-tests/
-
 # IDE & Editor files
 .vscode
 .idea

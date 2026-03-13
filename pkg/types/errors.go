@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -25,6 +26,8 @@ var (
 	ErrExecutionTimedOut      = errors.New("dureq: execution timed out")
 	ErrScheduleToStartTimeout = errors.New("dureq: schedule-to-start timeout exceeded")
 	ErrNoProgressReporter     = errors.New("dureq: no progress reporter in context (called outside handler?)")
+	ErrWorkflowTerminal       = errors.New("dureq: workflow is in terminal state, cannot receive signals")
+	ErrSignalDuplicate        = errors.New("dureq: duplicate signal (dedup key already exists)")
 )
 
 // ErrorClassification categorizes errors for retry decisions.
@@ -91,6 +94,14 @@ func GetErrorClassString(errClass ErrorClassification) string {
 		return "non-retryable"
 	case ErrorClassRateLimited:
 		return "rate-limited"
+	case ErrorClassSkip:
+		return "skip"
+	case ErrorClassRepeat:
+		return "repeat"
+	case ErrorClassPause:
+		return "pause"
+	case ErrorClassContinueAsNew:
+		return "continue-as-new"
 	}
 	return "unknown"
 }
@@ -175,11 +186,29 @@ func ClassifyControlFlow(err error) ErrorClassification {
 		return ErrorClassPause
 	}
 
+	var contErr *ContinueAsNewError
+	if errors.As(err, &contErr) {
+		return ErrorClassContinueAsNew
+	}
+
 	return ClassifyError(err)
 }
 
 const (
-	ErrorClassSkip   ErrorClassification = iota + 10 // skip execution, no state change
-	ErrorClassRepeat                                  // save and re-enqueue immediately
-	ErrorClassPause                                   // pause the job
+	ErrorClassSkip          ErrorClassification = iota + 10 // skip execution, no state change
+	ErrorClassRepeat                                         // save and re-enqueue immediately
+	ErrorClassPause                                          // pause the job
+	ErrorClassContinueAsNew                                  // complete and spawn new workflow instance
 )
+
+// ContinueAsNewError signals that a workflow should complete with status
+// "continued" and a new instance should be created with the provided input.
+// This is used for long-running workflows that need to reset their state
+// periodically to prevent unbounded growth.
+type ContinueAsNewError struct {
+	Input json.RawMessage
+}
+
+func (e *ContinueAsNewError) Error() string {
+	return "continue-as-new"
+}

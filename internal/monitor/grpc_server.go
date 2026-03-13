@@ -4,7 +4,7 @@ import (
 	"net/http"
 
 	pb "github.com/FDK0901/dureq/gen/dureq/monitor/v1"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -14,7 +14,7 @@ import (
 type GRPCServer struct {
 	pb.UnimplementedMonitorServiceServer
 	svc    *APIService
-	logger gochainedlog.Logger
+	logger chainedlog.Logger
 }
 
 // NewGRPCServer creates a new gRPC monitor server backed by an APIService.

@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 )
 
 // syncRequest represents a failed Redis write operation that should be retried.
@@ -38,14 +38,14 @@ type SyncRetrier struct {
 	ch      chan *syncRequest
 	pending atomic.Int64
 	failed  atomic.Int64
-	logger  gochainedlog.Logger
+	logger  chainedlog.Logger
 
 	mu     sync.Mutex
 	recent []SyncRetryItem // ring buffer of recent failures (max 20)
 }
 
 // NewSyncRetrier creates a SyncRetrier and starts its background loop.
-func NewSyncRetrier(ctx context.Context, logger gochainedlog.Logger) *SyncRetrier {
+func NewSyncRetrier(ctx context.Context, logger chainedlog.Logger) *SyncRetrier {
 	sr := &SyncRetrier{
 		ch:     make(chan *syncRequest, 256),
 		logger: logger,

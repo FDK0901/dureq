@@ -10,7 +10,7 @@ import (
 	"github.com/FDK0901/dureq/internal/dispatcher"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/redis/rueidis"
 	"github.com/rs/xid"
@@ -21,7 +21,7 @@ import (
 type Orchestrator struct {
 	store      *store.RedisStore
 	dispatcher *dispatcher.Dispatcher
-	logger     gochainedlog.Logger
+	logger     chainedlog.Logger
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -33,7 +33,7 @@ type Orchestrator struct {
 type OrchestratorConfig struct {
 	Store      *store.RedisStore
 	Dispatcher *dispatcher.Dispatcher
-	Logger     gochainedlog.Logger
+	Logger     chainedlog.Logger
 }
 
 // NewOrchestrator creates a new workflow orchestrator.
@@ -1531,8 +1531,8 @@ func (o *Orchestrator) retryWorkflow(ctx context.Context, wf *types.WorkflowInst
 				switch td.ResultReuse {
 				case types.ResultReuseNever:
 					shouldReset = true
-				// "on_success" keeps completed tasks (they succeeded), so no reset.
-				// "always" (default) also keeps completed tasks.
+					// "on_success" keeps completed tasks (they succeeded), so no reset.
+					// "always" (default) also keeps completed tasks.
 				}
 			}
 		}

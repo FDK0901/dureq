@@ -22,7 +22,7 @@ import (
 	"github.com/FDK0901/dureq/internal/server"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 )
 
 // Server options — re-export from internal/server.
@@ -53,11 +53,11 @@ type Server = server.Server
 type Mode = server.Mode
 
 const (
-	ModeQueue    = server.ModeQueue
+	ModeQueue     = server.ModeQueue
 	ModeScheduler = server.ModeScheduler
-	ModeWorkflow = server.ModeWorkflow
-	ModeMonitor  = server.ModeMonitor
-	ModeFull     = server.ModeFull
+	ModeWorkflow  = server.ModeWorkflow
+	ModeMonitor   = server.ModeMonitor
+	ModeFull      = server.ModeFull
 )
 
 // NewServer creates a new dureq server node.
@@ -103,7 +103,7 @@ type WorkflowAuditEntry = monitor.WorkflowAuditEntry
 type ApiError = monitor.ApiError
 
 // Re-export APIService
-func NewAPIService(s *RedisStore, disp Dispatcher, logger gochainedlog.Logger) *APIService {
+func NewAPIService(s *RedisStore, disp Dispatcher, logger chainedlog.Logger) *APIService {
 	return monitor.NewAPIService(s, disp, logger)
 }
 

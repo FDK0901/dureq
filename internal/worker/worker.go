@@ -19,7 +19,7 @@ import (
 	"github.com/FDK0901/dureq/internal/ratelimit"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/panjf2000/ants/v2"
 	"github.com/redis/rueidis"
@@ -42,7 +42,7 @@ type Config struct {
 	ShutdownTimeout   time.Duration // Grace period before aborting in-flight tasks. Default: 30s.
 	GlobalMiddlewares []types.MiddlewareFunc
 	DynConfig         *dynconfig.Manager // Optional: runtime config overrides (timeout, maxAttempts).
-	Logger            gochainedlog.Logger
+	Logger            chainedlog.Logger
 }
 
 // streamMessage wraps a parsed work message with the stream metadata needed for ack/delay.
@@ -69,7 +69,7 @@ type Worker struct {
 	globalMiddlewares []types.MiddlewareFunc
 	dynCfg            *dynconfig.Manager
 	tiers             []store.TierConfig
-	logger            gochainedlog.Logger
+	logger            chainedlog.Logger
 
 	rateLimiter     *ratelimit.Limiter
 	activeRuns      sync.Map // runID → struct{} for heartbeat/crash detection
@@ -787,7 +787,9 @@ func (w *Worker) finishProcessMessage(sm *streamMessage, work types.WorkMessage,
 		var repeatErr *types.RepeatError
 		if errors.As(res.err, &repeatErr) && repeatErr.Delay > 0 {
 			retryWork := work
-			syncRetrySave(w.syncer, func() error { return w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(repeatErr.Delay)) }, fmt.Sprintf("add delayed repeat %s", work.JobID))
+			syncRetrySave(w.syncer, func() error {
+				return w.store.AddDelayed(w.ctx, sm.TierName, &retryWork, time.Now().Add(repeatErr.Delay))
+			}, fmt.Sprintf("add delayed repeat %s", work.JobID))
 		} else {
 			syncRetrySave(w.syncer, func() error { return w.store.ReenqueueWork(w.ctx, sm.TierName, &work, 0) }, fmt.Sprintf("requeue repeat %s", work.JobID))
 		}

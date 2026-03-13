@@ -8,7 +8,7 @@ import (
 
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 )
 
 // SyncRetryStatsFunc is a function that returns the current SyncRetrier stats
@@ -22,7 +22,7 @@ type API struct {
 }
 
 // NewAPI creates a new monitoring API backed by Redis.
-func NewAPI(s *store.RedisStore, disp Dispatcher, logger gochainedlog.Logger) *API {
+func NewAPI(s *store.RedisStore, disp Dispatcher, logger chainedlog.Logger) *API {
 	svc := NewAPIService(s, disp, logger)
 	api := &API{svc: svc, mux: http.NewServeMux()}
 	api.registerRoutes()

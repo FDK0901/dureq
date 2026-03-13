@@ -6,7 +6,7 @@ import (
 
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 )
 
@@ -20,7 +20,7 @@ type Config struct {
 	ScanInterval time.Duration
 	// BatchSize is the number of jobs to process per scan iteration. Default: 100.
 	BatchSize int
-	Logger    gochainedlog.Logger
+	Logger    chainedlog.Logger
 }
 
 // Cleaner periodically removes completed jobs older than the retention period.
@@ -29,7 +29,7 @@ type Cleaner struct {
 	retentionPeriod time.Duration
 	scanInterval    time.Duration
 	batchSize       int
-	logger          gochainedlog.Logger
+	logger          chainedlog.Logger
 	cancel          context.CancelFunc
 }
 

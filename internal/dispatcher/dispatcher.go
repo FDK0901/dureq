@@ -6,7 +6,7 @@ import (
 
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/rs/xid"
 )
@@ -16,12 +16,12 @@ import (
 type Dispatcher struct {
 	store           *store.RedisStore
 	hooks           *types.Hooks
-	logger          gochainedlog.Logger
+	logger          chainedlog.Logger
 	handlerVersions map[types.TaskType]string
 }
 
 // New creates a new dispatcher backed by Redis.
-func New(s *store.RedisStore, logger gochainedlog.Logger) *Dispatcher {
+func New(s *store.RedisStore, logger chainedlog.Logger) *Dispatcher {
 	if logger == nil {
 		logger = chainedslog.NewSlog(chainedslog.NewSlogBase())
 	}

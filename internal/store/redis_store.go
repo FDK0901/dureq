@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/bytedance/sonic"
 	"github.com/redis/rueidis"
 )
@@ -109,24 +109,24 @@ type RedisStore struct {
 	rdb    rueidis.Client
 	cfg    RedisStoreConfig
 	prefix string
-	logger gochainedlog.Logger
+	logger chainedlog.Logger
 
 	// Pre-compiled Lua scripts (all single-key for Redis Cluster compatibility)
-	scriptSaveJob       *rueidis.Lua
-	scriptCreateJob     *rueidis.Lua
-	scriptCASJob        *rueidis.Lua
-	scriptCASUpdate     *rueidis.Lua
-	scriptCreateNX      *rueidis.Lua
+	scriptSaveJob         *rueidis.Lua
+	scriptCreateJob       *rueidis.Lua
+	scriptCASJob          *rueidis.Lua
+	scriptCASUpdate       *rueidis.Lua
+	scriptCreateNX        *rueidis.Lua
 	scriptLeaderRefresh   *rueidis.Lua
 	scriptMoveDelayed     *rueidis.Lua
-	scriptFlushGroup           *rueidis.Lua
-	scriptClaimSideEffect      *rueidis.Lua
-	scriptAcquireConcSlot      *rueidis.Lua
-	scriptReleaseConcSlot      *rueidis.Lua
+	scriptFlushGroup      *rueidis.Lua
+	scriptClaimSideEffect *rueidis.Lua
+	scriptAcquireConcSlot *rueidis.Lua
+	scriptReleaseConcSlot *rueidis.Lua
 }
 
 // NewRedisStore creates a new Redis store and registers tier configuration.
-func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog.Logger) (*RedisStore, error) {
+func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger chainedlog.Logger) (*RedisStore, error) {
 	cfg.defaults()
 
 	s := &RedisStore{
@@ -135,17 +135,17 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog
 		prefix: cfg.prefix(),
 		logger: logger,
 
-		scriptSaveJob:       rueidis.NewLuaScript(luaSaveJobSingleKey),
-		scriptCreateJob:     rueidis.NewLuaScript(luaCreateIfNotExists),
-		scriptCASJob:        rueidis.NewLuaScript(luaCASUpdateJobSingleKey),
-		scriptCASUpdate:     rueidis.NewLuaScript(luaCASUpdate),
-		scriptCreateNX:      rueidis.NewLuaScript(luaCreateIfNotExists),
-		scriptLeaderRefresh: rueidis.NewLuaScript(luaLeaderRefresh),
-		scriptMoveDelayed:   rueidis.NewLuaScript(luaMoveDelayedToStream),
+		scriptSaveJob:         rueidis.NewLuaScript(luaSaveJobSingleKey),
+		scriptCreateJob:       rueidis.NewLuaScript(luaCreateIfNotExists),
+		scriptCASJob:          rueidis.NewLuaScript(luaCASUpdateJobSingleKey),
+		scriptCASUpdate:       rueidis.NewLuaScript(luaCASUpdate),
+		scriptCreateNX:        rueidis.NewLuaScript(luaCreateIfNotExists),
+		scriptLeaderRefresh:   rueidis.NewLuaScript(luaLeaderRefresh),
+		scriptMoveDelayed:     rueidis.NewLuaScript(luaMoveDelayedToStream),
 		scriptFlushGroup:      rueidis.NewLuaScript(luaFlushGroup),
 		scriptClaimSideEffect: rueidis.NewLuaScript(luaClaimSideEffect),
-		scriptAcquireConcSlot:  rueidis.NewLuaScript(luaAcquireConcurrencySlot),
-		scriptReleaseConcSlot:  rueidis.NewLuaScript(luaReleaseConcurrencySlot),
+		scriptAcquireConcSlot: rueidis.NewLuaScript(luaAcquireConcurrencySlot),
+		scriptReleaseConcSlot: rueidis.NewLuaScript(luaReleaseConcurrencySlot),
 	}
 
 	// Register tiers in sorted set so workers can discover them.

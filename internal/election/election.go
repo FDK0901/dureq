@@ -12,7 +12,7 @@ import (
 
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/redis/rueidis"
 )
@@ -29,7 +29,7 @@ type Elector struct {
 	prefix string
 	nodeID string
 	ttl    time.Duration
-	logger gochainedlog.Logger
+	logger chainedlog.Logger
 
 	refreshScript    *rueidis.Lua
 	electWithEpoch   *rueidis.Lua
@@ -56,7 +56,7 @@ type ElectorConfig struct {
 	Prefix string
 	NodeID string
 	TTL    time.Duration // Default: 10s
-	Logger gochainedlog.Logger
+	Logger chainedlog.Logger
 }
 
 // NewElector creates a new Redis-based elector.

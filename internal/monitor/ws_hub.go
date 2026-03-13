@@ -4,7 +4,7 @@ import (
 	"context"
 	"sync"
 
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/redis/rueidis"
 )
 
@@ -34,10 +34,10 @@ type Hub interface {
 type hub struct {
 	mu      sync.RWMutex
 	clients map[*WSClient]struct{}
-	logger  gochainedlog.Logger
+	logger  chainedlog.Logger
 }
 
-func newHub(logger gochainedlog.Logger) Hub {
+func newHub(logger chainedlog.Logger) Hub {
 	return &hub{
 		clients: make(map[*WSClient]struct{}),
 		logger:  logger,

@@ -10,7 +10,7 @@ import (
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/internal/workflow"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 )
 
@@ -32,7 +32,7 @@ func (e *ApiError) Error() string { return e.Msg }
 type APIService struct {
 	store      *store.RedisStore
 	dispatcher Dispatcher
-	logger     gochainedlog.Logger
+	logger     chainedlog.Logger
 	hub        Hub
 	hubCancel  context.CancelFunc
 
@@ -40,7 +40,7 @@ type APIService struct {
 }
 
 // NewAPIService creates a new APIService, starting the hub's Redis subscription.
-func NewAPIService(s *store.RedisStore, disp Dispatcher, logger gochainedlog.Logger) *APIService {
+func NewAPIService(s *store.RedisStore, disp Dispatcher, logger chainedlog.Logger) *APIService {
 	if logger == nil {
 		logger = chainedslog.NewSlog(chainedslog.NewSlogBase())
 	}
@@ -60,9 +60,9 @@ func NewAPIService(s *store.RedisStore, disp Dispatcher, logger gochainedlog.Log
 
 // --- Accessors ---
 
-func (a *APIService) Store() *store.RedisStore    { return a.store }
-func (a *APIService) Hub() Hub                    { return a.hub }
-func (a *APIService) Logger() gochainedlog.Logger { return a.logger }
+func (a *APIService) Store() *store.RedisStore  { return a.store }
+func (a *APIService) Hub() Hub                  { return a.hub }
+func (a *APIService) Logger() chainedlog.Logger { return a.logger }
 
 func (a *APIService) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
 	a.syncRetryStats = fn
@@ -741,14 +741,14 @@ func (a *APIService) ResumeQueue(ctx context.Context, tierName string) error {
 
 // StatsResponse holds overall system statistics.
 type StatsResponse struct {
-	JobCounts       map[types.JobStatus]int        `json:"job_counts"`
-	ActiveSchedules int                            `json:"active_schedules"`
-	ActiveRuns      int                            `json:"active_runs"`
-	ActiveNodes     int                            `json:"active_nodes"`
-	WorkflowCounts  map[types.WorkflowStatus]int   `json:"workflow_counts,omitempty"`
-	BatchCounts     map[types.WorkflowStatus]int   `json:"batch_counts,omitempty"`
-	ActiveWorkflows int                            `json:"active_workflows"`
-	ActiveBatches   int                            `json:"active_batches"`
+	JobCounts       map[types.JobStatus]int      `json:"job_counts"`
+	ActiveSchedules int                          `json:"active_schedules"`
+	ActiveRuns      int                          `json:"active_runs"`
+	ActiveNodes     int                          `json:"active_nodes"`
+	WorkflowCounts  map[types.WorkflowStatus]int `json:"workflow_counts,omitempty"`
+	BatchCounts     map[types.WorkflowStatus]int `json:"batch_counts,omitempty"`
+	ActiveWorkflows int                          `json:"active_workflows"`
+	ActiveBatches   int                          `json:"active_batches"`
 }
 
 func (a *APIService) GetStats(ctx context.Context) (*StatsResponse, error) {
@@ -1540,9 +1540,9 @@ func (a *APIService) ForceUnlock(ctx context.Context, key string) error {
 
 // ConcurrencyInfo holds metadata about a concurrency key's slot usage.
 type ConcurrencyInfo struct {
-	Key            string   `json:"key"`
-	ActiveSlots    int64    `json:"active_slots"`
-	ActiveRunIDs   []string `json:"active_run_ids"`
+	Key          string   `json:"key"`
+	ActiveSlots  int64    `json:"active_slots"`
+	ActiveRunIDs []string `json:"active_run_ids"`
 }
 
 // GetConcurrencyInfo returns the current slot usage for a concurrency key.

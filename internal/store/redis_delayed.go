@@ -4,19 +4,19 @@ import (
 	"context"
 	"time"
 
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 )
 
 // DelayedPoller polls delayed sorted sets and moves ripe messages back to work streams.
 type DelayedPoller struct {
 	store    *RedisStore
-	logger   gochainedlog.Logger
+	logger   chainedlog.Logger
 	interval time.Duration
 	maxMove  int
 }
 
 // NewDelayedPoller creates a delayed retry poller.
-func NewDelayedPoller(store *RedisStore, logger gochainedlog.Logger) *DelayedPoller {
+func NewDelayedPoller(store *RedisStore, logger chainedlog.Logger) *DelayedPoller {
 	return &DelayedPoller{
 		store:    store,
 		logger:   logger,

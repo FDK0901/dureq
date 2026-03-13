@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 
 	"github.com/FDK0901/dureq/internal/store"
@@ -20,7 +20,7 @@ type Locker struct {
 	prefix             string
 	lockTTL            time.Duration
 	autoExtendInterval time.Duration
-	logger             gochainedlog.Logger
+	logger             chainedlog.Logger
 
 	unlockScript *rueidis.Lua
 	extendScript *rueidis.Lua
@@ -32,7 +32,7 @@ type LockerConfig struct {
 	Prefix             string
 	LockTTL            time.Duration // Default: 30s
 	AutoExtendInterval time.Duration // Default: 0 (no auto-extend)
-	Logger             gochainedlog.Logger
+	Logger             chainedlog.Logger
 }
 
 // NewLocker creates a new Redis-based distributed locker.
@@ -93,7 +93,7 @@ type RedisLock struct {
 	lockTTL      time.Duration
 	done         chan struct{}
 	closeOnce    sync.Once
-	logger       gochainedlog.Logger
+	logger       chainedlog.Logger
 	unlockScript *rueidis.Lua
 	extendScript *rueidis.Lua
 

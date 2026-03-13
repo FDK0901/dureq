@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/coder/websocket"
 )
 
@@ -16,7 +16,7 @@ const (
 
 // HandleWebSocket returns an http.HandlerFunc that upgrades connections to
 // WebSocket and streams real-time events from the Hub.
-func HandleWebSocket(hub Hub, logger gochainedlog.Logger) http.HandlerFunc {
+func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true,

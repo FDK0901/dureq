@@ -6,14 +6,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/redis/rueidis"
 )
 
 // Key patterns for dynamic configuration.
-func globalConfigKey(prefix string) string             { return prefix + ":config:global" }
-func handlerConfigKey(prefix, taskType string) string  { return prefix + ":config:handler:" + taskType }
+func globalConfigKey(prefix string) string            { return prefix + ":config:global" }
+func handlerConfigKey(prefix, taskType string) string { return prefix + ":config:handler:" + taskType }
 
 // Snapshot holds a point-in-time view of dynamic configuration.
 type Snapshot struct {
@@ -36,7 +36,7 @@ type HandlerOverride struct {
 type Manager struct {
 	rdb      rueidis.Client
 	prefix   string
-	logger   gochainedlog.Logger
+	logger   chainedlog.Logger
 	interval time.Duration
 
 	snapshot atomic.Pointer[Snapshot]
@@ -48,7 +48,7 @@ type Config struct {
 	RDB          rueidis.Client
 	Prefix       string
 	PollInterval time.Duration // Default: 10s.
-	Logger       gochainedlog.Logger
+	Logger       chainedlog.Logger
 }
 
 // NewManager creates a new dynamic configuration manager.

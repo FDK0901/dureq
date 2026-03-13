@@ -8,7 +8,7 @@ import (
 	"github.com/FDK0901/dureq/internal/dispatcher"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 )
 
@@ -17,7 +17,7 @@ type Config struct {
 	Store      *store.RedisStore
 	Dispatcher *dispatcher.Dispatcher
 	Group      types.GroupConfig
-	Logger     gochainedlog.Logger
+	Logger     chainedlog.Logger
 }
 
 // Processor periodically flushes ready groups and dispatches the
@@ -26,7 +26,7 @@ type Processor struct {
 	store      *store.RedisStore
 	dispatcher *dispatcher.Dispatcher
 	cfg        types.GroupConfig
-	logger     gochainedlog.Logger
+	logger     chainedlog.Logger
 	cancel     context.CancelFunc
 }
 

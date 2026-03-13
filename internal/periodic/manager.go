@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 
 	"github.com/FDK0901/dureq/internal/client"
@@ -23,7 +23,7 @@ type ManagerConfig struct {
 	// SyncInterval is how often to re-sync with the provider. Default: 1m.
 	SyncInterval time.Duration
 
-	Logger gochainedlog.Logger
+	Logger chainedlog.Logger
 }
 
 // Manager syncs periodic tasks from an external config source into the
@@ -33,7 +33,7 @@ type Manager struct {
 	provider     types.PeriodicTaskConfigProvider
 	client       *client.Client
 	syncInterval time.Duration
-	logger       gochainedlog.Logger
+	logger       chainedlog.Logger
 	cancel       context.CancelFunc
 
 	// Tracks which unique keys we've created so we can detect removals.

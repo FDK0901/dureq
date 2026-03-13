@@ -18,7 +18,7 @@ import (
 	"github.com/FDK0901/dureq/internal/worker"
 	"github.com/FDK0901/dureq/internal/workflow"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/redis/rueidis"
 	"github.com/rs/xid"
 )
@@ -27,7 +27,7 @@ import (
 // the elected leader additionally runs the scheduler and orchestrator.
 type Server struct {
 	cfg         Config
-	logger      gochainedlog.Logger
+	logger      chainedlog.Logger
 	rdb         rueidis.Client
 	store       *store.RedisStore
 	registry    *HandlerRegistry
@@ -95,19 +95,27 @@ func (s *Server) RegisterHandler(def types.HandlerDefinition) error {
 func (s *Server) Hooks() *types.Hooks { return &s.hooks }
 
 // OnJobCompleted registers a hook called when any job completes successfully.
-func (s *Server) OnJobCompleted(fn types.HookFunc) { s.hooks.OnJobCompleted = append(s.hooks.OnJobCompleted, fn) }
+func (s *Server) OnJobCompleted(fn types.HookFunc) {
+	s.hooks.OnJobCompleted = append(s.hooks.OnJobCompleted, fn)
+}
 
 // OnJobFailed registers a hook called when a job fails (may be retried).
-func (s *Server) OnJobFailed(fn types.HookFunc) { s.hooks.OnJobFailed = append(s.hooks.OnJobFailed, fn) }
+func (s *Server) OnJobFailed(fn types.HookFunc) {
+	s.hooks.OnJobFailed = append(s.hooks.OnJobFailed, fn)
+}
 
 // OnJobDead registers a hook called when a job exhausts all retries.
 func (s *Server) OnJobDead(fn types.HookFunc) { s.hooks.OnJobDead = append(s.hooks.OnJobDead, fn) }
 
 // OnJobPaused registers a hook called when a job is paused.
-func (s *Server) OnJobPaused(fn types.HookFunc) { s.hooks.OnJobPaused = append(s.hooks.OnJobPaused, fn) }
+func (s *Server) OnJobPaused(fn types.HookFunc) {
+	s.hooks.OnJobPaused = append(s.hooks.OnJobPaused, fn)
+}
 
 // OnJobResumed registers a hook called when a paused job is resumed.
-func (s *Server) OnJobResumed(fn types.HookFunc) { s.hooks.OnJobResumed = append(s.hooks.OnJobResumed, fn) }
+func (s *Server) OnJobResumed(fn types.HookFunc) {
+	s.hooks.OnJobResumed = append(s.hooks.OnJobResumed, fn)
+}
 
 // Store returns the Redis store. Available after Start().
 func (s *Server) Store() *store.RedisStore { return s.store }

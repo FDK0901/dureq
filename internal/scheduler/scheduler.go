@@ -9,7 +9,7 @@ import (
 	"github.com/FDK0901/dureq/internal/dynconfig"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 )
 
@@ -25,7 +25,7 @@ type Config struct {
 	Dispatcher   Dispatcher
 	TickInterval time.Duration
 	DynConfig    *dynconfig.Manager // Optional: runtime config overrides (tick interval).
-	Logger       gochainedlog.Logger
+	Logger       chainedlog.Logger
 
 	// OrphanCheckInterval controls how often orphan run detection runs.
 	// Defaults to 30s. Set to 0 to disable.
@@ -39,7 +39,7 @@ type Scheduler struct {
 	dispatcher Dispatcher
 	interval   time.Duration
 	dynCfg     *dynconfig.Manager
-	logger     gochainedlog.Logger
+	logger     chainedlog.Logger
 
 	orphanInterval  time.Duration
 	lastOrphanCheck time.Time

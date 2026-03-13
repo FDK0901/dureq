@@ -5,7 +5,7 @@ import (
 
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
-	gochainedlog "github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 )
 
@@ -24,11 +24,11 @@ func WithRetentionPeriod(d time.Duration) Option {
 type Mode int
 
 const (
-	ModeQueue    Mode = 1 << 0 // worker + dispatcher
+	ModeQueue     Mode = 1 << 0 // worker + dispatcher
 	ModeScheduler Mode = 1 << 1 // scheduler (leader-only)
-	ModeWorkflow Mode = 1 << 2 // workflow orchestrator (leader-only)
-	ModeMonitor  Mode = 1 << 3 // HTTP monitoring API
-	ModeFull     Mode = ModeQueue | ModeScheduler | ModeWorkflow | ModeMonitor
+	ModeWorkflow  Mode = 1 << 2 // workflow orchestrator (leader-only)
+	ModeMonitor   Mode = 1 << 3 // HTTP monitoring API
+	ModeFull      Mode = ModeQueue | ModeScheduler | ModeWorkflow | ModeMonitor
 )
 
 // Has returns true if the mode includes the given flag.
@@ -82,7 +82,7 @@ type Config struct {
 	RetentionPeriod *time.Duration
 
 	// Logger is the structured logger. Default: slog.Default().
-	Logger gochainedlog.Logger
+	Logger chainedlog.Logger
 
 	// Mode selects which subsystems are active. Default: ModeFull.
 	Mode Mode
@@ -175,7 +175,7 @@ func WithLockTTL(d time.Duration) Option {
 	return func(c *Config) { c.LockTTL = d }
 }
 
-func WithLogger(l gochainedlog.Logger) Option {
+func WithLogger(l chainedlog.Logger) Option {
 	return func(c *Config) { c.Logger = l }
 }
 

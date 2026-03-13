@@ -14,7 +14,7 @@ Every claim is backed by the specific Redis primitives and code paths that imple
 | **Completion** | Pipelined, not atomic | `DoMulti` 7-step pipeline | Partial failure recovered by orphan detection |
 | **Schedule** | At-most-once per tick (single leader) | Leader-only scheduler | Leader failover gap may re-fire the same schedule |
 | **Cancellation** | Best-effort, at-most-once | Pub/Sub (fire-and-forget) | Lost permanently if worker is offline |
-| **Workflow signal** | At-most-once | Durable Redis Stream + XDEL after read | Consumer crash after XDEL loses signal |
+| **Workflow signal** | API-dependent | Durable Redis Stream | `ReadSignals`+`AckSignals` = at-least-once; deprecated `ConsumeSignals` = at-most-once |
 | **Crash recovery** | At-least-once | XAUTOCLAIM after 5-min idle | Per-run lock prevents duplicate execution |
 
 ## What "Duplicate-Suppressed Execution" Means
@@ -131,6 +131,9 @@ Cancellation signals are delivered via Pub/Sub (fire-and-forget).
 If the target worker is offline when the PUBLISH arrives, the cancellation is **permanently lost**.
 The job continues running until completion or timeout.
 
+Cancellation is non-durable control-plane signaling, not durable workflow state.
+If you need durable cancellation, model it as persisted workflow state or polling over Redis keys.
+
 ### 7. Workflow Signal Delivery
 
 ```
@@ -153,6 +156,10 @@ must be idempotent.
 
 Note: The orchestrator does NOT consume signals — user code calls
 `ReadSignals()` from within signal handlers.
+
+> **API summary**: `ReadSignals` + `AckSignals` provides at-least-once delivery.
+> The deprecated `ConsumeSignals` provides at-most-once delivery. Choose based on
+> your idempotency capability. See [signals.md](signals.md) for details.
 
 ### 8. Overlap Policy + Retry Interaction
 

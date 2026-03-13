@@ -22,9 +22,9 @@ the side effect can happen more than once.
 **What you must provide:**
 - Use `sideeffect.Step()` or `sideeffect.ExternalCall()` for external API calls, OR
 - Idempotent handlers using stable business keys for external API calls, OR
-- Transactional completion: commit DB writes and job completion in the same transaction
+- Transactional completion: commit DB writes and job completion in the same transaction. This is the strongest pattern when your business state and job result live in the same database, but it requires application integration rather than being automatic.
 
-## When Can I Get Exactly-Once Outcomes?
+## When Can I Achieve Exactly-Once Business Outcomes?
 
 When all three conditions are met:
 
@@ -46,6 +46,8 @@ B will re-dispatch the same schedule entry with a new RunID.
 Both RunIDs execute (different locks), so the job fires twice.
 
 **Mitigation**: Use `UniqueKey` on the job, or make the handler idempotent.
+
+**Important**: This is not a duplicate of the same RunID — it is a second RunID for the same schedule firing. Use business-level idempotency, not just per-run locking, to protect against it.
 
 ## What Happens When a Worker Crashes?
 

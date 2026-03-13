@@ -1,6 +1,6 @@
 # dureq
 
-A distributed, Redis-native job scheduling and workflow orchestration system built in Go.
+A Redis-native execution engine for Go: jobs, schedules, workflows, batches, and operational controls for application backends.
 
 **dureq** is short for **du**rable **r**edis **e**xecution **q**ueue.
 
@@ -94,7 +94,7 @@ Client (Go)
 - **Leader-elected coordinator**: only the leader runs Scheduler + Orchestrator
 - **All nodes are workers**: every node polls Redis Streams and executes handlers
 - **Direct Redis data flow**: no actors, no RPC between components on the same node
-- **Single dependency**: Redis only (Standalone, Sentinel, or Cluster — including multi-shard clusters)
+- **Core runtime dependency**: Redis only (Standalone, Sentinel, or Cluster). Optional dashboards, APIs, and application-specific handlers run outside the core execution path.
 
 ## Features
 
@@ -112,11 +112,11 @@ Client (Go)
 - **Overlap Policies** — Control concurrent runs for recurring jobs (allow all, skip, buffer one, buffer all, replace)
 - **Catchup / Backfill** — Recover missed executions within a configurable window
 - **Schedule Jitter** — Random offset on scheduled execution times to prevent thundering herd
-- **Duplicate-Suppressed Execution** — Per-run distributed locks prevent concurrent handler invocation; external side effects require idempotency ([details](docs/guarantees.md))
+- **Duplicate-Suppressed Execution** — Prevents concurrent handler starts for the same RunID. This is not exactly-once outcome semantics; external side effects still require idempotency, sideeffect helpers, or transactional completion ([details](docs/guarantees.md))
 - **Unique Keys** — Deduplication via unique keys with lookup and manual deletion
 - **Worker Versioning** — BuildID-style safe deployments; version-mismatched work is re-enqueued for matching workers
 - **ScheduleToStart Timeout** — Fail jobs that wait too long in the queue before starting
-- **Workflow Signals** — Send asynchronous external data to running workflows
+- **Workflow Signals** — Send asynchronous external data to running workflows. Delivery semantics depend on the API used; see [guarantees](docs/guarantees.md) and [signals](docs/signals.md) docs
 
 ### Operations
 - **Leader Election** — Automatic failover with configurable TTL and epoch-based fencing tokens
@@ -192,7 +192,7 @@ func main() {
 
     ctx := context.Background()
     srv.Start(ctx)
-    // ... signal handling, srv.Stop()
+    // In production: wire OS signal handling, call srv.Stop(), and expose /healthz and /readyz when using dureqd-style deployment.
 }
 ```
 

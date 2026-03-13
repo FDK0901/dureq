@@ -23,6 +23,17 @@ func (s JobStatus) IsTerminal() bool {
 	return false
 }
 
+// IsRetryable returns true if the job is in a state that allows retry.
+// Unlike IsTerminal, this excludes Completed — only failed/dead/cancelled jobs
+// should be retried to prevent accidental re-execution of successful work.
+func (s JobStatus) IsRetryable() bool {
+	switch s {
+	case JobStatusFailed, JobStatusDead, JobStatusCancelled:
+		return true
+	}
+	return false
+}
+
 // IsPaused returns true if the job is in the paused state.
 func (s JobStatus) IsPaused() bool {
 	return s == JobStatusPaused
@@ -31,15 +42,22 @@ func (s JobStatus) IsPaused() bool {
 // --- State Transition Graph ---
 
 // jobTransitions defines the set of valid state transitions for a job.
+//
+// Runtime paths that use these transitions:
+//   - scheduler.dispatchFiring: completed/scheduled/failed → pending
+//   - worker.handleSuccess: pending/running → scheduled (recurring), pending/running → completed
+//   - worker.handleFailure: pending/running → failed/retrying/dead (worker skips job-level running state)
+//   - client.Retry: dead/completed → pending (manual retry)
+//   - scheduler.markEndOfSchedule: scheduled → completed
 var jobTransitions = map[JobStatus][]JobStatus{
-	JobStatusPending:   {JobStatusScheduled, JobStatusRunning, JobStatusCancelled},
-	JobStatusScheduled: {JobStatusRunning, JobStatusCancelled},
-	JobStatusRunning:   {JobStatusCompleted, JobStatusFailed, JobStatusRetrying, JobStatusPaused, JobStatusDead, JobStatusCancelled},
+	JobStatusPending:   {JobStatusScheduled, JobStatusRunning, JobStatusCompleted, JobStatusFailed, JobStatusRetrying, JobStatusDead, JobStatusCancelled},
+	JobStatusScheduled: {JobStatusRunning, JobStatusCompleted, JobStatusPending, JobStatusCancelled},
+	JobStatusRunning:   {JobStatusCompleted, JobStatusFailed, JobStatusRetrying, JobStatusPaused, JobStatusDead, JobStatusScheduled, JobStatusCancelled},
 	JobStatusRetrying:  {JobStatusRunning, JobStatusPaused, JobStatusDead, JobStatusCancelled},
 	JobStatusPaused:    {JobStatusRetrying, JobStatusRunning, JobStatusDead, JobStatusCancelled},
-	JobStatusFailed:    {JobStatusRetrying, JobStatusPaused, JobStatusDead, JobStatusScheduled, JobStatusCancelled},
-	JobStatusCompleted: {JobStatusScheduled}, // recurring jobs go back to scheduled
-	JobStatusDead:      {JobStatusRetrying},  // manual retry from dead
+	JobStatusFailed:    {JobStatusRetrying, JobStatusPaused, JobStatusDead, JobStatusScheduled, JobStatusPending, JobStatusCancelled},
+	JobStatusCompleted: {JobStatusScheduled, JobStatusPending}, // recurring: scheduled, manual retry: pending
+	JobStatusDead:      {JobStatusRetrying, JobStatusPending},  // manual retry from dead
 	JobStatusCancelled: {},
 }
 
@@ -104,3 +122,29 @@ func (s RunStatus) IsTerminal() bool {
 }
 
 func (s RunStatus) String() string { return string(s) }
+
+// --- Workflow State Transition Graph ---
+
+var workflowTransitions = map[WorkflowStatus][]WorkflowStatus{
+	WorkflowStatusPending:   {WorkflowStatusRunning, WorkflowStatusCancelled},
+	WorkflowStatusRunning:   {WorkflowStatusCompleted, WorkflowStatusFailed, WorkflowStatusCancelled, WorkflowStatusSuspended, WorkflowStatusContinued},
+	WorkflowStatusSuspended: {WorkflowStatusRunning, WorkflowStatusCancelled},
+	WorkflowStatusCompleted: {},
+	WorkflowStatusFailed:    {WorkflowStatusRunning}, // retry
+	WorkflowStatusCancelled: {},
+	WorkflowStatusContinued: {},                       // terminal: replaced by new instance
+}
+
+// ValidWorkflowTransition returns true if transitioning from → to is allowed.
+func ValidWorkflowTransition(from, to WorkflowStatus) bool {
+	targets, ok := workflowTransitions[from]
+	if !ok {
+		return false
+	}
+	for _, t := range targets {
+		if t == to {
+			return true
+		}
+	}
+	return false
+}

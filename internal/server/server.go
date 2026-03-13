@@ -180,33 +180,39 @@ func (s *Server) Start(ctx context.Context) error {
 		Logger:             s.logger,
 	})
 
-	// Initialize scheduler (runs only on leader).
-	s.sched = scheduler.New(scheduler.Config{
-		Store:        s.store,
-		Dispatcher:   s.disp,
-		TickInterval: s.cfg.SchedulerTickInterval,
-		Logger:       s.logger,
-	})
+	// Initialize scheduler (runs only on leader, requires ModeScheduler).
+	if s.cfg.Mode.Has(ModeScheduler) {
+		s.sched = scheduler.New(scheduler.Config{
+			Store:        s.store,
+			Dispatcher:   s.disp,
+			TickInterval: s.cfg.SchedulerTickInterval,
+			DynConfig:    s.dynCfg,
+			Logger:       s.logger,
+		})
+	}
 
-	// Initialize worker.
-	s.work, err = worker.New(worker.Config{
-		NodeID:            s.cfg.NodeID,
-		Store:             s.store,
-		Registry:          s.registry,
-		Disp:              s.disp,
-		Locker:            s.locker,
-		MaxConcurrency:    s.cfg.MaxConcurrency,
-		ShutdownTimeout:   s.cfg.ShutdownTimeout,
-		GlobalMiddlewares: s.middlewares,
-		Logger:            s.logger,
-	})
-	if err != nil {
-		return fmt.Errorf("worker: %w", err)
+	// Initialize worker (requires ModeQueue).
+	if s.cfg.Mode.Has(ModeQueue) {
+		s.work, err = worker.New(worker.Config{
+			NodeID:            s.cfg.NodeID,
+			Store:             s.store,
+			Registry:          s.registry,
+			Disp:              s.disp,
+			Locker:            s.locker,
+			MaxConcurrency:    s.cfg.MaxConcurrency,
+			ShutdownTimeout:   s.cfg.ShutdownTimeout,
+			GlobalMiddlewares: s.middlewares,
+			DynConfig:         s.dynCfg,
+			Logger:            s.logger,
+		})
+		if err != nil {
+			return fmt.Errorf("worker: %w", err)
+		}
 	}
 
 	// Initialize aggregation processor (runs on every node with GroupConfig, not just leader).
-	// FlushGroup uses an atomic Lua script, so concurrent flushers are safe.
-	if s.cfg.GroupConfig != nil {
+	// The processor uses FlushGroup (atomic Lua read+delete) so concurrent nodes are safe.
+	if s.cfg.Mode.Has(ModeQueue) && s.cfg.GroupConfig != nil {
 		s.aggProc = aggregation.New(aggregation.Config{
 			Store:      s.store,
 			Dispatcher: s.disp,
@@ -215,8 +221,8 @@ func (s *Server) Start(ctx context.Context) error {
 		})
 	}
 
-	// Initialize archival cleaner (runs only on leader).
-	{
+	// Initialize archival cleaner (runs only on leader, requires ModeScheduler).
+	if s.cfg.Mode.Has(ModeScheduler) {
 		archCfg := archival.Config{
 			Store:  s.store,
 			Logger: s.logger,
@@ -227,32 +233,33 @@ func (s *Server) Start(ctx context.Context) error {
 		s.archCleaner = archival.New(archCfg)
 	}
 
-	// Initialize workflow orchestrator (runs only on leader).
-	s.orch = workflow.NewOrchestrator(workflow.OrchestratorConfig{
-		Store:      s.store,
-		Dispatcher: s.disp,
-		Logger:     s.logger,
-	})
-
-	// Initialize elector.
-	s.elector = election.NewElector(election.ElectorConfig{
-		RDB:    s.rdb,
-		Prefix: s.store.Prefix(),
-		NodeID: s.cfg.NodeID,
-		TTL:    s.cfg.ElectionTTL,
-		Logger: s.logger,
-	})
-	s.elector.OnElected = s.onElected
-	s.elector.OnDemoted = s.onDemoted
-
-	// Start subsystems.
-	if err := s.elector.Start(s.ctx); err != nil {
-		return fmt.Errorf("elector start: %w", err)
+	// Initialize workflow orchestrator (runs only on leader, requires ModeWorkflow).
+	if s.cfg.Mode.Has(ModeWorkflow) {
+		s.orch = workflow.NewOrchestrator(workflow.OrchestratorConfig{
+			Store:      s.store,
+			Dispatcher: s.disp,
+			Logger:     s.logger,
+		})
 	}
 
-	// Only start the worker if at least one handler is registered.
-	// A handler-less node (e.g., dureqd coordinator) should not consume work.
-	if len(s.registry.TaskTypes()) > 0 {
+	// Initialize and start elector (needed only if leader-only components are active).
+	if s.cfg.Mode.Has(ModeScheduler) || s.cfg.Mode.Has(ModeWorkflow) {
+		s.elector = election.NewElector(election.ElectorConfig{
+			RDB:    s.rdb,
+			Prefix: s.store.Prefix(),
+			NodeID: s.cfg.NodeID,
+			TTL:    s.cfg.ElectionTTL,
+			Logger: s.logger,
+		})
+		s.elector.OnElected = s.onElected
+		s.elector.OnDemoted = s.onDemoted
+		if err := s.elector.Start(s.ctx); err != nil {
+			return fmt.Errorf("elector start: %w", err)
+		}
+	}
+
+	// Only start the worker if ModeQueue is active and handlers are registered.
+	if s.work != nil && len(s.registry.TaskTypes()) > 0 {
 		if err := s.work.Start(s.ctx); err != nil {
 			return fmt.Errorf("worker start: %w", err)
 		}
@@ -310,18 +317,30 @@ func (s *Server) Stop() error {
 
 // onElected is called when this node wins the leader election.
 func (s *Server) onElected() {
-	s.logger.Info().Msg("this node is now the leader — starting scheduler, orchestrator, and archival")
-	s.sched.Start(s.ctx)
-	s.orch.Start(s.ctx)
-	s.archCleaner.Start(s.ctx)
+	s.logger.Info().Msg("this node is now the leader — starting leader-only subsystems")
+	if s.sched != nil {
+		s.sched.Start(s.ctx)
+	}
+	if s.orch != nil {
+		s.orch.Start(s.ctx)
+	}
+	if s.archCleaner != nil {
+		s.archCleaner.Start(s.ctx)
+	}
 }
 
 // onDemoted is called when this node loses leadership.
 func (s *Server) onDemoted() {
-	s.logger.Info().Msg("this node lost leadership — stopping scheduler, orchestrator, and archival")
-	s.sched.Stop()
-	s.orch.Stop()
-	s.archCleaner.Stop()
+	s.logger.Info().Msg("this node lost leadership — stopping leader-only subsystems")
+	if s.sched != nil {
+		s.sched.Stop()
+	}
+	if s.orch != nil {
+		s.orch.Stop()
+	}
+	if s.archCleaner != nil {
+		s.archCleaner.Stop()
+	}
 }
 
 // heartbeatLoop registers this node and sends periodic heartbeats.

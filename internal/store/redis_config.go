@@ -28,6 +28,27 @@ type RedisStoreConfig struct {
 	// DedupTTL is the TTL for run ID deduplication keys. Default: 5m.
 	DedupTTL time.Duration
 
+	// RequestDedupTTL is the TTL for client-level request idempotency keys.
+	// Must exceed the maximum expected client retry window. Default: 1h.
+	RequestDedupTTL time.Duration
+
+	// OverlapBufferTTL is the TTL for buffered overlap dispatch entries.
+	// Must exceed the longest schedule interval (e.g., monthly cron = 31d).
+	// Default: 7d.
+	OverlapBufferTTL time.Duration
+
+	// WorkflowResultTTL is the TTL for workflow task result entries.
+	// Must exceed the longest workflow execution duration. Default: 7d.
+	WorkflowResultTTL time.Duration
+
+	// SideEffectTTL is the TTL for side-effect step cache entries.
+	// Must exceed the longest handler execution timeout. Default: 24h.
+	SideEffectTTL time.Duration
+
+	// SignalDedupTTL is the TTL for workflow signal deduplication keys.
+	// Must exceed the longest workflow lifetime. Default: 30d.
+	SignalDedupTTL time.Duration
+
 	// Tiers is the list of user-defined priority tiers. Default: [normal].
 	Tiers []TierConfig
 }
@@ -72,6 +93,21 @@ func (c *RedisStoreConfig) defaults() {
 	}
 	if c.DedupTTL == 0 {
 		c.DedupTTL = 5 * time.Minute
+	}
+	if c.RequestDedupTTL == 0 {
+		c.RequestDedupTTL = 1 * time.Hour
+	}
+	if c.OverlapBufferTTL == 0 {
+		c.OverlapBufferTTL = 7 * 24 * time.Hour // 7 days
+	}
+	if c.WorkflowResultTTL == 0 {
+		c.WorkflowResultTTL = 7 * 24 * time.Hour // 7 days
+	}
+	if c.SideEffectTTL == 0 {
+		c.SideEffectTTL = 24 * time.Hour
+	}
+	if c.SignalDedupTTL == 0 {
+		c.SignalDedupTTL = 30 * 24 * time.Hour // 30 days
 	}
 	if len(c.Tiers) == 0 {
 		c.Tiers = []TierConfig{

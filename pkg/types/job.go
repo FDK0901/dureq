@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+// ConcurrencyKey defines a concurrency constraint for job execution.
+// Jobs sharing the same Key are limited to MaxConcurrency simultaneous runs.
+type ConcurrencyKey struct {
+	Key            string `json:"key"`             // e.g., "tenant:acme", "resource:stripe-api"
+	MaxConcurrency int    `json:"max_concurrency"` // e.g., 1 for serialized, 5 for bounded
+}
+
 // Priority represents the execution priority of a job (1-10).
 type Priority int
 
@@ -376,6 +383,11 @@ type Job struct {
 	// this duration.
 	HeartbeatTimeout *Duration `json:"heartbeat_timeout,omitempty"`
 
+	// ConcurrencyKeys limits simultaneous execution across jobs sharing the same key.
+	// For example, ConcurrencyKey{Key: "tenant:acme", MaxConcurrency: 1} ensures
+	// only one job for tenant "acme" runs at a time.
+	ConcurrencyKeys []ConcurrencyKey `json:"concurrency_keys,omitempty"`
+
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -418,15 +430,19 @@ type WorkMessage struct {
 	// Version is the handler version this message was dispatched with.
 	// Workers with a mismatched version will skip and re-enqueue the message.
 	Version string `json:"version,omitempty"`
+
+	// ConcurrencyKeys carried from the Job at dispatch time.
+	ConcurrencyKeys []ConcurrencyKey `json:"concurrency_keys,omitempty"`
 }
 
 // WorkResult is the outcome of executing a work message.
 type WorkResult struct {
-	RunID   string          `json:"run_id"`
-	JobID   string          `json:"job_id"`
-	Success bool            `json:"success"`
-	Error   *string         `json:"error,omitempty"`
-	Output  json.RawMessage `json:"output,omitempty"` // handler output data
+	RunID              string          `json:"run_id"`
+	JobID              string          `json:"job_id"`
+	Success            bool            `json:"success"`
+	Error              *string         `json:"error,omitempty"`
+	Output             json.RawMessage `json:"output,omitempty"`               // handler output data
+	ContinueAsNewInput json.RawMessage `json:"continue_as_new_input,omitempty"` // set when handler returns ContinueAsNewError
 }
 
 // NodeInfo is registered by each node in the dureq_nodes KV bucket.
@@ -465,11 +481,22 @@ const (
 	WorkflowStatusFailed    WorkflowStatus = "failed"
 	WorkflowStatusCancelled WorkflowStatus = "cancelled"
 	WorkflowStatusSuspended WorkflowStatus = "suspended"
+	WorkflowStatusContinued WorkflowStatus = "continued" // replaced by continue-as-new
 )
 
 func (s WorkflowStatus) IsTerminal() bool {
 	switch s {
-	case WorkflowStatusCompleted, WorkflowStatusFailed, WorkflowStatusCancelled:
+	case WorkflowStatusCompleted, WorkflowStatusFailed, WorkflowStatusCancelled, WorkflowStatusContinued:
+		return true
+	}
+	return false
+}
+
+// IsRetryable returns true if the workflow/batch is in a state that allows retry.
+// Excludes Completed and Continued — only failed/cancelled should be retried.
+func (s WorkflowStatus) IsRetryable() bool {
+	switch s {
+	case WorkflowStatusFailed, WorkflowStatusCancelled:
 		return true
 	}
 	return false
@@ -485,6 +512,10 @@ type WorkflowDefinition struct {
 	RetryPolicy      *RetryPolicy   `json:"retry_policy,omitempty"`
 	DefaultPriority  *Priority      `json:"default_priority,omitempty"`
 	Hooks            *WorkflowHooks `json:"hooks,omitempty"`
+
+	// SignalTimeout limits how long a signal handler can run.
+	// If not set, signal handlers inherit the workflow's ExecutionTimeout.
+	SignalTimeout *Duration `json:"signal_timeout,omitempty"`
 }
 
 // WorkflowHooks defines lifecycle hooks that are automatically dispatched
@@ -523,6 +554,19 @@ const (
 	// WorkflowTaskSubflow is a dynamic subflow node whose handler returns []WorkflowTask
 	// at runtime. The orchestrator injects these tasks into the workflow instance.
 	WorkflowTaskSubflow WorkflowTaskType = "subflow"
+)
+
+// ResultReusePolicy controls whether a workflow task's cached result
+// is reused on workflow retry.
+type ResultReusePolicy string
+
+const (
+	// ResultReuseAlways reuses the cached result if available (default).
+	ResultReuseAlways ResultReusePolicy = "always"
+	// ResultReuseNever forces re-execution even if a cached result exists.
+	ResultReuseNever ResultReusePolicy = "never"
+	// ResultReuseOnSuccess reuses only if the previous run succeeded.
+	ResultReuseOnSuccess ResultReusePolicy = "on_success"
 )
 
 // WorkflowTask is one step in a workflow DAG.
@@ -572,6 +616,11 @@ type WorkflowTask struct {
 	// Preconditions define conditions that must be true before this task is dispatched.
 	// If any precondition fails, the task is skipped.
 	Preconditions []Precondition `json:"preconditions,omitempty"`
+
+	// ResultReuse controls whether this task's cached result is reused on
+	// workflow retry. Default ("" or "always") reuses cached results.
+	// "never" forces re-execution. "on_success" reuses only successful results.
+	ResultReuse ResultReusePolicy `json:"result_reuse,omitempty"`
 }
 
 // WorkflowInstance is a running instance of a workflow definition.
@@ -607,6 +656,16 @@ type WorkflowInstance struct {
 	// Output is the result of the final (leaf) task, copied here when the
 	// workflow completes so callers can retrieve the workflow-level result.
 	Output json.RawMessage `json:"output,omitempty"`
+
+	// ArchivedTaskCount is the number of completed tasks that have been moved
+	// to the archive hash (prefix:workflow:{id}:archive) to reduce state size.
+	ArchivedTaskCount int `json:"archived_task_count,omitempty"`
+
+	// ContinuedFrom links to the predecessor workflow when this instance was
+	// created via continue-as-new.
+	ContinuedFrom *string `json:"continued_from,omitempty"`
+	// ContinuedTo links to the successor workflow after continue-as-new.
+	ContinuedTo *string `json:"continued_to,omitempty"`
 
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
@@ -753,6 +812,25 @@ type WorkflowSignal struct {
 	Payload    json.RawMessage `json:"payload,omitempty"`
 	SentAt     time.Time       `json:"sent_at"`
 	WorkflowID string          `json:"workflow_id"`
+
+	// DedupeKey, if non-empty, prevents duplicate signals with the same key
+	// from being stored. The dedup check uses a SET NX with TTL.
+	DedupeKey string `json:"dedupe_key,omitempty"`
+
+	// StreamID is the Redis stream entry ID. Populated by ReadSignals on read,
+	// used by AckSignals to delete processed entries. Not persisted in the
+	// stream payload itself.
+	StreamID string `json:"-"`
+}
+
+// SignalOption is a functional option for configuring signal delivery.
+type SignalOption func(*WorkflowSignal)
+
+// WithDedupeKey sets a dedup key on the signal to prevent duplicate delivery.
+func WithDedupeKey(key string) SignalOption {
+	return func(s *WorkflowSignal) {
+		s.DedupeKey = key
+	}
 }
 
 // BatchProgress is published as an event for progress tracking.

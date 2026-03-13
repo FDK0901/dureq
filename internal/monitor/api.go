@@ -159,6 +159,12 @@ func (a *API) registerRoutes() {
 	a.mux.HandleFunc("DELETE /api/nodes/{nodeID}/drain", a.undrainNode)
 	a.mux.HandleFunc("GET /api/nodes/{nodeID}/drain", a.getNodeDrainStatus)
 
+	// Repair / Inspect
+	a.mux.HandleFunc("POST /api/runs/{runID}/requeue", a.requeueRun)
+	a.mux.HandleFunc("GET /api/locks/{key}", a.getLock)
+	a.mux.HandleFunc("DELETE /api/locks/{key}", a.forceUnlock)
+	a.mux.HandleFunc("GET /api/concurrency/{key}", a.getConcurrencyInfo)
+
 	// WebSocket
 	a.mux.HandleFunc("GET /api/ws", HandleWebSocket(a.svc.Hub(), a.svc.Logger()))
 
@@ -1078,4 +1084,44 @@ func (a *API) getNodeDrainStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]any{"node_id": nodeID, "draining": draining})
+}
+
+// --- Repair / Inspect ---
+
+func (a *API) requeueRun(w http.ResponseWriter, r *http.Request) {
+	runID := r.PathValue("runID")
+	if err := a.svc.RequeueRun(r.Context(), runID); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "requeued", "run_id": runID})
+}
+
+func (a *API) getLock(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	info, err := a.svc.GetLockInfo(r.Context(), key)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, info)
+}
+
+func (a *API) forceUnlock(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if err := a.svc.ForceUnlock(r.Context(), key); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "unlocked", "key": key})
+}
+
+func (a *API) getConcurrencyInfo(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	info, err := a.svc.GetConcurrencyInfo(r.Context(), key)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, info)
 }

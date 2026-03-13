@@ -117,9 +117,12 @@ type RedisStore struct {
 	scriptCASJob        *rueidis.Lua
 	scriptCASUpdate     *rueidis.Lua
 	scriptCreateNX      *rueidis.Lua
-	scriptLeaderRefresh *rueidis.Lua
-	scriptMoveDelayed   *rueidis.Lua
-	scriptFlushGroup    *rueidis.Lua
+	scriptLeaderRefresh   *rueidis.Lua
+	scriptMoveDelayed     *rueidis.Lua
+	scriptFlushGroup           *rueidis.Lua
+	scriptClaimSideEffect      *rueidis.Lua
+	scriptAcquireConcSlot      *rueidis.Lua
+	scriptReleaseConcSlot      *rueidis.Lua
 }
 
 // NewRedisStore creates a new Redis store and registers tier configuration.
@@ -139,7 +142,10 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger gochainedlog
 		scriptCreateNX:      rueidis.NewLuaScript(luaCreateIfNotExists),
 		scriptLeaderRefresh: rueidis.NewLuaScript(luaLeaderRefresh),
 		scriptMoveDelayed:   rueidis.NewLuaScript(luaMoveDelayedToStream),
-		scriptFlushGroup:    rueidis.NewLuaScript(luaFlushGroup),
+		scriptFlushGroup:      rueidis.NewLuaScript(luaFlushGroup),
+		scriptClaimSideEffect: rueidis.NewLuaScript(luaClaimSideEffect),
+		scriptAcquireConcSlot:  rueidis.NewLuaScript(luaAcquireConcurrencySlot),
+		scriptReleaseConcSlot:  rueidis.NewLuaScript(luaReleaseConcurrencySlot),
 	}
 
 	// Register tiers in sorted set so workers can discover them.
@@ -268,6 +274,22 @@ func (s *RedisStore) UpdateJob(ctx context.Context, job *types.Job, expectedRev 
 	}
 
 	oldData, ver := parseSaveJobResult(result)
+
+	// Validate state transition (log invalid transitions for audit).
+	// Extract status via cheap string search to avoid full JSON unmarshal on hot path.
+	if oldData != "" {
+		if oldStatus := extractJSONStatus(oldData); oldStatus != "" {
+			from := types.JobStatus(oldStatus)
+			if from != job.Status && !types.ValidJobTransition(from, job.Status) {
+				s.logger.Warn().
+					String("job_id", job.ID).
+					String("from", string(from)).
+					String("to", string(job.Status)).
+					Msg("store: invalid job state transition")
+			}
+		}
+	}
+
 	s.updateJobIndexes(ctx, job, oldData)
 	s.updateJobAssociationIndexes(ctx, job)
 	s.mirrorJobPayload(ctx, job) // best-effort JSON mirror for JSONPath search
@@ -598,7 +620,7 @@ func (s *RedisStore) HasActiveRunForJob(ctx context.Context, jobID string) (bool
 // SaveOverlapBuffer stores a buffered dispatch timestamp for BUFFER_ONE policy.
 // Overwrites any previous buffered entry.
 func (s *RedisStore) SaveOverlapBuffer(ctx context.Context, jobID string, nextRunAt time.Time) error {
-	return s.rdb.Do(ctx, s.rdb.B().Set().Key(OverlapBufferedKey(s.prefix, jobID)).Value(strconv.FormatInt(nextRunAt.UnixNano(), 10)).Ex(24*time.Hour).Build()).Error()
+	return s.rdb.Do(ctx, s.rdb.B().Set().Key(OverlapBufferedKey(s.prefix, jobID)).Value(strconv.FormatInt(nextRunAt.UnixNano(), 10)).Ex(s.cfg.OverlapBufferTTL).Build()).Error()
 }
 
 // PopOverlapBuffer retrieves and deletes the buffered dispatch for BUFFER_ONE.
@@ -619,7 +641,7 @@ func (s *RedisStore) PushOverlapBufferAll(ctx context.Context, jobID string, nex
 	key := OverlapBufferListKey(s.prefix, jobID)
 	cmds := make(rueidis.Commands, 0, 2)
 	cmds = append(cmds, s.rdb.B().Rpush().Key(key).Element(strconv.FormatInt(nextRunAt.UnixNano(), 10)).Build())
-	cmds = append(cmds, s.rdb.B().Expire().Key(key).Seconds(int64((24 * time.Hour).Seconds())).Build())
+	cmds = append(cmds, s.rdb.B().Expire().Key(key).Seconds(int64(s.cfg.OverlapBufferTTL.Seconds())).Build())
 	results := s.rdb.DoMulti(ctx, cmds...)
 	for _, r := range results {
 		if err := r.Error(); err != nil {
@@ -775,6 +797,11 @@ func (s *RedisStore) SaveWorkflow(ctx context.Context, wf *types.WorkflowInstanc
 	}
 	cmds = append(cmds, s.rdb.B().Zadd().Key(WorkflowsByStatusKey(s.prefix, string(wf.Status))).ScoreMember().ScoreMember(score, wf.ID).Build())
 
+	// Deadline index: track workflows with deadlines for efficient timeout checks.
+	if wf.Deadline != nil {
+		cmds = append(cmds, s.rdb.B().Zadd().Key(WorkflowDeadlinesKey(s.prefix)).ScoreMember().ScoreMember(float64(wf.Deadline.Unix()), wf.ID).Build())
+	}
+
 	results := s.rdb.DoMulti(ctx, cmds...)
 	for _, r := range results {
 		if err := r.Error(); err != nil {
@@ -836,17 +863,113 @@ func (s *RedisStore) UpdateWorkflow(ctx context.Context, wf *types.WorkflowInsta
 		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(WorkflowsByStatusKey(s.prefix, oldStatus)).Member(wf.ID).Build())
 	}
 	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(WorkflowsByStatusKey(s.prefix, string(wf.Status))).ScoreMember().ScoreMember(score, wf.ID).Build())
+
+	// Remove from deadline index when terminal (no longer needs timeout checks).
+	if wf.Status.IsTerminal() {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(WorkflowDeadlinesKey(s.prefix)).Member(wf.ID).Build())
+	}
+
 	s.mirrorWorkflowPayloads(ctx, wf) // best-effort JSON mirror for JSONPath search
 	return ver, nil
 }
 
-// DeleteWorkflow removes a workflow instance and its indexes.
+// CompactWorkflowTasks moves completed tasks exceeding the threshold to the archive hash.
+// Only non-terminal + the most recent `keep` completed tasks remain in the main Tasks map.
+func (s *RedisStore) CompactWorkflowTasks(ctx context.Context, wf *types.WorkflowInstance, keep int) (int, error) {
+	if keep <= 0 {
+		keep = 50
+	}
+
+	// Collect completed tasks sorted by finish time.
+	type completedTask struct {
+		name       string
+		state      types.WorkflowTaskState
+		finishedAt time.Time
+	}
+	var completed []completedTask
+	for name, state := range wf.Tasks {
+		if state.Status == types.JobStatusCompleted && state.FinishedAt != nil {
+			completed = append(completed, completedTask{name: name, state: state, finishedAt: *state.FinishedAt})
+		}
+	}
+
+	if len(completed) <= keep {
+		return 0, nil
+	}
+
+	// Sort by finish time ascending (oldest first).
+	for i := 0; i < len(completed); i++ {
+		for j := i + 1; j < len(completed); j++ {
+			if completed[j].finishedAt.Before(completed[i].finishedAt) {
+				completed[i], completed[j] = completed[j], completed[i]
+			}
+		}
+	}
+
+	// Archive the oldest completed tasks beyond the keep threshold.
+	toArchive := completed[:len(completed)-keep]
+	archiveKey := WorkflowArchiveKey(s.prefix, wf.ID)
+
+	cmds := make(rueidis.Commands, 0, len(toArchive))
+	for _, t := range toArchive {
+		data, err := sonic.ConfigFastest.Marshal(t.state)
+		if err != nil {
+			continue
+		}
+		cmds = append(cmds, s.rdb.B().Hset().Key(archiveKey).FieldValue().FieldValue(t.name, string(data)).Build())
+		delete(wf.Tasks, t.name)
+	}
+
+	if len(cmds) > 0 {
+		for _, resp := range s.rdb.DoMulti(ctx, cmds...) {
+			if err := resp.Error(); err != nil {
+				return 0, fmt.Errorf("archive workflow tasks: %w", err)
+			}
+		}
+	}
+
+	wf.ArchivedTaskCount += len(toArchive)
+	return len(toArchive), nil
+}
+
+// GetArchivedTask retrieves a single archived task state from the archive hash.
+func (s *RedisStore) GetArchivedTask(ctx context.Context, wfID, taskName string) (*types.WorkflowTaskState, error) {
+	data, err := s.rdb.Do(ctx, s.rdb.B().Hget().Key(WorkflowArchiveKey(s.prefix, wfID)).Field(taskName).Build()).ToString()
+	if err != nil {
+		return nil, err
+	}
+	var state types.WorkflowTaskState
+	if err := sonic.ConfigFastest.Unmarshal([]byte(data), &state); err != nil {
+		return nil, err
+	}
+	return &state, nil
+}
+
+// TrimWorkflowEvents trims a workflow's event index to the most recent maxEntries.
+func (s *RedisStore) TrimWorkflowEvents(ctx context.Context, wfID string, maxEntries int64) error {
+	key := WorkflowEventsKey(s.prefix, wfID)
+	count, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(key).Build()).ToInt64()
+	if err != nil || count <= maxEntries {
+		return nil
+	}
+	// Remove oldest entries (lowest scores) beyond the limit.
+	removeCount := count - maxEntries
+	return s.rdb.Do(ctx, s.rdb.B().Zremrangebyrank().Key(key).Start(0).Stop(removeCount-1).Build()).Error()
+}
+
+// DeleteWorkflow removes a workflow instance, all indexes, and associated data
+// (signal stream, event index, task archive, JSON mirror).
 func (s *RedisStore) DeleteWorkflow(ctx context.Context, id string) error {
 	oldStatus := hashFieldFromJSON(ctx, s.rdb, WorkflowKey(s.prefix, id), "status")
 
-	cmds := make(rueidis.Commands, 0, 4)
+	cmds := make(rueidis.Commands, 0, 8)
 	cmds = append(cmds, s.rdb.B().Del().Key(WorkflowKey(s.prefix, id)).Build())
 	cmds = append(cmds, s.rdb.B().Zrem().Key(WorkflowsByCreatedKey(s.prefix)).Member(id).Build())
+	cmds = append(cmds, s.rdb.B().Zrem().Key(WorkflowDeadlinesKey(s.prefix)).Member(id).Build())
+	// Deep cleanup: signal stream, event index, task archive.
+	cmds = append(cmds, s.rdb.B().Del().Key(WorkflowSignalStreamKey(s.prefix, id)).Build())
+	cmds = append(cmds, s.rdb.B().Del().Key(WorkflowEventsKey(s.prefix, id)).Build())
+	cmds = append(cmds, s.rdb.B().Del().Key(WorkflowArchiveKey(s.prefix, id)).Build())
 	if oldStatus != "" {
 		cmds = append(cmds, s.rdb.B().Zrem().Key(WorkflowsByStatusKey(s.prefix, oldStatus)).Member(id).Build())
 	}
@@ -875,6 +998,32 @@ func (s *RedisStore) ListWorkflows(ctx context.Context) ([]*types.WorkflowInstan
 		return nil, nil
 	}
 	return s.hydrateWorkflows(ctx, ids)
+}
+
+// ListDueWorkflowDeadlines returns workflows whose deadlines have passed.
+// Uses the deadline sorted set for O(due) instead of O(all-running).
+func (s *RedisStore) ListDueWorkflowDeadlines(ctx context.Context, now time.Time) ([]*types.WorkflowInstance, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(WorkflowDeadlinesKey(s.prefix)).Min("0").Max(strconv.FormatFloat(float64(now.Unix()), 'f', 0, 64)).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list due workflow deadlines: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateWorkflows(ctx, ids)
+}
+
+// ListDueBatchDeadlines returns batches whose deadlines have passed.
+// Uses the deadline sorted set for O(due) instead of O(all-running).
+func (s *RedisStore) ListDueBatchDeadlines(ctx context.Context, now time.Time) ([]*types.BatchInstance, error) {
+	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(BatchDeadlinesKey(s.prefix)).Min("0").Max(strconv.FormatFloat(float64(now.Unix()), 'f', 0, 64)).Build()).AsStrSlice()
+	if err != nil {
+		return nil, fmt.Errorf("list due batch deadlines: %w", err)
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	return s.hydrateBatches(ctx, ids)
 }
 
 // ListWorkflowsByStatus returns workflow instances with the given status.
@@ -914,6 +1063,11 @@ func (s *RedisStore) SaveBatch(ctx context.Context, batch *types.BatchInstance) 
 		cmds = append(cmds, s.rdb.B().Zrem().Key(BatchesByStatusKey(s.prefix, oldStatus)).Member(batch.ID).Build())
 	}
 	cmds = append(cmds, s.rdb.B().Zadd().Key(BatchesByStatusKey(s.prefix, string(batch.Status))).ScoreMember().ScoreMember(score, batch.ID).Build())
+
+	// Deadline index: track batches with deadlines for efficient timeout checks.
+	if batch.Deadline != nil {
+		cmds = append(cmds, s.rdb.B().Zadd().Key(BatchDeadlinesKey(s.prefix)).ScoreMember().ScoreMember(float64(batch.Deadline.Unix()), batch.ID).Build())
+	}
 
 	results := s.rdb.DoMulti(ctx, cmds...)
 	for _, r := range results {
@@ -976,17 +1130,25 @@ func (s *RedisStore) UpdateBatch(ctx context.Context, batch *types.BatchInstance
 		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(BatchesByStatusKey(s.prefix, oldStatus)).Member(batch.ID).Build())
 	}
 	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(BatchesByStatusKey(s.prefix, string(batch.Status))).ScoreMember().ScoreMember(score, batch.ID).Build())
+
+	// Remove from deadline index when terminal (no longer needs timeout checks).
+	if batch.Status.IsTerminal() {
+		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(BatchDeadlinesKey(s.prefix)).Member(batch.ID).Build())
+	}
+
 	s.mirrorBatchPayloads(ctx, batch) // best-effort JSON mirror for JSONPath search
 	return ver, nil
 }
 
-// DeleteBatch removes a batch instance and its indexes.
+// DeleteBatch removes a batch instance, all indexes, and associated data
+// (batch item results, JSON mirror).
 func (s *RedisStore) DeleteBatch(ctx context.Context, batchID string) error {
 	oldStatus := hashFieldFromJSON(ctx, s.rdb, BatchKey(s.prefix, batchID), "status")
 
-	cmds := make(rueidis.Commands, 0, 4)
+	cmds := make(rueidis.Commands, 0, 6)
 	cmds = append(cmds, s.rdb.B().Del().Key(BatchKey(s.prefix, batchID)).Build())
 	cmds = append(cmds, s.rdb.B().Zrem().Key(BatchesByCreatedKey(s.prefix)).Member(batchID).Build())
+	cmds = append(cmds, s.rdb.B().Zrem().Key(BatchDeadlinesKey(s.prefix)).Member(batchID).Build())
 	if oldStatus != "" {
 		cmds = append(cmds, s.rdb.B().Zrem().Key(BatchesByStatusKey(s.prefix, oldStatus)).Member(batchID).Build())
 	}
@@ -997,9 +1159,21 @@ func (s *RedisStore) DeleteBatch(ctx context.Context, batchID string) error {
 			firstErr = err
 		}
 	}
+	// Deep cleanup: batch item results + JSON mirror (async, best-effort).
 	go func() {
-		bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// Delete individual batch result keys listed in the results set.
+		resultsSetKey := BatchResultsSetKey(s.prefix, batchID)
+		itemIDs, err := s.rdb.Do(bgCtx, s.rdb.B().Smembers().Key(resultsSetKey).Build()).AsStrSlice()
+		if err == nil && len(itemIDs) > 0 {
+			delCmds := make(rueidis.Commands, 0, len(itemIDs)+1)
+			for _, itemID := range itemIDs {
+				delCmds = append(delCmds, s.rdb.B().Del().Key(BatchResultKey(s.prefix, batchID, itemID)).Build())
+			}
+			delCmds = append(delCmds, s.rdb.B().Del().Key(resultsSetKey).Build())
+			s.rdb.DoMulti(bgCtx, delCmds...)
+		}
 		s.rdb.Do(bgCtx, s.rdb.B().JsonDel().Key(BatchPayloadKey(s.prefix, batchID)).Path("$").Build())
 	}()
 	return firstErr
@@ -1147,6 +1321,23 @@ func (s *RedisStore) SaveJobRun(ctx context.Context, run *types.JobRun) error {
 		}
 	}
 	return nil
+}
+
+// GetHistoryRun retrieves a run from the history store by run ID.
+func (s *RedisStore) GetHistoryRun(ctx context.Context, runID string) (*types.JobRun, uint64, error) {
+	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(HistoryRunKey(s.prefix, runID)).Build()).AsStrMap()
+	if err != nil {
+		return nil, 0, fmt.Errorf("get history run: %w", err)
+	}
+	if len(result) == 0 {
+		return nil, 0, types.ErrRunNotFound
+	}
+
+	var run types.JobRun
+	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &run); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal history run: %w", err)
+	}
+	return &run, parseVersion(result["_version"]), nil
 }
 
 // ============================================================
@@ -1563,6 +1754,13 @@ func WorkMessageFromStreamValues(values map[string]string) types.WorkMessage {
 	}
 	// Worker versioning.
 	wm.Version = values["version"]
+	// Concurrency keys (JSON-encoded slice).
+	if ck := values["concurrency_keys"]; ck != "" {
+		var keys []types.ConcurrencyKey
+		if sonic.ConfigFastest.Unmarshal([]byte(ck), &keys) == nil {
+			wm.ConcurrencyKeys = keys
+		}
+	}
 	return wm
 }
 
@@ -1766,7 +1964,21 @@ func matchJSONGetResult(r rueidis.RedisResult, expected string) bool {
 // --- Workflow Signal operations ---
 
 // SendSignal appends a signal to a workflow's signal stream.
+// If the signal has a DedupeKey, it prevents duplicate signals using SET NX.
 func (s *RedisStore) SendSignal(ctx context.Context, signal *types.WorkflowSignal) error {
+	// Dedup check: if DedupeKey is set, use SET NX to prevent duplicates.
+	// TTL = SignalDedupTTL (default 30d). Must exceed max workflow lifetime.
+	if signal.DedupeKey != "" {
+		dedupKey := SignalDedupKey(s.prefix, signal.WorkflowID, signal.DedupeKey)
+		err := s.rdb.Do(ctx, s.rdb.B().Set().Key(dedupKey).Value("1").Nx().Ex(s.cfg.SignalDedupTTL).Build()).Error()
+		if err != nil {
+			if rueidis.IsRedisNil(err) {
+				return types.ErrSignalDuplicate
+			}
+			return fmt.Errorf("signal dedup check: %w", err)
+		}
+	}
+
 	key := WorkflowSignalStreamKey(s.prefix, signal.WorkflowID)
 	data, err := sonic.ConfigFastest.Marshal(signal)
 	if err != nil {
@@ -1776,9 +1988,11 @@ func (s *RedisStore) SendSignal(ctx context.Context, signal *types.WorkflowSigna
 	return s.rdb.Do(ctx, cmd).Error()
 }
 
-// ConsumeSignals reads and acknowledges all pending signals for a workflow.
-// Returns the signals and removes them from the stream.
-func (s *RedisStore) ConsumeSignals(ctx context.Context, workflowID string) ([]types.WorkflowSignal, error) {
+// ReadSignals reads all pending signals for a workflow without deleting them.
+// Each returned signal has its StreamID populated so the caller can pass
+// processed signals to AckSignals after handling. This prevents signal loss
+// if the caller crashes between read and processing.
+func (s *RedisStore) ReadSignals(ctx context.Context, workflowID string) ([]types.WorkflowSignal, error) {
 	key := WorkflowSignalStreamKey(s.prefix, workflowID)
 	cmd := s.rdb.B().Xrange().Key(key).Start("-").End("+").Build()
 	entries, err := s.rdb.Do(ctx, cmd).AsXRange()
@@ -1790,7 +2004,6 @@ func (s *RedisStore) ConsumeSignals(ctx context.Context, workflowID string) ([]t
 	}
 
 	signals := make([]types.WorkflowSignal, 0, len(entries))
-	ids := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		data, ok := entry.FieldValues["data"]
 		if !ok {
@@ -1800,15 +2013,41 @@ func (s *RedisStore) ConsumeSignals(ctx context.Context, workflowID string) ([]t
 		if err := sonic.ConfigFastest.Unmarshal([]byte(data), &sig); err != nil {
 			continue
 		}
+		sig.StreamID = entry.ID
 		signals = append(signals, sig)
-		ids = append(ids, entry.ID)
 	}
 
-	// Delete consumed entries.
+	return signals, nil
+}
+
+// AckSignals deletes processed signal entries from the workflow signal stream.
+// Call this after successfully handling signals returned by ReadSignals.
+func (s *RedisStore) AckSignals(ctx context.Context, workflowID string, streamIDs []string) error {
+	if len(streamIDs) == 0 {
+		return nil
+	}
+	key := WorkflowSignalStreamKey(s.prefix, workflowID)
+	return s.rdb.Do(ctx, s.rdb.B().Xdel().Key(key).Id(streamIDs...).Build()).Error()
+}
+
+// ConsumeSignals reads and acknowledges all pending signals for a workflow.
+// Deprecated: Use ReadSignals + AckSignals for crash-safe signal processing.
+// This method is retained for backward compatibility but is lossy — if the
+// caller crashes after this call returns, the signals are permanently lost.
+func (s *RedisStore) ConsumeSignals(ctx context.Context, workflowID string) ([]types.WorkflowSignal, error) {
+	signals, err := s.ReadSignals(ctx, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(signals))
+	for _, sig := range signals {
+		if sig.StreamID != "" {
+			ids = append(ids, sig.StreamID)
+		}
+	}
 	if len(ids) > 0 {
-		s.rdb.Do(ctx, s.rdb.B().Xdel().Key(key).Id(ids...).Build())
+		s.rdb.Do(ctx, s.rdb.B().Xdel().Key(WorkflowSignalStreamKey(s.prefix, workflowID)).Id(ids...).Build())
 	}
-
 	return signals, nil
 }
 
@@ -2003,4 +2242,94 @@ func (s *RedisStore) PurgeJobData(ctx context.Context, jobID string) error {
 	s.rdb.Do(ctx, s.rdb.B().Del().Key(ResultKey(s.prefix, jobID)).Build())
 
 	return nil
+}
+
+// extractJSONStatus extracts the "status" field value from a JSON string
+// without full unmarshal. Returns empty string if not found.
+func extractJSONStatus(data string) string {
+	const key = `"status":"`
+	idx := strings.Index(data, key)
+	if idx < 0 {
+		return ""
+	}
+	start := idx + len(key)
+	end := strings.IndexByte(data[start:], '"')
+	if end < 0 {
+		return ""
+	}
+	return data[start : start+end]
+}
+
+// --- Side-effect steps ---
+
+// ClaimSideEffect atomically claims a side-effect step for the given run.
+// Returns (result, true) if the step was already completed (cached result),
+// or ("", false) if the step was newly claimed and the caller should execute.
+func (s *RedisStore) ClaimSideEffect(ctx context.Context, runID, stepKey string, ttlSeconds int) (string, bool, error) {
+	key := SideEffectKey(s.prefix, runID, stepKey)
+	result, err := s.scriptClaimSideEffect.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{strconv.Itoa(ttlSeconds)},
+	).ToString()
+	if err != nil {
+		return "", false, fmt.Errorf("claim side effect: %w", err)
+	}
+
+	switch {
+	case result == "claimed":
+		return "", false, nil
+	case result == "pending":
+		// Another caller has claimed but not yet completed. Treat as "already done"
+		// to avoid duplicate execution — caller should wait or retry.
+		return "", false, fmt.Errorf("side effect step %q is already being executed", stepKey)
+	case strings.HasPrefix(result, "done:"):
+		return result[5:], true, nil
+	default:
+		return "", false, fmt.Errorf("unexpected claim result: %s", result)
+	}
+}
+
+// CompleteSideEffect marks a side-effect step as done and stores the result.
+func (s *RedisStore) CompleteSideEffect(ctx context.Context, runID, stepKey string, result string) error {
+	key := SideEffectKey(s.prefix, runID, stepKey)
+	cmd := s.rdb.B().Hset().Key(key).FieldValue().FieldValue("status", "done").FieldValue("result", result).Build()
+	return s.rdb.Do(ctx, cmd).Error()
+}
+
+// ============================================================
+// Concurrency slot operations
+// ============================================================
+
+// AcquireConcurrencySlot tries to acquire a concurrency slot for the given run.
+// Returns true if the slot was acquired, false if at capacity.
+func (s *RedisStore) AcquireConcurrencySlot(ctx context.Context, concKey, runID string, maxConcurrency int) (bool, error) {
+	key := ConcurrencySlotKey(s.prefix, concKey)
+	now := strconv.FormatFloat(float64(time.Now().UnixMilli())/1000.0, 'f', 3, 64)
+	result, err := s.scriptAcquireConcSlot.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{runID, strconv.Itoa(maxConcurrency), now},
+	).ToInt64()
+	if err != nil {
+		return false, fmt.Errorf("acquire concurrency slot: %w", err)
+	}
+	return result == 1, nil
+}
+
+// ReleaseConcurrencySlot releases a concurrency slot held by the given run.
+func (s *RedisStore) ReleaseConcurrencySlot(ctx context.Context, concKey, runID string) error {
+	key := ConcurrencySlotKey(s.prefix, concKey)
+	_, err := s.scriptReleaseConcSlot.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{runID},
+	).ToInt64()
+	if err != nil {
+		return fmt.Errorf("release concurrency slot: %w", err)
+	}
+	return nil
+}
+
+// ConcurrencySlotCount returns the current number of active slots for a concurrency key.
+func (s *RedisStore) ConcurrencySlotCount(ctx context.Context, concKey string) (int64, error) {
+	key := ConcurrencySlotKey(s.prefix, concKey)
+	return s.rdb.Do(ctx, s.rdb.B().Zcard().Key(key).Build()).ToInt64()
 }

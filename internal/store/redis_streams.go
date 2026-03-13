@@ -74,6 +74,11 @@ func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *type
 			fv = fv.FieldValue("headers", string(hdr))
 		}
 	}
+	if len(wm.ConcurrencyKeys) > 0 {
+		if ck, err := sonic.ConfigFastest.Marshal(wm.ConcurrencyKeys); err == nil {
+			fv = fv.FieldValue("concurrency_keys", string(ck))
+		}
+	}
 
 	msgID, err := s.rdb.Do(ctx, fv.Build()).ToString()
 	if err != nil {
@@ -221,6 +226,13 @@ func (s *RedisStore) GetResult(ctx context.Context, jobID string) (*types.WorkRe
 	return &result, nil
 }
 
+// ExtendResultTTL extends the TTL of a stored result.
+// Used to extend result lifetime for workflow-associated jobs so results
+// survive for the workflow's entire execution duration.
+func (s *RedisStore) ExtendResultTTL(ctx context.Context, jobID string, ttl time.Duration) error {
+	return s.rdb.Do(ctx, s.rdb.B().Expire().Key(ResultKey(s.prefix, jobID)).Seconds(int64(ttl.Seconds())).Build()).Error()
+}
+
 // ============================================================
 // Batched completion pipeline
 // ============================================================
@@ -233,6 +245,10 @@ type CompletionBatch struct {
 	DailyStatField string // "processed" or "failed"
 	AckTierName    string // tier name for XACK (v1 only, empty for v2)
 	AckMessageID   string // stream message ID for XACK (v1 only)
+
+	// ResultTTLOverride, if > 0, overrides the default ResultTTL for this result.
+	// Used by workflow tasks to extend result lifetime to match the workflow deadline.
+	ResultTTLOverride time.Duration
 }
 
 // CompleteRun performs SaveRun + SaveJobRun + DeleteRun + IncrDailyStat +
@@ -294,8 +310,12 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 
 	// 6. Result hash + TTL (slot-targeted)
 	resultKey := ResultKey(s.prefix, batch.Result.JobID)
+	resultTTL := s.cfg.ResultTTL
+	if batch.ResultTTLOverride > 0 {
+		resultTTL = batch.ResultTTLOverride
+	}
 	cmds = append(cmds, s.rdb.B().Hset().Key(resultKey).FieldValue().FieldValue("data", string(resultData)).Build())
-	cmds = append(cmds, s.rdb.B().Expire().Key(resultKey).Seconds(int64(s.cfg.ResultTTL.Seconds())).Build())
+	cmds = append(cmds, s.rdb.B().Expire().Key(resultKey).Seconds(int64(resultTTL.Seconds())).Build())
 
 	// 7. AckMessage (v1 only — stream message acknowledgment)
 	if batch.AckTierName != "" && batch.AckMessageID != "" {
@@ -344,6 +364,11 @@ func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.
 	if len(wm.Metadata) > 0 {
 		if meta, err := sonic.ConfigFastest.Marshal(wm.Metadata); err == nil {
 			m["metadata"] = string(meta)
+		}
+	}
+	if len(wm.ConcurrencyKeys) > 0 {
+		if ck, err := sonic.ConfigFastest.Marshal(wm.ConcurrencyKeys); err == nil {
+			m["concurrency_keys"] = string(ck)
 		}
 	}
 	data, err := sonic.ConfigFastest.Marshal(m)

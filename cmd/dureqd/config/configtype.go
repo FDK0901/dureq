@@ -6,11 +6,13 @@ type Config struct {
 }
 
 type DureqdConfig struct {
-	NodeID      string `koanf:"nodeId"`
-	ApiAddress  string `koanf:"apiAddress"`
-	GrpcAddress string `koanf:"grpcAddress"`
-	Concurrency int    `koanf:"concurrency"`
-	Prefix      string `koanf:"prefix"`
+	NodeID      string   `koanf:"nodeId"`
+	ApiAddress  string   `koanf:"apiAddress"`
+	GrpcAddress string   `koanf:"grpcAddress"`
+	Concurrency int      `koanf:"concurrency"`
+	Prefix      string   `koanf:"prefix"`
+	Mode        string   `koanf:"mode"` // "full", "queue", "scheduler", "workflow", "monitor" or comma-separated combo
+	Handlers    []string `koanf:"handlers"` // enabled handler task types; empty = all
 }
 
 type RedisConfig struct {

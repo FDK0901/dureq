@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/FDK0901/dureq/internal/cache"
+	"github.com/FDK0901/dureq/internal/dynconfig"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
 	gochainedlog "github.com/FDK0901/go-chainedlog"
@@ -23,6 +24,7 @@ type Config struct {
 	Store        *store.RedisStore
 	Dispatcher   Dispatcher
 	TickInterval time.Duration
+	DynConfig    *dynconfig.Manager // Optional: runtime config overrides (tick interval).
 	Logger       gochainedlog.Logger
 
 	// OrphanCheckInterval controls how often orphan run detection runs.
@@ -36,6 +38,7 @@ type Scheduler struct {
 	cache      *cache.ScheduleCache
 	dispatcher Dispatcher
 	interval   time.Duration
+	dynCfg     *dynconfig.Manager
 	logger     gochainedlog.Logger
 
 	orphanInterval  time.Duration
@@ -63,6 +66,7 @@ func New(cfg Config) *Scheduler {
 		cache:          cache.NewScheduleCache(cfg.Store, cache.DefaultCacheConfig()),
 		dispatcher:     cfg.Dispatcher,
 		interval:       cfg.TickInterval,
+		dynCfg:         cfg.DynConfig,
 		orphanInterval: cfg.OrphanCheckInterval,
 		logger:         cfg.Logger,
 	}
@@ -104,7 +108,8 @@ func (s *Scheduler) Stop() {
 func (s *Scheduler) tickLoop(ctx context.Context) {
 	defer close(s.done)
 
-	ticker := time.NewTicker(s.interval)
+	currentInterval := s.interval
+	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
 	// Run one tick immediately on start.
@@ -116,6 +121,14 @@ func (s *Scheduler) tickLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			s.tick(ctx)
+			// Check if dynamic config changed the tick interval.
+			if s.dynCfg != nil {
+				if snap := s.dynCfg.Get(); snap.SchedulerTickInterval > 0 && snap.SchedulerTickInterval != currentInterval {
+					currentInterval = snap.SchedulerTickInterval
+					ticker.Reset(currentInterval)
+					s.logger.Info().String("interval", currentInterval.String()).Msg("scheduler: tick interval updated from dynamic config")
+				}
+			}
 		}
 	}
 }
@@ -537,6 +550,15 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 					Error:     &errMsg,
 					Timestamp: now,
 				})
+			}
+		}
+
+		// Release concurrency slots held by the orphaned run.
+		if len(job.ConcurrencyKeys) > 0 {
+			for _, ck := range job.ConcurrencyKeys {
+				if err := s.store.ReleaseConcurrencySlot(ctx, ck.Key, run.ID); err != nil {
+					s.logger.Warn().String("run_id", run.ID).String("conc_key", ck.Key).Err(err).Msg("scheduler: failed to release concurrency slot for orphaned run")
+				}
 			}
 		}
 

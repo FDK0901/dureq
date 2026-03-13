@@ -160,8 +160,8 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 		return &ApiError{Msg: "job not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
 
-	if !job.Status.IsTerminal() {
-		return &ApiError{Msg: "job is in non-terminal state: " + string(job.Status), StatusCode: http.StatusConflict}
+	if !job.Status.IsRetryable() {
+		return &ApiError{Msg: "cannot retry: job is " + string(job.Status) + " (only failed/dead/cancelled)", StatusCode: http.StatusConflict}
 	}
 
 	now := time.Now()
@@ -193,6 +193,14 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 }
 
 func (a *APIService) DeleteJob(ctx context.Context, jobID string) error {
+	// Guard: only delete terminal jobs to prevent orphaned in-flight work.
+	job, _, err := a.store.GetJob(ctx, jobID)
+	if err != nil {
+		return &ApiError{Msg: "job not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	if !job.Status.IsTerminal() {
+		return &ApiError{Msg: "cannot delete: job is " + string(job.Status) + " (cancel it first)", StatusCode: http.StatusConflict}
+	}
 	if err := a.store.DeleteJob(ctx, jobID); err != nil {
 		return err
 	}
@@ -397,7 +405,12 @@ func (a *APIService) GetWorkflowTaskResult(ctx context.Context, wfID, taskName s
 	}
 	state, ok := wf.Tasks[taskName]
 	if !ok {
-		return nil, &ApiError{Msg: "task not found: " + taskName, StatusCode: http.StatusNotFound}
+		// Task may have been compacted to archive — try archive lookup.
+		archived, archErr := a.store.GetArchivedTask(ctx, wfID, taskName)
+		if archErr != nil || archived == nil {
+			return nil, &ApiError{Msg: "task not found: " + taskName, StatusCode: http.StatusNotFound}
+		}
+		state = *archived
 	}
 	if state.JobID == "" {
 		return nil, &ApiError{Msg: "task has no job ID (not yet dispatched)", StatusCode: http.StatusNotFound}
@@ -470,8 +483,8 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 	if err != nil {
 		return &ApiError{Msg: "workflow not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
-	if !wf.Status.IsTerminal() {
-		return &ApiError{Msg: "cannot retry: workflow is " + string(wf.Status), StatusCode: http.StatusConflict}
+	if !wf.Status.IsRetryable() {
+		return &ApiError{Msg: "cannot retry: workflow is " + string(wf.Status) + " (only failed/cancelled)", StatusCode: http.StatusConflict}
 	}
 
 	now := time.Now()
@@ -606,8 +619,8 @@ func (a *APIService) RetryBatch(ctx context.Context, batchID string, retryFailed
 	if err != nil {
 		return &ApiError{Msg: "batch not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
-	if !batch.Status.IsTerminal() {
-		return &ApiError{Msg: "cannot retry: batch is " + string(batch.Status), StatusCode: http.StatusConflict}
+	if !batch.Status.IsRetryable() {
+		return &ApiError{Msg: "cannot retry: batch is " + string(batch.Status) + " (only failed/cancelled)", StatusCode: http.StatusConflict}
 	}
 
 	now := time.Now()
@@ -1014,7 +1027,7 @@ func (a *APIService) BulkRetryJobs(ctx context.Context, req BulkRequest) (*BulkR
 	now := time.Now()
 	for _, id := range ids {
 		job, rev, err := a.store.GetJob(ctx, id)
-		if err != nil || !job.Status.IsTerminal() {
+		if err != nil || !job.Status.IsRetryable() {
 			continue
 		}
 		job.Status = types.JobStatusPending
@@ -1107,6 +1120,10 @@ func (a *APIService) BulkCancelWorkflows(ctx context.Context, req BulkRequest) (
 						}
 					}
 				}
+				// Recursively cancel child workflows (matches single-cancel behavior).
+				if state.ChildWorkflowID != "" {
+					a.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+				}
 			}
 		}
 		if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err == nil {
@@ -1142,17 +1159,26 @@ func (a *APIService) BulkRetryWorkflows(ctx context.Context, req BulkRequest) (*
 		if err != nil {
 			continue
 		}
+		// Only retry failed/cancelled workflows — skip running/pending/completed
+		// to prevent resetting in-flight or successful work.
+		if !wf.Status.IsRetryable() {
+			continue
+		}
 		wf.Attempt++
 		wf.Status = types.WorkflowStatusRunning
 		wf.UpdatedAt = now
 		wf.CompletedAt = nil
+		// Only reset failed/dead/cancelled tasks — preserve completed work
+		// (matches single-retry behavior in RetryWorkflow).
 		for name, state := range wf.Tasks {
-			state.Status = types.JobStatusPending
-			state.JobID = ""
-			state.Error = nil
-			state.StartedAt = nil
-			state.FinishedAt = nil
-			wf.Tasks[name] = state
+			if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
+				state.Status = types.JobStatusPending
+				state.JobID = ""
+				state.Error = nil
+				state.StartedAt = nil
+				state.FinishedAt = nil
+				wf.Tasks[name] = state
+			}
 		}
 		if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err == nil {
 			a.dispatcher.PublishEvent(types.JobEvent{
@@ -1240,9 +1266,20 @@ func (a *APIService) BulkCancelBatches(ctx context.Context, req BulkRequest) (*B
 			}
 		}
 
-		// Signal cancel for onetime job if running.
-		if batch.OnetimeState != nil && !batch.OnetimeState.Status.IsTerminal() && batch.OnetimeState.JobID != "" {
-			a.signalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+		// Cancel onetime task if still running (matches single-cancel behavior).
+		if batch.OnetimeState != nil && !batch.OnetimeState.Status.IsTerminal() {
+			if batch.OnetimeState.JobID != "" {
+				if childJob, childRev, err := a.store.GetJob(ctx, batch.OnetimeState.JobID); err == nil {
+					if !childJob.Status.IsTerminal() {
+						childJob.Status = types.JobStatusCancelled
+						childJob.UpdatedAt = now
+						a.store.UpdateJob(ctx, childJob, childRev)
+					}
+				}
+				a.signalCancelActiveRuns(ctx, batch.OnetimeState.JobID)
+			}
+			batch.OnetimeState.Status = types.JobStatusCancelled
+			batch.OnetimeState.FinishedAt = &now
 		}
 
 		if _, err := a.store.UpdateBatch(ctx, batch, rev); err == nil {
@@ -1278,22 +1315,35 @@ func (a *APIService) BulkRetryBatches(ctx context.Context, req BulkRequest) (*Bu
 		if err != nil {
 			continue
 		}
+		// Only retry failed/cancelled batches — skip running/pending/completed
+		// to prevent resetting in-flight or successful work.
+		if !batch.Status.IsRetryable() {
+			continue
+		}
 		batch.Attempt++
 		batch.Status = types.WorkflowStatusRunning
 		batch.UpdatedAt = now
 		batch.CompletedAt = nil
+		// Only reset failed/dead/cancelled items — preserve completed work.
+		pendingCount := 0
+		completedCount := 0
+		for itemID, state := range batch.ItemStates {
+			if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
+				state.Status = types.JobStatusPending
+				state.JobID = ""
+				state.Error = nil
+				state.StartedAt = nil
+				state.FinishedAt = nil
+				batch.ItemStates[itemID] = state
+				pendingCount++
+			} else if state.Status == types.JobStatusCompleted {
+				completedCount++
+			}
+		}
 		batch.FailedItems = 0
 		batch.RunningItems = 0
-		batch.PendingItems = batch.TotalItems
-		batch.CompletedItems = 0
-		for itemID, state := range batch.ItemStates {
-			state.Status = types.JobStatusPending
-			state.JobID = ""
-			state.Error = nil
-			state.StartedAt = nil
-			state.FinishedAt = nil
-			batch.ItemStates[itemID] = state
-		}
+		batch.PendingItems = pendingCount
+		batch.CompletedItems = completedCount
 		batch.NextChunkIndex = 0
 		if _, err := a.store.UpdateBatch(ctx, batch, rev); err == nil {
 			a.dispatcher.PublishEvent(types.JobEvent{
@@ -1403,4 +1453,115 @@ func (a *APIService) SetNodeDrain(ctx context.Context, nodeID string, drain bool
 
 func (a *APIService) IsNodeDraining(ctx context.Context, nodeID string) (bool, error) {
 	return a.store.IsNodeDraining(ctx, nodeID)
+}
+
+// ===================== Repair / Inspect =====================
+
+// RequeueRun re-dispatches a failed or dead run's parent job.
+func (a *APIService) RequeueRun(ctx context.Context, runID string) error {
+	// Try active runs first, then history.
+	run, _, err := a.store.GetRun(ctx, runID)
+	if err != nil {
+		// Look up from history hash directly.
+		histRun, _, hErr := a.store.GetHistoryRun(ctx, runID)
+		if hErr != nil {
+			return &ApiError{Msg: "run not found", StatusCode: http.StatusNotFound}
+		}
+		run = histRun
+	}
+
+	if !run.Status.IsTerminal() {
+		return &ApiError{Msg: "run is still active (status: " + string(run.Status) + ")", StatusCode: http.StatusConflict}
+	}
+
+	job, rev, err := a.store.GetJob(ctx, run.JobID)
+	if err != nil {
+		return &ApiError{Msg: "parent job not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+
+	now := time.Now()
+	prevStatus := job.Status
+	job.Status = types.JobStatusPending
+	job.Attempt = 0
+	job.LastError = nil
+	job.UpdatedAt = now
+
+	newRev, err := a.store.UpdateJob(ctx, job, rev)
+	if err != nil {
+		return err
+	}
+
+	if err := a.dispatcher.Dispatch(ctx, job, 0); err != nil {
+		job.Status = prevStatus
+		job.UpdatedAt = time.Now()
+		a.store.UpdateJob(ctx, job, newRev)
+		return fmt.Errorf("dispatch failed: %w", err)
+	}
+
+	return nil
+}
+
+// LockInfo holds metadata about a distributed lock.
+type LockInfo struct {
+	Key    string `json:"key"`
+	Owner  string `json:"owner"`
+	TTL    int64  `json:"ttl_seconds"`
+	Exists bool   `json:"exists"`
+}
+
+// GetLockInfo inspects a distributed lock by key.
+func (a *APIService) GetLockInfo(ctx context.Context, key string) (*LockInfo, error) {
+	fullKey := store.LockKey(a.store.Prefix(), key)
+
+	owner, err := a.store.Client().Do(ctx, a.store.Client().B().Get().Key(fullKey).Build()).ToString()
+	if err != nil {
+		return &LockInfo{Key: key, Exists: false}, nil
+	}
+
+	ttl, _ := a.store.Client().Do(ctx, a.store.Client().B().Ttl().Key(fullKey).Build()).ToInt64()
+
+	return &LockInfo{
+		Key:    key,
+		Owner:  owner,
+		TTL:    ttl,
+		Exists: true,
+	}, nil
+}
+
+// ForceUnlock forcibly removes a distributed lock.
+func (a *APIService) ForceUnlock(ctx context.Context, key string) error {
+	fullKey := store.LockKey(a.store.Prefix(), key)
+	err := a.store.Client().Do(ctx, a.store.Client().B().Del().Key(fullKey).Build()).Error()
+	if err != nil {
+		return fmt.Errorf("force unlock: %w", err)
+	}
+	return nil
+}
+
+// ConcurrencyInfo holds metadata about a concurrency key's slot usage.
+type ConcurrencyInfo struct {
+	Key            string   `json:"key"`
+	ActiveSlots    int64    `json:"active_slots"`
+	ActiveRunIDs   []string `json:"active_run_ids"`
+}
+
+// GetConcurrencyInfo returns the current slot usage for a concurrency key.
+func (a *APIService) GetConcurrencyInfo(ctx context.Context, key string) (*ConcurrencyInfo, error) {
+	count, err := a.store.ConcurrencySlotCount(ctx, key)
+	if err != nil {
+		return nil, fmt.Errorf("get concurrency info: %w", err)
+	}
+
+	// Get all active run IDs holding slots.
+	fullKey := store.ConcurrencySlotKey(a.store.Prefix(), key)
+	members, err := a.store.Client().Do(ctx, a.store.Client().B().Zrange().Key(fullKey).Min("-inf").Max("+inf").Byscore().Build()).AsStrSlice()
+	if err != nil {
+		members = nil // non-fatal
+	}
+
+	return &ConcurrencyInfo{
+		Key:          key,
+		ActiveSlots:  count,
+		ActiveRunIDs: members,
+	}, nil
 }

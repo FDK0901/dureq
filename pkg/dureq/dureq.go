@@ -46,9 +46,19 @@ var (
 	WithGroupAggregation      = server.WithGroupAggregation
 	WithRetentionPeriod       = server.WithRetentionPeriod
 	WithShutdownTimeout       = server.WithShutdownTimeout
+	WithMode                  = server.WithMode
 )
 
 type Server = server.Server
+type Mode = server.Mode
+
+const (
+	ModeQueue    = server.ModeQueue
+	ModeScheduler = server.ModeScheduler
+	ModeWorkflow = server.ModeWorkflow
+	ModeMonitor  = server.ModeMonitor
+	ModeFull     = server.ModeFull
+)
 
 // NewServer creates a new dureq server node.
 func NewServer(opts ...server.Option) (*server.Server, error) {

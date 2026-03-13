@@ -270,6 +270,11 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 
 		// Check if all tasks are done.
 		if AllTasksCompleted(wf) {
+			// Check if the completing task requested continue-as-new.
+			if contInput := o.checkContinueAsNew(ctx, event.JobID); contInput != nil {
+				return o.continueWorkflowAsNew(ctx, wf, rev, contInput, &now)
+			}
+
 			wf.Status = types.WorkflowStatusCompleted
 			wf.CompletedAt = &now
 			wf.UpdatedAt = now
@@ -293,7 +298,15 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 				Timestamp: now,
 			})
 			o.logger.Info().String("workflow_id", wfID).Msg("workflow completed")
+			// Trim workflow events to last 1000 entries on completion.
+			o.store.TrimWorkflowEvents(ctx, wfID, 1000)
 			return nil
+		}
+
+		// Compact old completed tasks to archive if exceeding threshold.
+		const compactThreshold = 50
+		if archived, _ := o.store.CompactWorkflowTasks(ctx, wf, compactThreshold); archived > 0 {
+			o.logger.Debug().String("workflow_id", wfID).Int("archived", archived).Msg("orchestrator: compacted workflow tasks")
 		}
 
 		// Save the task completion first (without dispatching).
@@ -350,6 +363,7 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 				Timestamp: now,
 			})
 			o.logger.Info().String("workflow_id", wfID).Msg("workflow failed: no ready tasks and some tasks failed (stuck)")
+			o.store.TrimWorkflowEvents(ctx, wfID, 1000)
 		}
 		return nil
 	}
@@ -742,6 +756,7 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 		})
 
 		o.logger.Info().String("workflow_id", wfID).String("failed_task", taskName).Msg("workflow failed")
+		o.store.TrimWorkflowEvents(ctx, wfID, 1000)
 		return nil
 	}
 
@@ -1065,6 +1080,9 @@ func (o *Orchestrator) progressParentWorkflowTask(ctx context.Context, childWf *
 		}
 
 		if status == types.JobStatusCompleted {
+			// Decrement PendingDeps for downstream tasks that depend on this one.
+			DecrementPendingDeps(parentWf, taskName)
+
 			// Check if all parent tasks are done.
 			if AllTasksCompleted(parentWf) {
 				parentWf.Status = types.WorkflowStatusCompleted
@@ -1493,9 +1511,33 @@ func (o *Orchestrator) retryWorkflow(ctx context.Context, wf *types.WorkflowInst
 		wf.Deadline = &deadline
 	}
 
-	// Reset only failed/dead/cancelled tasks — keep completed tasks.
+	// Build task def lookup for ResultReusePolicy checks.
+	taskDefMap := make(map[string]*types.WorkflowTask, len(wf.Definition.Tasks))
+	for i := range wf.Definition.Tasks {
+		taskDefMap[wf.Definition.Tasks[i].Name] = &wf.Definition.Tasks[i]
+	}
+
+	// Reset tasks based on status and ResultReusePolicy.
+	// - Failed/dead/cancelled: always reset
+	// - Completed: reset if ResultReusePolicy is "never"
 	for name, state := range wf.Tasks {
-		if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
+		shouldReset := false
+
+		switch state.Status {
+		case types.JobStatusFailed, types.JobStatusDead, types.JobStatusCancelled:
+			shouldReset = true
+		case types.JobStatusCompleted:
+			if td, ok := taskDefMap[name]; ok {
+				switch td.ResultReuse {
+				case types.ResultReuseNever:
+					shouldReset = true
+				// "on_success" keeps completed tasks (they succeeded), so no reset.
+				// "always" (default) also keeps completed tasks.
+				}
+			}
+		}
+
+		if shouldReset {
 			state.Status = types.JobStatusPending
 			state.JobID = ""
 			state.Error = nil
@@ -1732,19 +1774,14 @@ func (o *Orchestrator) timeoutCheckLoop(ctx context.Context) {
 }
 
 func (o *Orchestrator) checkWorkflowTimeouts(ctx context.Context) {
-	workflows, err := o.store.ListWorkflowsByStatus(ctx, types.WorkflowStatusRunning)
+	now := time.Now()
+	// Query only workflows whose deadlines have passed (O(due) not O(all-running)).
+	workflows, err := o.store.ListDueWorkflowDeadlines(ctx, now)
 	if err != nil {
 		return
 	}
-
-	now := time.Now()
 	for _, wf := range workflows {
-		if wf.Deadline == nil {
-			continue
-		}
-		if now.After(*wf.Deadline) {
-			o.timeoutWorkflow(ctx, wf)
-		}
+		o.timeoutWorkflow(ctx, wf)
 	}
 }
 
@@ -1796,19 +1833,14 @@ func (o *Orchestrator) timeoutWorkflow(ctx context.Context, wf *types.WorkflowIn
 }
 
 func (o *Orchestrator) checkBatchTimeouts(ctx context.Context) {
-	batches, err := o.store.ListBatchesByStatus(ctx, types.WorkflowStatusRunning)
+	now := time.Now()
+	// Query only batches whose deadlines have passed (O(due) not O(all-running)).
+	batches, err := o.store.ListDueBatchDeadlines(ctx, now)
 	if err != nil {
 		return
 	}
-
-	now := time.Now()
 	for _, batch := range batches {
-		if batch.Deadline == nil {
-			continue
-		}
-		if now.After(*batch.Deadline) {
-			o.timeoutBatch(ctx, batch)
-		}
+		o.timeoutBatch(ctx, batch)
 	}
 }
 
@@ -2144,4 +2176,91 @@ func strPtr(s string) *string { return &s }
 
 func generateID() string {
 	return xid.New().String()
+}
+
+// checkContinueAsNew reads the result of the given job and returns
+// the ContinueAsNewInput if set, or nil otherwise.
+func (o *Orchestrator) checkContinueAsNew(ctx context.Context, jobID string) json.RawMessage {
+	result, err := o.store.GetResult(ctx, jobID)
+	if err != nil || result == nil {
+		return nil
+	}
+	if len(result.ContinueAsNewInput) == 0 {
+		return nil
+	}
+	return result.ContinueAsNewInput
+}
+
+// continueWorkflowAsNew marks the current workflow as "continued" and spawns
+// a new workflow instance with the same definition but fresh state and new input.
+func (o *Orchestrator) continueWorkflowAsNew(ctx context.Context, wf *types.WorkflowInstance, rev uint64, input json.RawMessage, now *time.Time) error {
+	newID := generateID()
+
+	// Mark current workflow as continued.
+	wf.Status = types.WorkflowStatusContinued
+	wf.CompletedAt = now
+	wf.UpdatedAt = *now
+	wf.ContinuedTo = &newID
+
+	if wf.Definition.Hooks != nil {
+		o.dispatchWorkflowHook(ctx, wf, "on_exit", wf.Definition.Hooks.OnExit, now)
+	}
+
+	if _, err := o.store.UpdateWorkflow(ctx, wf, rev); err != nil {
+		o.logger.Error().String("workflow_id", wf.ID).Err(err).Msg("orchestrator: failed to save continued workflow")
+		return err
+	}
+
+	// Build fresh task states.
+	tasks := make(map[string]types.WorkflowTaskState, len(wf.Definition.Tasks))
+	for _, t := range wf.Definition.Tasks {
+		tasks[t.Name] = types.WorkflowTaskState{
+			Status: types.JobStatusPending,
+		}
+	}
+
+	newWf := &types.WorkflowInstance{
+		ID:            newID,
+		WorkflowName:  wf.WorkflowName,
+		Definition:    wf.Definition,
+		Status:        types.WorkflowStatusRunning,
+		Tasks:         tasks,
+		Input:         input,
+		Attempt:       1,
+		ContinuedFrom: &wf.ID,
+		CreatedAt:     *now,
+		UpdatedAt:     *now,
+	}
+
+	InitPendingDeps(newWf)
+
+	if wf.Definition.ExecutionTimeout != nil {
+		deadline := now.Add(wf.Definition.ExecutionTimeout.Std())
+		newWf.Deadline = &deadline
+	}
+
+	newRev, err := o.store.SaveWorkflow(ctx, newWf)
+	if err != nil {
+		o.logger.Error().String("old_workflow_id", wf.ID).String("new_workflow_id", newID).Err(err).Msg("orchestrator: failed to save new workflow for continue-as-new")
+		return err
+	}
+
+	o.dispatcher.PublishEvent(types.JobEvent{
+		Type:      types.EventWorkflowStarted,
+		JobID:     newID,
+		Timestamp: *now,
+	})
+
+	// Dispatch root tasks.
+	roots := RootTasks(&newWf.Definition)
+	for _, taskName := range roots {
+		o.dispatchWorkflowTask(ctx, newWf, taskName, now)
+	}
+	o.store.UpdateWorkflow(ctx, newWf, newRev)
+
+	// Trim old workflow events.
+	o.store.TrimWorkflowEvents(ctx, wf.ID, 1000)
+
+	o.logger.Info().String("old_workflow_id", wf.ID).String("new_workflow_id", newID).Msg("workflow continued-as-new")
+	return nil
 }

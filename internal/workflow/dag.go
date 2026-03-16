@@ -475,6 +475,7 @@ func resetLoopBody(instance *types.WorkflowInstance, startTask, endTask string) 
 
 			// Reset intermediate task to pending.
 			if state, exists := instance.Tasks[succ]; exists && state.Status == types.JobStatusCompleted {
+				state.Iteration++
 				state.Status = types.JobStatusPending
 				state.JobID = ""
 				state.Error = nil

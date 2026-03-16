@@ -55,6 +55,7 @@ func redisDB() int {
 }
 
 // flushDB clears all keys before each test.
+// flushDB clears all keys before each test.
 func flushDB(t *testing.T) {
 	t.Helper()
 

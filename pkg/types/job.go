@@ -437,6 +437,12 @@ type WorkMessage struct {
 	// duplicate dispatches of the same schedule firing under leader failover.
 	FiringID string `json:"firing_id,omitempty"`
 
+	// OperationKey is a stable, deterministic identifier for the logical operation.
+	// Unlike RunID (which changes per retry), OperationKey is preserved across retries
+	// of the same logical work unit, enabling exactly-once completion tracking.
+	// Derivation: scheduled={firingID}, immediate={jobID}, workflow={wfID}:{taskName}.
+	OperationKey string `json:"operation_key,omitempty"`
+
 	// ConcurrencyKeys carried from the Job at dispatch time.
 	ConcurrencyKeys []ConcurrencyKey `json:"concurrency_keys,omitempty"`
 }
@@ -697,6 +703,10 @@ type WorkflowTaskState struct {
 	// Skipped indicates the task was skipped due to a failed precondition.
 	Skipped    bool   `json:"skipped,omitempty"`
 	SkipReason string `json:"skip_reason,omitempty"`
+	// Iteration tracks how many times this task has been dispatched across
+	// loop iterations. Incremented on each loop-back reset so the OperationKey
+	// includes the iteration count, preventing the ledger from blocking re-execution.
+	Iteration int `json:"iteration,omitempty"`
 }
 
 // --- Batch Processing Types ---

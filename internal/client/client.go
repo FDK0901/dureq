@@ -1128,9 +1128,20 @@ func (c *Client) dispatchJob(ctx context.Context, job *types.Job) error {
 		TaskType:        job.TaskType,
 		Payload:         job.Payload,
 		Attempt:         job.Attempt,
+		Headers:         job.Headers,
 		Priority:        priority,
 		DispatchedAt:    now,
 		ConcurrencyKeys: job.ConcurrencyKeys,
+	}
+
+	// Derive OperationKey (same logic as dispatcher.Dispatch).
+	if opk, ok := job.Headers["x-dureq-operation-key"]; ok {
+		msg.OperationKey = opk
+	} else if fid, ok := job.Headers["x-dureq-firing-id"]; ok {
+		msg.FiringID = fid
+		msg.OperationKey = fid
+	} else {
+		msg.OperationKey = job.ID
 	}
 
 	tierName := resolveTier(c.store.Config().Tiers, priority)

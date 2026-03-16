@@ -156,6 +156,10 @@ for _, msgJson in ipairs(msgs) do
       args[#args+1] = 'concurrency_keys'
       args[#args+1] = msg.concurrency_keys
     end
+    if msg.operation_key and msg.operation_key ~= '' then
+      args[#args+1] = 'operation_key'
+      args[#args+1] = msg.operation_key
+    end
     redis.call('XADD', stream, '*', unpack(args))
     redis.call('ZREM', delayed, msgJson)
     moved = moved + 1
@@ -268,6 +272,104 @@ return 1
 // Returns 1 if removed, 0 if not found.
 const luaReleaseConcurrencySlot = `
 return redis.call('ZREM', KEYS[1], ARGV[1])
+`
+
+// ============================================================
+// Exactly-once scripts (L2 operation ledger + atomic dispatch)
+// ============================================================
+
+// luaAtomicDispatch atomically checks dedup + XADD + sets dedup mark.
+// Both keys share {tierName} hash tag for Redis Cluster slot co-location.
+// KEYS[1] = dureq:{tierName}:work (stream)
+// KEYS[2] = dureq:{tierName}:dedup:{runID}
+// ARGV[1] = dedup TTL seconds
+// ARGV[2..N] = field-value pairs for XADD (even count)
+// Returns: stream message ID on success, "DUP" if already dispatched.
+const luaAtomicDispatch = `
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 'DUP'
+end
+local args = {}
+for i = 2, #ARGV do
+  args[#args + 1] = ARGV[i]
+end
+local msgID = redis.call('XADD', KEYS[1], '*', unpack(args))
+redis.call('SET', KEYS[2], msgID, 'EX', tonumber(ARGV[1]))
+return msgID
+`
+
+// luaCheckAndClaimOperation checks if an operation is already completed in the ledger.
+// If not completed and not yet claimed, marks it as "claimed".
+// Single-key on {opKey} — always cluster-safe.
+// KEYS[1] = dureq:opled:{opKey}
+// ARGV[1] = runID (for audit)
+// ARGV[2] = TTL seconds (safety expiry)
+// Returns:
+//
+//	"ok"            — not completed, proceed
+//	"DONE:{result}" — already completed, skip
+const luaCheckAndClaimOperation = `
+local status = redis.call('HGET', KEYS[1], 'status')
+if status == 'done' then
+  return 'DONE:' .. (redis.call('HGET', KEYS[1], 'result') or '')
+end
+if not status then
+  redis.call('HSET', KEYS[1], 'status', 'claimed', 'run_id', ARGV[1])
+  redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+end
+return 'ok'
+`
+
+// luaCompleteOperation atomically marks an operation as "done" in the ledger.
+// This is the single atomic commit point for exactly-once (L2).
+// Single-key on {opKey} — always cluster-safe.
+// KEYS[1] = dureq:opled:{opKey}
+// ARGV[1] = result JSON
+// ARGV[2] = TTL seconds
+// ARGV[3] = runID
+// Returns: 1 on success (new completion), 0 if already done (duplicate).
+const luaCompleteOperation = `
+local status = redis.call('HGET', KEYS[1], 'status')
+if status == 'done' then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'status', 'done', 'result', ARGV[1], 'run_id', ARGV[3])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+return 1
+`
+
+// luaClaimOperationEffect atomically claims an operation-scoped side-effect step.
+// Same pattern as luaClaimSideEffect but keyed by OperationKey for L3 exactly-once.
+// Single-key on {opKey} — always cluster-safe.
+// KEYS[1] = dureq:opfx:{opKey}:{stepKey}
+// ARGV[1] = TTL in seconds
+// Returns: "claimed", "pending", or "done:{result}"
+const luaClaimOperationEffect = `
+local key = KEYS[1]
+local status = redis.call('HGET', key, 'status')
+if status == 'done' then
+  return 'done:' .. (redis.call('HGET', key, 'result') or '')
+end
+if status == 'pending' then
+  return 'pending'
+end
+redis.call('HSET', key, 'status', 'pending')
+redis.call('EXPIRE', key, tonumber(ARGV[1]))
+return 'claimed'
+`
+
+// luaCompleteOperationEffect atomically marks an operation effect as done.
+// CAS guard: only transitions from non-done to done. Rejects stale completers.
+// KEYS[1] = dureq:opfx:{opKey}:{stepKey}
+// ARGV[1] = result string
+// Returns: 1 if completed, 0 if already done (stale completer rejected).
+const luaCompleteOperationEffect = `
+local status = redis.call('HGET', KEYS[1], 'status')
+if status == 'done' then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'status', 'done', 'result', ARGV[1])
+return 1
 `
 
 // Public accessors for Lua scripts needed by external packages (election, lock).

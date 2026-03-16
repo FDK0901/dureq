@@ -28,6 +28,7 @@ var (
 	ErrNoProgressReporter     = errors.New("dureq: no progress reporter in context (called outside handler?)")
 	ErrWorkflowTerminal       = errors.New("dureq: workflow is in terminal state, cannot receive signals")
 	ErrSignalDuplicate        = errors.New("dureq: duplicate signal (dedup key already exists)")
+	ErrEffectPending          = errors.New("dureq: operation effect is pending (claimed by another worker)")
 )
 
 // ErrorClassification categorizes errors for retry decisions.

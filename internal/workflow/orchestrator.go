@@ -220,14 +220,6 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 
 	now := time.Now()
 
-	// Publish task completion event (idempotent, safe to call once).
-	o.dispatcher.PublishEvent(types.JobEvent{
-		Type:       types.EventWorkflowTaskCompleted,
-		JobID:      event.JobID,
-		WorkflowID: wfID,
-		Timestamp:  now,
-	})
-
 	// Retry loop: re-read workflow on CAS conflict to pick up concurrent changes.
 	for attempt := 0; attempt < 5; attempt++ {
 		wf, rev, err := o.store.GetWorkflow(ctx, wfID)
@@ -246,6 +238,28 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 				taskDef = &wf.Definition.Tasks[i]
 				break
 			}
+		}
+
+		// Idempotency + identity guard: skip if task is already terminal (duplicate event)
+		// or if the event's JobID doesn't match the current incarnation (stale event
+		// from a previous loop iteration or retry).
+		if state, ok := wf.Tasks[taskName]; ok {
+			if state.Status.IsTerminal() {
+				return nil
+			}
+			if state.JobID != "" && state.JobID != event.JobID {
+				return nil
+			}
+		}
+
+		// Publish task completion event AFTER identity guard passes.
+		if attempt == 0 {
+			o.dispatcher.PublishEvent(types.JobEvent{
+				Type:       types.EventWorkflowTaskCompleted,
+				JobID:      event.JobID,
+				WorkflowID: wfID,
+				Timestamp:  now,
+			})
 		}
 
 		// Mark task as completed.
@@ -418,7 +432,9 @@ func (o *Orchestrator) processConditionResult(ctx context.Context, wf *types.Wor
 	// Loop-back handling: if the target task was already completed (cycle via condition),
 	// reset the entire loop body (target → ... → this condition) to pending.
 	if targetState, exists := wf.Tasks[targetName]; exists && targetState.Status == types.JobStatusCompleted {
-		// Reset the target task.
+		// Reset the target task. Increment Iteration so the OperationKey
+		// changes across loop iterations, preventing the ledger from blocking re-execution.
+		targetState.Iteration++
 		targetState.Status = types.JobStatusPending
 		targetState.JobID = ""
 		targetState.Error = nil
@@ -431,6 +447,7 @@ func (o *Orchestrator) processConditionResult(ctx context.Context, wf *types.Wor
 
 		// Reset the condition node itself so it re-evaluates after the loop body completes.
 		condState := wf.Tasks[taskName]
+		condState.Iteration++
 		condState.Status = types.JobStatusPending
 		condState.JobID = ""
 		condState.Error = nil
@@ -646,6 +663,16 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 			return nil
 		}
 
+		// Identity guard: skip if stale event from a previous incarnation.
+		if state, ok := wf.Tasks[taskName]; ok {
+			if state.Status.IsTerminal() {
+				return nil
+			}
+			if state.JobID != "" && state.JobID != event.JobID {
+				return nil
+			}
+		}
+
 		// Mark the failed task.
 		if state, ok := wf.Tasks[taskName]; ok {
 			state.Status = types.JobStatusFailed
@@ -826,6 +853,16 @@ func (o *Orchestrator) dispatchWorkflowTask(ctx context.Context, wf *types.Workf
 		CreatedAt:    *now,
 		UpdatedAt:    *now,
 	}
+
+	// Set OperationKey header for exactly-once tracking across workflow task retries.
+	if job.Headers == nil {
+		job.Headers = make(map[string]string)
+	}
+	iteration := 0
+	if state, ok := wf.Tasks[taskName]; ok {
+		iteration = state.Iteration
+	}
+	job.Headers["x-dureq-operation-key"] = fmt.Sprintf("%s:%s:%d", wf.ID, taskName, iteration)
 
 	if _, err := o.store.CreateJob(ctx, job); err != nil {
 		o.logger.Error().String("workflow_id", wf.ID).String("task", taskName).Err(err).Msg("workflow orchestrator: failed to create job for task")
@@ -1168,6 +1205,16 @@ func (o *Orchestrator) handleBatchJobCompleted(ctx context.Context, event types.
 
 	switch role {
 	case "onetime":
+		// Idempotency + identity guard: skip if onetime already terminal or stale event.
+		if batch.OnetimeState != nil {
+			if batch.OnetimeState.Status.IsTerminal() {
+				return nil
+			}
+			if batch.OnetimeState.JobID != "" && batch.OnetimeState.JobID != event.JobID {
+				return nil
+			}
+		}
+
 		// Onetime preprocessing completed — capture result and start item dispatch.
 		o.logger.Info().String("batch_id", batchID).Msg("batch onetime completed")
 
@@ -1203,6 +1250,21 @@ func (o *Orchestrator) handleBatchJobCompleted(ctx context.Context, event types.
 		}
 
 		o.logger.Debug().String("batch_id", batchID).String("item_id", itemID).Msg("batch item completed")
+
+		// Idempotency + identity guard: skip state mutation if item already completed
+		// or stale event, but still check if batch is done (in case previous event's
+		// finalizeBatch was missed due to CAS conflict).
+		if state, ok := batch.ItemStates[itemID]; ok {
+			if state.Status.IsTerminal() {
+				if o.isBatchDone(batch) {
+					o.finalizeBatch(ctx, batch, rev, &now)
+				}
+				return nil
+			}
+			if state.JobID != "" && state.JobID != event.JobID {
+				return nil
+			}
+		}
 
 		if state, ok := batch.ItemStates[itemID]; ok {
 			state.Status = types.JobStatusCompleted
@@ -1257,7 +1319,7 @@ func (o *Orchestrator) updateBatchItemRetrying(ctx context.Context, job *types.J
 		return
 	}
 	itemID := *job.BatchItem
-	if state, ok := batch.ItemStates[itemID]; ok && state.Status == types.JobStatusRunning {
+	if state, ok := batch.ItemStates[itemID]; ok && state.Status == types.JobStatusRunning && state.JobID == job.ID {
 		state.Status = types.JobStatusRetrying
 		batch.ItemStates[itemID] = state
 		batch.UpdatedAt = time.Now()
@@ -1276,7 +1338,7 @@ func (o *Orchestrator) updateWorkflowTaskRetrying(ctx context.Context, job *type
 		return
 	}
 	taskName := *job.WorkflowTask
-	if state, ok := wf.Tasks[taskName]; ok && state.Status == types.JobStatusRunning {
+	if state, ok := wf.Tasks[taskName]; ok && state.Status == types.JobStatusRunning && state.JobID == job.ID {
 		state.Status = types.JobStatusRetrying
 		wf.Tasks[taskName] = state
 		wf.UpdatedAt = time.Now()
@@ -1308,6 +1370,15 @@ func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.Job
 
 	switch role {
 	case "onetime":
+		// Identity guard: skip if stale event from a previous onetime incarnation.
+		if batch.OnetimeState != nil {
+			if batch.OnetimeState.Status.IsTerminal() {
+				return nil
+			}
+			if batch.OnetimeState.JobID != "" && batch.OnetimeState.JobID != event.JobID {
+				return nil
+			}
+		}
 		// Onetime failure → entire batch fails.
 		o.logger.Warn().String("batch_id", batchID).Msg("batch onetime failed — failing batch")
 
@@ -1340,6 +1411,19 @@ func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.Job
 		}
 
 		o.logger.Warn().String("batch_id", batchID).String("item_id", itemID).Msg("batch item failed")
+
+		// Identity guard: skip state mutation if stale/duplicate, but re-check isBatchDone.
+		if state, ok := batch.ItemStates[itemID]; ok {
+			if state.Status.IsTerminal() {
+				if o.isBatchDone(batch) {
+					o.finalizeBatch(ctx, batch, rev, &now)
+				}
+				return nil
+			}
+			if state.JobID != "" && state.JobID != event.JobID {
+				return nil
+			}
+		}
 
 		if state, ok := batch.ItemStates[itemID]; ok {
 			state.Status = types.JobStatusFailed
@@ -1427,6 +1511,7 @@ func (o *Orchestrator) dispatchBatchChunk(ctx context.Context, batch *types.Batc
 			BatchItem:   &item.ID,
 			BatchRole:   strPtr("item"),
 			RetryPolicy: batch.Definition.ItemRetryPolicy,
+			Headers:     map[string]string{"x-dureq-operation-key": fmt.Sprintf("%s:item:%s", batch.ID, item.ID)},
 			CreatedAt:   *now,
 			UpdatedAt:   *now,
 		}
@@ -1907,6 +1992,7 @@ func (o *Orchestrator) dispatchBatchOnetime(ctx context.Context, batch *types.Ba
 		Priority:  batch.Definition.DefaultPriority,
 		BatchID:   &batch.ID,
 		BatchRole: strPtr("onetime"),
+		Headers:   map[string]string{"x-dureq-operation-key": fmt.Sprintf("%s:onetime", batch.ID)},
 		CreatedAt: *now,
 		UpdatedAt: *now,
 	}
@@ -2065,6 +2151,17 @@ func (o *Orchestrator) handleHookCompleted(ctx context.Context, wfID, hookName, 
 	if err != nil {
 		return
 	}
+	// Idempotency + identity guard.
+	if wf.HookStates != nil {
+		if state, ok := wf.HookStates[hookName]; ok {
+			if state.Status.IsTerminal() {
+				return
+			}
+			if state.JobID != "" && state.JobID != jobID {
+				return
+			}
+		}
+	}
 	now := time.Now()
 	if wf.HookStates != nil {
 		if state, ok := wf.HookStates[hookName]; ok {
@@ -2089,6 +2186,17 @@ func (o *Orchestrator) handleHookFailed(ctx context.Context, wfID, hookName, job
 	wf, rev, err := o.store.GetWorkflow(ctx, wfID)
 	if err != nil {
 		return
+	}
+	// Identity guard: skip if stale event from a previous hook incarnation.
+	if wf.HookStates != nil {
+		if state, ok := wf.HookStates[hookName]; ok {
+			if state.Status.IsTerminal() {
+				return
+			}
+			if state.JobID != "" && state.JobID != jobID {
+				return
+			}
+		}
 	}
 	now := time.Now()
 	if wf.HookStates != nil {
@@ -2127,6 +2235,7 @@ func (o *Orchestrator) dispatchWorkflowHook(ctx context.Context, wf *types.Workf
 		Priority:     wf.Definition.DefaultPriority,
 		WorkflowID:   &wf.ID,
 		WorkflowTask: &taskName,
+		Headers:      map[string]string{"x-dureq-operation-key": fmt.Sprintf("%s:hook:%s", wf.ID, hookName)},
 		CreatedAt:    *now,
 		UpdatedAt:    *now,
 	}

@@ -74,7 +74,7 @@ func FailTx(ctx context.Context, tx *sql.Tx, err error) error {
 // The step name distinguishes different checkpoints within the same run.
 // On retry, the handler can call IsCheckpointed to skip already-completed steps.
 func CheckpointTx(ctx context.Context, tx *sql.Tx, step string, data []byte) error {
-	runID := types.GetRunID(ctx)
+	runID := dedupKey(ctx)
 	jobID := types.GetJobID(ctx)
 	if runID == "" {
 		return fmt.Errorf("dureq: run_id not found in context")
@@ -88,10 +88,10 @@ func CheckpointTx(ctx context.Context, tx *sql.Tx, step string, data []byte) err
 	return err
 }
 
-// IsCompleted checks whether the current run has already been completed.
-// Use this at the start of a handler to skip re-execution entirely.
+// IsCompleted checks whether the current operation has already been completed.
+// Uses OperationKey if available, falling back to RunID for backward compatibility.
 func IsCompleted(ctx context.Context, db *sql.DB) (bool, error) {
-	runID := types.GetRunID(ctx)
+	runID := dedupKey(ctx)
 	if runID == "" {
 		return false, fmt.Errorf("dureq: run_id not found in context")
 	}
@@ -106,7 +106,7 @@ func IsCompleted(ctx context.Context, db *sql.DB) (bool, error) {
 
 // IsCheckpointed checks whether a specific checkpoint step has been recorded.
 func IsCheckpointed(ctx context.Context, db *sql.DB, step string) (bool, []byte, error) {
-	runID := types.GetRunID(ctx)
+	runID := dedupKey(ctx)
 	if runID == "" {
 		return false, nil, fmt.Errorf("dureq: run_id not found in context")
 	}
@@ -125,8 +125,17 @@ func IsCheckpointed(ctx context.Context, db *sql.DB, step string) (bool, []byte,
 	return true, data, nil
 }
 
+// dedupKey returns the best available idempotency key from the context.
+// Prefers OperationKey (stable across retries) over RunID (per-attempt).
+func dedupKey(ctx context.Context) string {
+	if opKey := types.GetOperationKey(ctx); opKey != "" {
+		return opKey
+	}
+	return types.GetRunID(ctx)
+}
+
 func completeTx(ctx context.Context, tx *sql.Tx, step string, data []byte) error {
-	runID := types.GetRunID(ctx)
+	runID := dedupKey(ctx)
 	jobID := types.GetJobID(ctx)
 	if runID == "" {
 		return fmt.Errorf("dureq: run_id not found in context")

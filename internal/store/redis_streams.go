@@ -43,65 +43,71 @@ func (s *RedisStore) EnsureStreams(ctx context.Context) error {
 }
 
 // DispatchWork adds a work message to the tier-specific Redis Stream.
+// Uses an atomic Lua script (dedup check + XADD + dedup mark) so that
+// crash between dedup and XADD can no longer silently lose a message.
 func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *types.WorkMessage) (string, error) {
-	streamKey := WorkStreamKey(s.prefix, tierName)
-
-	// FiringID dedup: prevents duplicate dispatch of the same schedule firing
-	// under leader failover (deterministic key = "{jobID}:{firingTime.UnixMilli()}").
+	// FiringID dedup: best-effort pre-check on a separate slot.
+	// Not the authoritative gate — the atomic script below is.
 	if wm.FiringID != "" {
 		firingKey := FiringDedupKey(s.prefix, wm.FiringID)
-		err := s.rdb.Do(ctx, s.rdb.B().Set().Key(firingKey).Value(wm.RunID).Nx().Ex(1 * time.Hour).Build()).Error()
+		err := s.rdb.Do(ctx, s.rdb.B().Set().Key(firingKey).Value(wm.RunID).Nx().Ex(1*time.Hour).Build()).Error()
 		if err != nil {
 			if rueidis.IsRedisNil(err) {
-				// Same firing already dispatched — idempotent skip.
 				return "", nil
 			}
 			return "", fmt.Errorf("firing dedup check: %w", err)
 		}
 	}
 
-	// Use run ID as dedup key (prevents double-dispatch).
-	dedupKey := DedupKey(s.prefix, wm.RunID)
-	err := s.rdb.Do(ctx, s.rdb.B().Set().Key(dedupKey).Value("1").Nx().Ex(s.cfg.DedupTTL).Build()).Error()
-	if err != nil {
-		if rueidis.IsRedisNil(err) {
-			// Already dispatched — idempotent success.
-			return "", nil
-		}
-		return "", fmt.Errorf("dedup check: %w", err)
+	// Build XADD field-value pairs as flat string slice for the Lua script.
+	args := []string{
+		strconv.Itoa(int(s.cfg.DedupTTL.Seconds())), // ARGV[1] = dedup TTL
+		"run_id", wm.RunID,
+		"job_id", wm.JobID,
+		"task_type", string(wm.TaskType),
+		"payload", string(wm.Payload),
+		"attempt", strconv.Itoa(wm.Attempt),
+		"deadline", wm.Deadline.Format(time.RFC3339Nano),
+		"priority", strconv.Itoa(int(wm.Priority)),
+		"dispatched_at", wm.DispatchedAt.Format(time.RFC3339Nano),
+		"tier", tierName,
+		"version", wm.Version,
 	}
-
-	fv := s.rdb.B().Xadd().Key(streamKey).Id("*").FieldValue().
-		FieldValue("run_id", wm.RunID).
-		FieldValue("job_id", wm.JobID).
-		FieldValue("task_type", string(wm.TaskType)).
-		FieldValue("payload", string(wm.Payload)).
-		FieldValue("attempt", strconv.Itoa(wm.Attempt)).
-		FieldValue("deadline", wm.Deadline.Format(time.RFC3339Nano)).
-		FieldValue("priority", strconv.Itoa(int(wm.Priority))).
-		FieldValue("dispatched_at", wm.DispatchedAt.Format(time.RFC3339Nano)).
-		FieldValue("tier", tierName).
-		FieldValue("version", wm.Version)
-
 	if wm.FiringID != "" {
-		fv = fv.FieldValue("firing_id", wm.FiringID)
+		args = append(args, "firing_id", wm.FiringID)
+	}
+	if wm.OperationKey != "" {
+		args = append(args, "operation_key", wm.OperationKey)
 	}
 	if len(wm.Headers) > 0 {
 		if hdr, err := sonic.ConfigFastest.Marshal(wm.Headers); err == nil {
-			fv = fv.FieldValue("headers", string(hdr))
+			args = append(args, "headers", string(hdr))
 		}
 	}
 	if len(wm.ConcurrencyKeys) > 0 {
 		if ck, err := sonic.ConfigFastest.Marshal(wm.ConcurrencyKeys); err == nil {
-			fv = fv.FieldValue("concurrency_keys", string(ck))
+			args = append(args, "concurrency_keys", string(ck))
 		}
 	}
 
-	msgID, err := s.rdb.Do(ctx, fv.Build()).ToString()
+	// Atomic Lua: EXISTS dedup → XADD → SET dedup. Both keys share {tierName} slot.
+	streamKey := WorkStreamKey(s.prefix, tierName)
+	dedupKey := StreamDedupKey(s.prefix, tierName, wm.RunID)
+
+	msgID, err := s.scriptAtomicDispatch.Exec(ctx, s.rdb,
+		[]string{streamKey, dedupKey},
+		args,
+	).ToString()
 	if err != nil {
-		// Rollback dedup key on failure.
-		s.rdb.Do(ctx, s.rdb.B().Del().Key(dedupKey).Build())
-		return "", fmt.Errorf("XADD work: %w", err)
+		return "", fmt.Errorf("atomic dispatch: %w", err)
+	}
+	if msgID == "DUP" {
+		return "", nil // already dispatched — idempotent success
+	}
+
+	// Optional durability: wait for replication after critical dispatch write.
+	if durErr := s.waitDurability(ctx); durErr != nil {
+		s.logger.Warn().Err(durErr).Msg("durability wait failed after dispatch")
 	}
 
 	// Fire-and-forget push notification to wake blocked workers immediately.
@@ -266,13 +272,51 @@ type CompletionBatch struct {
 	// ResultTTLOverride, if > 0, overrides the default ResultTTL for this result.
 	// Used by workflow tasks to extend result lifetime to match the workflow deadline.
 	ResultTTLOverride time.Duration
+
+	// OperationKey is the stable operation identifier for exactly-once ledger commit.
+	// If set, CompleteRun performs a two-phase commit: Lua ledger mark (atomic commit
+	// point) followed by the DoMulti bookkeeping pipeline. Empty = skip ledger (backward compat).
+	OperationKey string
 }
 
-// CompleteRun performs SaveRun + SaveJobRun + DeleteRun + IncrDailyStat +
-// PublishEvent + PublishResult + AckMessage.
+// CompleteRun performs a two-phase completion:
+//
+//  1. Phase 1 (atomic): If OperationKey is set, mark the operation as "done" in the
+//     ledger via Lua script. This is the single atomic commit point for exactly-once (L2).
+//     If the ledger returns 0 (duplicate), only XACK is performed and bookkeeping is skipped.
+//  2. Phase 2 (pipeline): SaveRun + SaveJobRun + DeleteRun + IncrDailyStat +
+//     PublishEvent + PublishResult + AckMessage via DoMulti.
+//
 // Slot-targeted commands are pipelined via DoMulti; PUBLISH (no-slot)
 // commands are sent separately for Redis Cluster compatibility.
 func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) error {
+	resultData, err := sonic.ConfigFastest.Marshal(batch.Result)
+	if err != nil {
+		return fmt.Errorf("marshal result: %w", err)
+	}
+
+	// Phase 1: Operation ledger commit (exactly-once gate).
+	// The ledger CAS is the atomic commit point. Phase 2 always runs for
+	// idempotent ops (result, history, cleanup, XACK). Non-idempotent ops
+	// (stats increment, event stream append) only run on first completion.
+	firstCompletion := true
+	if batch.OperationKey != "" {
+		isNew, err := s.CompleteOperation(ctx, batch.OperationKey, batch.Run.ID, string(resultData))
+		if err != nil {
+			return fmt.Errorf("operation ledger commit: %w", err)
+		}
+		firstCompletion = isNew
+		if isNew {
+			if durErr := s.waitDurability(ctx); durErr != nil {
+				s.logger.Warn().Err(durErr).Msg("durability wait failed after ledger commit")
+			}
+		}
+		// isNew=false → replay: run idempotent Phase 2 ops only (result, history, cleanup, XACK).
+	}
+
+	// Phase 2: Bookkeeping pipeline.
+	// Idempotent ops (HSET, ZADD, SREM, DEL, XACK) always run.
+	// Non-idempotent ops (HINCRBY stats, XADD events) only run on firstCompletion.
 	runData, err := sonic.ConfigFastest.Marshal(batch.Run)
 	if err != nil {
 		return fmt.Errorf("marshal run: %w", err)
@@ -280,10 +324,6 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 	eventData, err := sonic.ConfigFastest.Marshal(batch.Event)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
-	}
-	resultData, err := sonic.ConfigFastest.Marshal(batch.Result)
-	if err != nil {
-		return fmt.Errorf("marshal result: %w", err)
 	}
 
 	cmds := make(rueidis.Commands, 0, 24)
@@ -308,22 +348,28 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 	cmds = append(cmds, s.rdb.B().Zrem().Key(RunsByJobKey(s.prefix, batch.Run.JobID)).Member(batch.Run.ID).Build())
 	cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveByJobKey(s.prefix, batch.Run.JobID)).Member(batch.Run.ID).Build())
 
-	// 4. IncrDailyStat
-	date := time.Now().Format("2006-01-02")
-	statsKey := DailyStatsKey(s.prefix, date)
-	cmds = append(cmds, s.rdb.B().Hincrby().Key(statsKey).Field(batch.DailyStatField).Increment(1).Build())
-	cmds = append(cmds, s.rdb.B().Expire().Key(statsKey).Seconds(int64((91 * 24 * time.Hour).Seconds())).Build())
+	// 4. IncrDailyStat — non-idempotent, skip on replay to avoid double-count.
+	if firstCompletion {
+		date := time.Now().Format("2006-01-02")
+		statsKey := DailyStatsKey(s.prefix, date)
+		cmds = append(cmds, s.rdb.B().Hincrby().Key(statsKey).Field(batch.DailyStatField).Increment(1).Build())
+		cmds = append(cmds, s.rdb.B().Expire().Key(statsKey).Seconds(int64((91 * 24 * time.Hour).Seconds())).Build())
+	}
 
-	// 5. Event stream (slot-targeted)
-	cmds = append(cmds, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
-		Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.EventStreamMaxLen, 10)).
-		Id("*").FieldValue().
-		FieldValue("type", string(batch.Event.Type)).
-		FieldValue("job_id", batch.Event.JobID).
-		FieldValue("run_id", batch.Event.RunID).
-		FieldValue("node_id", batch.Event.NodeID).
-		FieldValue("data", string(eventData)).
-		Build())
+	// 5. Event stream — only on first completion to avoid duplicate events.
+	// Crash recovery (different worker via XAUTOCLAIM) is handled by
+	// RepairCompletedOperation which has its own XADD.
+	if firstCompletion {
+		cmds = append(cmds, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
+			Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.EventStreamMaxLen, 10)).
+			Id("*").FieldValue().
+			FieldValue("type", string(batch.Event.Type)).
+			FieldValue("job_id", batch.Event.JobID).
+			FieldValue("run_id", batch.Event.RunID).
+			FieldValue("node_id", batch.Event.NodeID).
+			FieldValue("data", string(eventData)).
+			Build())
+	}
 
 	// 6. Result hash + TTL (slot-targeted)
 	resultKey := ResultKey(s.prefix, batch.Result.JobID)
@@ -345,14 +391,55 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 		}
 	}
 
-	// Pub/Sub notifications (no-slot) — sent separately for cluster compatibility.
-	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(eventData)).Build())
-	if batch.Event.BatchProgress != nil {
-		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, batch.Event.BatchProgress.BatchID)).Message(string(eventData)).Build())
+	// Pub/Sub notifications (no-slot) — only on first completion.
+	// Crash recovery notifications are handled by RepairCompletedOperation.
+	if firstCompletion {
+		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(eventData)).Build())
+		if batch.Event.BatchProgress != nil {
+			s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, batch.Event.BatchProgress.BatchID)).Message(string(eventData)).Build())
+		}
+		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, batch.Result.JobID)).Message(string(resultData)).Build())
 	}
-	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, batch.Result.JobID)).Message(string(resultData)).Build())
 
 	return nil
+}
+
+// RepairCompletedOperation stores the result from the operation ledger, ACKs the
+// stream message, and publishes a result notification. Called by a worker that
+// picks up a message via XAUTOCLAIM after the original worker crashed between
+// ledger commit and Phase 2 completion. All ops are idempotent.
+func (s *RedisStore) RepairCompletedOperation(ctx context.Context, jobID, tierName, msgID, resultJSON string) {
+	resultKey := ResultKey(s.prefix, jobID)
+	cmds := make(rueidis.Commands, 0, 3)
+	cmds = append(cmds, s.rdb.B().Hset().Key(resultKey).FieldValue().FieldValue("data", resultJSON).Build())
+	cmds = append(cmds, s.rdb.B().Expire().Key(resultKey).Seconds(int64(s.cfg.ResultTTL.Seconds())).Build())
+	if tierName != "" && msgID != "" {
+		cmds = append(cmds, s.rdb.B().Xack().Key(WorkStreamKey(s.prefix, tierName)).Group(ConsumerGroup).Id(msgID).Build())
+	}
+	for _, resp := range s.rdb.DoMulti(ctx, cmds...) {
+		if err := resp.Error(); err != nil {
+			s.logger.Warn().Err(err).String("job_id", jobID).Msg("repair: pipeline error")
+		}
+	}
+	// Publish completion event to the durable events stream so the orchestrator
+	// can progress workflow/batch state. The data field MUST be a serialized
+	// JobEvent (not WorkResult), because the orchestrator unmarshals it as JobEvent.
+	repairEvent := types.JobEvent{
+		Type:      types.EventJobCompleted,
+		JobID:     jobID,
+		Timestamp: time.Now(),
+	}
+	eventData, _ := sonic.ConfigFastest.Marshal(repairEvent)
+	s.rdb.Do(ctx, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
+		Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.EventStreamMaxLen, 10)).
+		Id("*").FieldValue().
+		FieldValue("type", string(types.EventJobCompleted)).
+		FieldValue("job_id", jobID).
+		FieldValue("data", string(eventData)).
+		Build())
+	// Pub/Sub for real-time listeners (WebSocket, result waiters).
+	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(eventData)).Build())
+	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, jobID)).Message(resultJSON).Build())
 }
 
 // ============================================================
@@ -372,6 +459,9 @@ func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.
 		"dispatched_at": wm.DispatchedAt.Format(time.RFC3339Nano),
 		"tier":          tierName,
 		"version":       wm.Version,
+	}
+	if wm.OperationKey != "" {
+		m["operation_key"] = wm.OperationKey
 	}
 	if len(wm.Headers) > 0 {
 		if hdr, err := sonic.ConfigFastest.Marshal(wm.Headers); err == nil {
@@ -432,6 +522,9 @@ func (s *RedisStore) ReenqueueWork(ctx context.Context, tierName string, wm *typ
 		FieldValue("redeliveries", strconv.Itoa(redeliveries)).
 		FieldValue("version", wm.Version)
 
+	if wm.OperationKey != "" {
+		fv = fv.FieldValue("operation_key", wm.OperationKey)
+	}
 	if len(wm.Headers) > 0 {
 		if hdr, err := sonic.ConfigFastest.Marshal(wm.Headers); err == nil {
 			fv = fv.FieldValue("headers", string(hdr))

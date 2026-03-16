@@ -112,11 +112,14 @@ Client (Go)
 - **Overlap Policies** — Control concurrent runs for recurring jobs (allow all, skip, buffer one, buffer all, replace)
 - **Catchup / Backfill** — Recover missed executions within a configurable window
 - **Schedule Jitter** — Random offset on scheduled execution times to prevent thundering herd
-- **Duplicate-Suppressed Execution** — Prevents concurrent handler starts for the same RunID. This is not exactly-once outcome semantics; external side effects still require idempotency, sideeffect helpers, or transactional completion ([details](docs/guarantees.md))
+- **Operation Ledger (L2 Exactly-Once)** — Stable OperationKey per logical operation + Redis CAS ledger ensures each operation completes at most once internally. Crash recovery via `RepairCompletedOperation`. External side effects require idempotency keys, `sideeffect.Step`, or transactional completion ([details](docs/guarantees.md))
+- **Atomic Dispatch** — Lua script performs dedup check + XADD + dedup mark in a single atomic operation; eliminates crash window between dedup and stream write
+- **Transactional Completion** — `pkg/integration/postgres` adapter commits business write + dureq completion marker in the same SQL transaction for exactly-once business outcomes
+- **Durable Cancellation** — Persisted cancel flag (`SET EX 24h`) + Pub/Sub fast path + 10s polling fallback; survives Pub/Sub disconnections
 - **Unique Keys** — Deduplication via unique keys with lookup and manual deletion
 - **Worker Versioning** — BuildID-style safe deployments; version-mismatched work is re-enqueued for matching workers
 - **ScheduleToStart Timeout** — Fail jobs that wait too long in the queue before starting
-- **Workflow Signals** — Send asynchronous external data to running workflows. Delivery semantics depend on the API used; see [guarantees](docs/guarantees.md) and [signals](docs/signals.md) docs
+- **Workflow Signals** — Send asynchronous external data to running workflows. `ReadSignals` + `AckSignals` provides at-least-once delivery; see [guarantees](docs/guarantees.md) and [signals](docs/signals.md) docs
 
 ### Operations
 - **Leader Election** — Automatic failover with configurable TTL and epoch-based fencing tokens
@@ -136,16 +139,19 @@ Client (Go)
 
 ### Execution Guarantees
 
-dureq provides **at-least-once delivery with duplicate-suppressed handler start**.
+dureq provides **at-least-once delivery with L2 exactly-once internal completion** via an operation ledger.
 
-| Aspect | Guarantee | Details |
-|--------|-----------|---------|
+| Aspect | Guarantee | Mechanism |
+|--------|-----------|-----------|
 | Enqueue | At-most-once per UniqueKey | `SET NX` dedup guard |
-| Dispatch | At-least-once per RunID | Dedup key prevents re-add to stream |
-| Handler start | Duplicate-suppressed | Per-run lock prevents concurrent execution |
-| Completion | Pipelined (not atomic) | Partial failure recovered by orphan detection |
-| Cancellation | Best-effort | Pub/Sub (lost if worker offline) |
-| Workflow signals | At-most-once | Durable Redis Stream; XDEL after read (crash between read and consumer processing loses signal) |
+| Dispatch | At-most-once per RunID | Atomic Lua script (dedup + XADD + mark) in single Redis slot |
+| Schedule firing | At-most-once per FiringID | `SET NX EX 1h` pre-check + deterministic firing identity |
+| Handler start | Duplicate-suppressed | Operation ledger claim + per-run lock |
+| Internal completion | Exactly-once per OperationKey | Two-phase: ledger CAS commit (Phase 1) + idempotent pipeline (Phase 2) |
+| Business outcome | Exactly-once (opt-in) | `pkg/integration/postgres.CompleteTx` — same SQL TX as business write |
+| Cancellation | Durable | Persisted flag (`SET EX 24h`) + Pub/Sub + 10s polling |
+| Workflow signals | At-least-once | `ReadSignals` + `AckSignals`; deprecated `ConsumeSignals` provides at-most-once |
+| Durability | Opt-in | `WAIT` / `WAITAOF` after critical writes (configurable) |
 
 For full details including failure scenarios, see [docs/guarantees.md](docs/guarantees.md) and [docs/faq.md](docs/faq.md).
 
@@ -369,10 +375,12 @@ Inside a handler, access job metadata via context:
 
 ```go
 func handler(ctx context.Context, payload json.RawMessage) error {
-    jobID    := types.GetJobID(ctx)
-    attempt  := types.GetAttempt(ctx)
-    taskType := types.GetTaskType(ctx)
-    headers  := types.GetHeaders(ctx)
+    jobID        := types.GetJobID(ctx)
+    runID        := types.GetRunID(ctx)
+    operationKey := types.GetOperationKey(ctx)
+    attempt      := types.GetAttempt(ctx)
+    taskType     := types.GetTaskType(ctx)
+    headers      := types.GetHeaders(ctx)
 
     types.ReportProgress(ctx, json.RawMessage(`{"percent": 50}`))
 
@@ -583,6 +591,9 @@ dureq/
 |   +-- lifecycle/           # Graceful shutdown coordination
 +-- pkg/
 |   +-- types/               # Public domain types (Job, Schedule, Workflow, Batch)
+|   +-- sideeffect/          # At-most-once side effect helpers (Step, ExternalCall)
+|   +-- integration/
+|       +-- postgres/        # Transactional completion adapter (CompleteTx, CheckpointTx)
 +-- examples/                # Runnable demos
 +-- tests/
 |   +-- integration/         # Integration tests (requires Redis)
@@ -610,6 +621,8 @@ dureq/
 | `heartbeat_progress/`       | In-flight progress reporting                                 |
 | `overlap_policy/`           | Overlap policy demonstration (including REPLACE)             |
 | `retention/`                | Archival and retention management                            |
+| `condition_loop/`           | Workflow condition nodes with loop-back (while-loop pattern) |
+| `pg_completion/`            | Transactional completion with PostgreSQL (exactly-once outcome) |
 
 ```bash
 cd examples/workflow_with_mux

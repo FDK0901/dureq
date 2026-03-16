@@ -49,6 +49,19 @@ type RedisStoreConfig struct {
 	// Must exceed the longest workflow lifetime. Default: 30d.
 	SignalDedupTTL time.Duration
 
+	// OperationLedgerTTL is the TTL for exactly-once operation ledger entries.
+	// Must exceed the longest possible retry chain duration. Default: 24h.
+	OperationLedgerTTL time.Duration
+
+	// DurabilityLevel controls write acknowledgment after critical exactly-once operations.
+	//   "none"    — default, current behavior (no WAIT)
+	//   "replica" — WAIT 1 replica after ledger commit
+	//   "aof"     — WAITAOF 1 1 after ledger commit (Redis 7.2+)
+	DurabilityLevel string
+
+	// DurabilityTimeout is the maximum time to wait for replication/AOF ack. Default: 500ms.
+	DurabilityTimeout time.Duration
+
 	// Tiers is the list of user-defined priority tiers. Default: [normal].
 	Tiers []TierConfig
 }
@@ -108,6 +121,12 @@ func (c *RedisStoreConfig) defaults() {
 	}
 	if c.SignalDedupTTL == 0 {
 		c.SignalDedupTTL = 30 * 24 * time.Hour // 30 days
+	}
+	if c.OperationLedgerTTL == 0 {
+		c.OperationLedgerTTL = 24 * time.Hour
+	}
+	if c.DurabilityTimeout == 0 {
+		c.DurabilityTimeout = 500 * time.Millisecond
 	}
 	if len(c.Tiers) == 0 {
 		c.Tiers = []TierConfig{

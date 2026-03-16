@@ -396,7 +396,8 @@ func parseStreamMessage(entry rueidis.XRangeEntry, tierName string) *streamMessa
 }
 
 // runHeartbeat periodically updates the run's LastHeartbeatAt field while the job executes.
-func (w *Worker) runHeartbeat(ctx context.Context, run *types.JobRun, mu *sync.Mutex) {
+// Also refreshes the operation ledger TTL to prevent expiry during long-running jobs.
+func (w *Worker) runHeartbeat(ctx context.Context, run *types.JobRun, mu *sync.Mutex, operationKey string) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
@@ -411,6 +412,10 @@ func (w *Worker) runHeartbeat(ctx context.Context, run *types.JobRun, mu *sync.M
 			snapshot := *run
 			mu.Unlock()
 			w.store.SaveRun(w.ctx, &snapshot)
+			// Refresh operation ledger TTL to prevent expiry during long-running jobs.
+			if operationKey != "" {
+				w.store.RefreshOperationLedger(w.ctx, operationKey)
+			}
 		}
 	}
 }
@@ -512,6 +517,40 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		return
 	}
 
+	// --- Operation ledger check (exactly-once L2) ---
+	// If this operation was already completed by a previous attempt,
+	// skip execution entirely and just ACK the message.
+	if work.OperationKey != "" {
+		ledgerResult, err := w.store.CheckAndClaimOperation(w.ctx, work.OperationKey, work.RunID)
+		if err != nil {
+			w.logger.Warn().String("op_key", work.OperationKey).Err(err).Msg("worker: operation ledger check failed, proceeding without L2 guard")
+		} else if strings.HasPrefix(ledgerResult, "DONE:") {
+			w.logger.Info().String("op_key", work.OperationKey).String("run_id", work.RunID).Msg("worker: operation already completed, running repair + ACK")
+			// Repair: ensure result is stored, message is ACK'd, and result notification
+			// is published — even if the original worker crashed after ledger commit.
+			resultJSON := ledgerResult[5:]
+			w.store.RepairCompletedOperation(w.ctx, work.JobID, sm.TierName, sm.StreamMsgID, resultJSON)
+			// Best-effort job status repair (idempotent via CAS).
+			go func() {
+				job, rev, getErr := w.store.GetJob(w.ctx, work.JobID)
+				if getErr != nil || job.Status.IsTerminal() {
+					return
+				}
+				now := time.Now()
+				_, _, schedErr := w.store.GetSchedule(w.ctx, work.JobID)
+				if schedErr == nil {
+					job.Status = types.JobStatusScheduled
+				} else {
+					job.Status = types.JobStatusCompleted
+					job.CompletedAt = &now
+				}
+				job.UpdatedAt = now
+				w.store.UpdateJob(w.ctx, job, rev)
+			}()
+			return
+		}
+	}
+
 	// --- Per-run lock (exactly-once guard) ---
 	// Prevents duplicate execution when XAUTOCLAIM reclaims a message
 	// while the original worker's handler is still running.
@@ -607,7 +646,7 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	hbWg.Add(1)
 	go func() {
 		defer hbWg.Done()
-		w.runHeartbeat(hbCtx, run, &runMu)
+		w.runHeartbeat(hbCtx, run, &runMu, work.OperationKey)
 	}()
 
 	// Publish started event.
@@ -676,9 +715,11 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	execCtx = types.WithAttempt(execCtx, work.Attempt)
 	execCtx = types.WithTaskType(execCtx, work.TaskType)
 	execCtx = types.WithPriority(execCtx, work.Priority)
+	execCtx = types.WithOperationKey(execCtx, work.OperationKey)
 	execCtx = types.WithNodeID(execCtx, w.nodeID)
 	execCtx = types.WithSideEffectStore(execCtx, w.store)
 	execCtx = types.WithSideEffectTTL(execCtx, int(w.store.Config().SideEffectTTL.Seconds()))
+	execCtx = types.WithOperationEffectStore(execCtx, w.store)
 	if work.Headers != nil {
 		execCtx = types.WithHeaders(execCtx, work.Headers)
 	}
@@ -921,6 +962,7 @@ func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessag
 		DailyStatField: "processed",
 		AckTierName:    sm.TierName,
 		AckMessageID:   sm.StreamMsgID,
+		OperationKey:   work.OperationKey,
 	}
 
 	syncRetrySave(w.syncer, func() error { return w.store.CompleteRun(w.ctx, batch) }, fmt.Sprintf("complete run %s (continue-as-new)", run.ID))
@@ -977,6 +1019,7 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 		DailyStatField: "processed",
 		AckTierName:    sm.TierName,
 		AckMessageID:   sm.StreamMsgID,
+		OperationKey:   work.OperationKey,
 	}
 
 	syncRetrySave(w.syncer, func() error { return w.store.CompleteRun(w.ctx, batch) }, fmt.Sprintf("complete run %s", run.ID))

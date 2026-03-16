@@ -123,6 +123,13 @@ type RedisStore struct {
 	scriptClaimSideEffect *rueidis.Lua
 	scriptAcquireConcSlot *rueidis.Lua
 	scriptReleaseConcSlot *rueidis.Lua
+
+	// Exactly-once scripts (L2 operation ledger + atomic dispatch)
+	scriptAtomicDispatch  *rueidis.Lua
+	scriptClaimOperation  *rueidis.Lua
+	scriptCompleteOp      *rueidis.Lua
+	scriptClaimOpEffect    *rueidis.Lua
+	scriptCompleteOpEffect *rueidis.Lua
 }
 
 // NewRedisStore creates a new Redis store and registers tier configuration.
@@ -146,6 +153,12 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger chainedlog.L
 		scriptClaimSideEffect: rueidis.NewLuaScript(luaClaimSideEffect),
 		scriptAcquireConcSlot: rueidis.NewLuaScript(luaAcquireConcurrencySlot),
 		scriptReleaseConcSlot: rueidis.NewLuaScript(luaReleaseConcurrencySlot),
+
+		scriptAtomicDispatch: rueidis.NewLuaScript(luaAtomicDispatch),
+		scriptClaimOperation: rueidis.NewLuaScript(luaCheckAndClaimOperation),
+		scriptCompleteOp:     rueidis.NewLuaScript(luaCompleteOperation),
+		scriptClaimOpEffect:    rueidis.NewLuaScript(luaClaimOperationEffect),
+		scriptCompleteOpEffect: rueidis.NewLuaScript(luaCompleteOperationEffect),
 	}
 
 	// Register tiers in sorted set so workers can discover them.
@@ -1789,6 +1802,7 @@ func WorkMessageFromStreamValues(values map[string]string) types.WorkMessage {
 	// Worker versioning.
 	wm.Version = values["version"]
 	wm.FiringID = values["firing_id"]
+	wm.OperationKey = values["operation_key"]
 	// Concurrency keys (JSON-encoded slice).
 	if ck := values["concurrency_keys"]; ck != "" {
 		var keys []types.ConcurrencyKey
@@ -2410,4 +2424,133 @@ func (s *RedisStore) ReleaseConcurrencySlot(ctx context.Context, concKey, runID 
 func (s *RedisStore) ConcurrencySlotCount(ctx context.Context, concKey string) (int64, error) {
 	key := ConcurrencySlotKey(s.prefix, concKey)
 	return s.rdb.Do(ctx, s.rdb.B().Zcard().Key(key).Build()).ToInt64()
+}
+
+// ============================================================
+// Durability layer (opt-in WAIT/WAITAOF)
+// ============================================================
+
+// waitDurability waits for replication acknowledgment after critical writes.
+// Returns nil if DurabilityLevel is empty or "none" (default).
+// Returns an error if the requested durability level was not achieved (e.g.
+// 0 replicas acked within timeout). Callers should log and continue.
+func (s *RedisStore) waitDurability(ctx context.Context) error {
+	ms := int64(s.cfg.DurabilityTimeout.Milliseconds())
+	switch s.cfg.DurabilityLevel {
+	case "replica":
+		count, err := s.rdb.Do(ctx, s.rdb.B().Wait().Numreplicas(1).Timeout(ms).Build()).ToInt64()
+		if err != nil {
+			return fmt.Errorf("WAIT: %w", err)
+		}
+		if count < 1 {
+			return fmt.Errorf("WAIT: only %d replicas acked (wanted 1)", count)
+		}
+	case "aof":
+		arr, err := s.rdb.Do(ctx, s.rdb.B().Waitaof().Numlocal(1).Numreplicas(1).Timeout(ms).Build()).ToArray()
+		if err != nil {
+			return fmt.Errorf("WAITAOF: %w", err)
+		}
+		if len(arr) >= 2 {
+			local, _ := arr[0].ToInt64()
+			replicas, _ := arr[1].ToInt64()
+			if local < 1 || replicas < 1 {
+				return fmt.Errorf("WAITAOF: local=%d replicas=%d (wanted 1,1)", local, replicas)
+			}
+		}
+	}
+	return nil
+}
+
+// ============================================================
+// Exactly-once operation ledger (L2)
+// ============================================================
+
+// CheckAndClaimOperation checks the operation ledger. If the operation was already
+// completed, returns "DONE:{result}". Otherwise marks it as "claimed" and returns "ok".
+// Empty opKey is a no-op (backward compatible with pre-OperationKey messages).
+func (s *RedisStore) CheckAndClaimOperation(ctx context.Context, opKey, runID string) (string, error) {
+	if opKey == "" {
+		return "ok", nil
+	}
+	key := OperationLedgerKey(s.prefix, opKey)
+	ttl := strconv.Itoa(int(s.cfg.OperationLedgerTTL.Seconds()))
+	result, err := s.scriptClaimOperation.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{runID, ttl},
+	).ToString()
+	if err != nil {
+		return "", fmt.Errorf("check operation ledger: %w", err)
+	}
+	return result, nil
+}
+
+// CompleteOperation atomically marks an operation as "done" in the ledger.
+// Returns true if this is a new completion, false if already completed (duplicate).
+// Empty opKey is a no-op that returns true (backward compatible).
+func (s *RedisStore) CompleteOperation(ctx context.Context, opKey, runID, resultJSON string) (bool, error) {
+	if opKey == "" {
+		return true, nil
+	}
+	key := OperationLedgerKey(s.prefix, opKey)
+	ttl := strconv.Itoa(int(s.cfg.OperationLedgerTTL.Seconds()))
+	result, err := s.scriptCompleteOp.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{resultJSON, ttl, runID},
+	).ToInt64()
+	if err != nil {
+		return false, fmt.Errorf("complete operation: %w", err)
+	}
+	return result == 1, nil
+}
+
+// ============================================================
+// Operation-scoped effect tracking (L3)
+// ============================================================
+
+// ClaimOperationEffect atomically claims an operation-scoped side-effect step.
+// Returns:
+//   - (result, true, nil)             — already done, cached result returned
+//   - ("", false, nil)                — newly claimed, caller should execute
+//   - ("", false, ErrEffectPending)   — claimed by another worker, caller should wait/skip
+func (s *RedisStore) ClaimOperationEffect(ctx context.Context, opKey, stepKey string, ttlSeconds int) (string, bool, error) {
+	key := OperationEffectKey(s.prefix, opKey, stepKey)
+	result, err := s.scriptClaimOpEffect.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{strconv.Itoa(ttlSeconds)},
+	).ToString()
+	if err != nil {
+		return "", false, fmt.Errorf("claim operation effect: %w", err)
+	}
+	if len(result) > 5 && result[:5] == "done:" {
+		return result[5:], true, nil
+	}
+	if result == "pending" {
+		return "", false, types.ErrEffectPending
+	}
+	return "", false, nil // "claimed" — caller should execute
+}
+
+// CompleteOperationEffect atomically marks an operation-scoped side-effect step as done.
+// Uses CAS: only transitions from non-done to done. Returns false if already done
+// (stale completer rejected).
+func (s *RedisStore) CompleteOperationEffect(ctx context.Context, opKey, stepKey string, result string) (bool, error) {
+	key := OperationEffectKey(s.prefix, opKey, stepKey)
+	res, err := s.scriptCompleteOpEffect.Exec(ctx, s.rdb,
+		[]string{key},
+		[]string{result},
+	).ToInt64()
+	if err != nil {
+		return false, fmt.Errorf("complete operation effect: %w", err)
+	}
+	return res == 1, nil
+}
+
+// RefreshOperationLedger extends the TTL of the operation ledger key.
+// Called during heartbeat to prevent ledger expiry during long-running jobs.
+func (s *RedisStore) RefreshOperationLedger(ctx context.Context, opKey string) {
+	if opKey == "" {
+		return
+	}
+	key := OperationLedgerKey(s.prefix, opKey)
+	s.rdb.Do(ctx, s.rdb.B().Expire().Key(key).Seconds(int64(s.cfg.OperationLedgerTTL.Seconds())).Build())
 }

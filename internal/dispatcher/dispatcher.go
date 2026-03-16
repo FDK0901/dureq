@@ -65,6 +65,15 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) 
 	if fid, ok := job.Headers["x-dureq-firing-id"]; ok {
 		msg.FiringID = fid
 	}
+	// Derive OperationKey: FiringID for scheduled, JobID for immediate.
+	// Workflow orchestrator overrides via x-dureq-operation-key header.
+	if opk, ok := job.Headers["x-dureq-operation-key"]; ok {
+		msg.OperationKey = opk
+	} else if msg.FiringID != "" {
+		msg.OperationKey = msg.FiringID
+	} else {
+		msg.OperationKey = job.ID
+	}
 	// Tag with handler version for version-aware routing.
 	if d.handlerVersions != nil {
 		if v, ok := d.handlerVersions[job.TaskType]; ok {

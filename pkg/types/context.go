@@ -21,6 +21,8 @@ const (
 	ctxKeyProgressReporter
 	ctxKeySideEffectStore
 	ctxKeySideEffectTTL
+	ctxKeyOperationKey
+	ctxKeyOperationEffectStore
 )
 
 // WithJobID stores the job ID in the context.
@@ -111,6 +113,18 @@ func GetHeaders(ctx context.Context) map[string]string {
 	return v
 }
 
+// WithOperationKey stores the operation key in the context.
+func WithOperationKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, ctxKeyOperationKey, key)
+}
+
+// GetOperationKey extracts the operation key from the context.
+// Returns empty string if not set (backward-compatible with pre-OperationKey messages).
+func GetOperationKey(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyOperationKey).(string)
+	return v
+}
+
 // ProgressReporterFunc is the callback stored in context for reporting progress.
 type ProgressReporterFunc func(ctx context.Context, data json.RawMessage) error
 
@@ -149,6 +163,32 @@ func WithSideEffectTTL(ctx context.Context, seconds int) context.Context {
 // Returns 0 if not set (caller should use a default).
 func GetSideEffectTTL(ctx context.Context) int {
 	v, _ := ctx.Value(ctxKeySideEffectTTL).(int)
+	return v
+}
+
+// OperationEffectStore is a minimal interface for operation-scoped side-effect dedup (L3).
+// Unlike SideEffectStore (keyed by RunID, lost on retry), OperationEffectStore uses
+// OperationKey which survives across retries, enabling exactly-once external effects.
+type OperationEffectStore interface {
+	// ClaimOperationEffect atomically claims a side-effect step for the given operation.
+	// Returns:
+	//   (result, true, nil)           — already done, cached result returned
+	//   ("", false, nil)              — newly claimed, caller should execute
+	//   ("", false, ErrEffectPending) — claimed by another worker, caller should wait/skip
+	ClaimOperationEffect(ctx context.Context, opKey, stepKey string, ttlSeconds int) (string, bool, error)
+	// CompleteOperationEffect atomically marks a step as done (CAS: only non-done → done).
+	// Returns true if newly completed, false if already done (stale completer rejected).
+	CompleteOperationEffect(ctx context.Context, opKey, stepKey string, result string) (bool, error)
+}
+
+// WithOperationEffectStore stores the OperationEffectStore in the context.
+func WithOperationEffectStore(ctx context.Context, s OperationEffectStore) context.Context {
+	return context.WithValue(ctx, ctxKeyOperationEffectStore, s)
+}
+
+// GetOperationEffectStore extracts the OperationEffectStore from the context.
+func GetOperationEffectStore(ctx context.Context) OperationEffectStore {
+	v, _ := ctx.Value(ctxKeyOperationEffectStore).(OperationEffectStore)
 	return v
 }
 

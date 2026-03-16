@@ -148,6 +148,21 @@ func SignalDedupKey(prefix, wfID, dedupeKey string) string {
 	return fmt.Sprintf("%s:sigdedup:%s:%s", prefix, wfID, dedupeKey)
 }
 
+// Operation Ledger (exactly-once commit point). Hash-tagged on {opKey} for cluster safety.
+func OperationLedgerKey(prefix, opKey string) string {
+	return fmt.Sprintf("%s:opled:{%s}", prefix, opKey)
+}
+
+// Stream-scoped dedup (co-located with {tierName} stream for atomic Lua dispatch).
+func StreamDedupKey(prefix, tierName, runID string) string {
+	return fmt.Sprintf("%s:{%s}:dedup:%s", prefix, tierName, runID)
+}
+
+// Operation-scoped effect tracking (L3). Hash-tagged on {opKey}.
+func OperationEffectKey(prefix, opKey, stepKey string) string {
+	return fmt.Sprintf("%s:opfx:{%s}:%s", prefix, opKey, stepKey)
+}
+
 // JSON Payload mirrors (RedisJSON) — used for JSONPath-based search.
 func JobPayloadKey(prefix, id string) string       { return fmt.Sprintf("%s:jparam:job:%s", prefix, id) }
 func WorkflowPayloadKey(prefix, id string) string  { return fmt.Sprintf("%s:jparam:workflow:%s", prefix, id) }

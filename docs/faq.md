@@ -45,8 +45,9 @@ The scheduler runs only on the elected leader. During failover:
 B will attempt to re-dispatch the same schedule entry.
 
 **Protection**: Each schedule firing generates a deterministic **FiringID** (`"{jobID}:{firingTime.UnixMilli()}"`).
-The dispatcher performs `SET NX` on the FiringID key before publishing to the work stream.
-If Leader A already dispatched the same firing, the `SET NX` fails and Leader B skips the dispatch.
+The dispatcher checks the FiringID key and publishes to the work stream in one atomic Lua script;
+the key is set only when the publish succeeds. If Leader A already dispatched the same firing,
+Leader B finds the key and skips the dispatch.
 
 **Fallback**: If the FiringID key expires (1-hour TTL) before Leader B processes the schedule,
 the firing may dispatch twice. Use `UniqueKey` on the job or handler-level idempotency as

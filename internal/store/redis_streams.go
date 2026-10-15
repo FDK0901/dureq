@@ -42,26 +42,18 @@ func (s *RedisStore) EnsureStreams(ctx context.Context) error {
 	return nil
 }
 
-// DispatchWork adds a work message to the tier-specific Redis Stream.
-// Uses an atomic Lua script (dedup check + XADD + dedup mark) so that
-// crash between dedup and XADD can no longer silently lose a message.
-func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *types.WorkMessage) (string, error) {
-	// FiringID dedup: best-effort pre-check on a separate slot.
-	// Not the authoritative gate — the atomic script below is.
-	if wm.FiringID != "" {
-		firingKey := FiringDedupKey(s.prefix, wm.FiringID)
-		err := s.rdb.Do(ctx, s.rdb.B().Set().Key(firingKey).Value(wm.RunID).Nx().Ex(1*time.Hour).Build()).Error()
-		if err != nil {
-			if rueidis.IsRedisNil(err) {
-				return "", nil
-			}
-			return "", fmt.Errorf("firing dedup check: %w", err)
-		}
-	}
+// firingDedupTTL bounds how long a dispatched schedule firing is remembered.
+const firingDedupTTL = 1 * time.Hour
 
+// DispatchWork adds a work message to the tier-specific Redis Stream.
+// Uses an atomic Lua script (RunID/FiringID dedup check + XADD + dedup marks)
+// so that a crash or error before the XADD never consumes the dedup marks
+// and silently loses the message.
+func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *types.WorkMessage) (string, error) {
 	// Build XADD field-value pairs as flat string slice for the Lua script.
 	args := []string{
-		strconv.Itoa(int(s.cfg.DedupTTL.Seconds())), // ARGV[1] = dedup TTL
+		strconv.Itoa(int(s.cfg.DedupTTL.Seconds())), // ARGV[1] = run dedup TTL
+		strconv.Itoa(int(firingDedupTTL.Seconds())), // ARGV[2] = firing dedup TTL
 		"run_id", wm.RunID,
 		"job_id", wm.JobID,
 		"task_type", string(wm.TaskType),
@@ -90,14 +82,16 @@ func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *type
 		}
 	}
 
-	// Atomic Lua: EXISTS dedup → XADD → SET dedup. Both keys share {tierName} slot.
-	streamKey := WorkStreamKey(s.prefix, tierName)
-	dedupKey := StreamDedupKey(s.prefix, tierName, wm.RunID)
+	// Atomic Lua: EXISTS dedup → XADD → SET dedup. All keys share {tierName} slot.
+	keys := []string{
+		WorkStreamKey(s.prefix, tierName),
+		StreamDedupKey(s.prefix, tierName, wm.RunID),
+	}
+	if wm.FiringID != "" {
+		keys = append(keys, FiringDedupKey(s.prefix, tierName, wm.FiringID))
+	}
 
-	msgID, err := s.scriptAtomicDispatch.Exec(ctx, s.rdb,
-		[]string{streamKey, dedupKey},
-		args,
-	).ToString()
+	msgID, err := s.scriptAtomicDispatch.Exec(ctx, s.rdb, keys, args).ToString()
 	if err != nil {
 		return "", fmt.Errorf("atomic dispatch: %w", err)
 	}
@@ -568,6 +562,13 @@ func (s *RedisStore) ClaimStaleMessages(ctx context.Context, tierName, consumerN
 		return nil, err
 	}
 	return entries, nil
+}
+
+// RefreshMessageClaim resets a pending message's idle time (XCLAIM ... JUSTID)
+// so ClaimStaleMessages does not hand a still-running message to another worker.
+// No-op if the message is no longer pending (already ACK'd).
+func (s *RedisStore) RefreshMessageClaim(ctx context.Context, tierName, consumerName, messageID string) error {
+	return s.rdb.Do(ctx, s.rdb.B().Xclaim().Key(WorkStreamKey(s.prefix, tierName)).Group(ConsumerGroup).Consumer(consumerName).MinIdleTime("0").Id(messageID).Justid().Build()).Error()
 }
 
 // ============================================================

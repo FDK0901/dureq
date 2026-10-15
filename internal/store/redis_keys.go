@@ -111,7 +111,11 @@ func CancelChannelKey(prefix string) string { return prefix + ":cancel" }
 func CancelFlagKey(prefix, runID string) string { return fmt.Sprintf("%s:cancel_flag:%s", prefix, runID) }
 
 // Firing Dedup (prevents duplicate dispatch of the same schedule firing under leader failover)
-func FiringDedupKey(prefix, firingID string) string { return fmt.Sprintf("%s:firing:%s", prefix, firingID) }
+// Tagged on {tierName} so the atomic dispatch script can check and set it
+// in the same slot as the work stream.
+func FiringDedupKey(prefix, tierName, firingID string) string {
+	return fmt.Sprintf("%s:{%s}:firing:%s", prefix, tierName, firingID)
+}
 
 // Job Audit Trail (per-job state transition history)
 func JobAuditKey(prefix, jobID string) string { return fmt.Sprintf("%s:job:%s:audit", prefix, jobID) }

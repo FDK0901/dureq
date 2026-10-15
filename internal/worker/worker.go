@@ -337,6 +337,15 @@ func (w *Worker) jobNotifySubscriber(notify chan<- struct{}) {
 	}
 }
 
+const (
+	// staleClaimMinIdle is how long a stream entry must sit idle in the PEL
+	// before claimStaleLoop reclaims it from its (presumably crashed) owner.
+	staleClaimMinIdle = 5 * time.Minute
+	// claimRefreshInterval is how often a running handler resets its entry's
+	// idle time. Must stay well below staleClaimMinIdle.
+	claimRefreshInterval = 30 * time.Second
+)
+
 // claimStaleLoop periodically reclaims unacknowledged messages from crashed workers.
 func (w *Worker) claimStaleLoop() {
 	ticker := time.NewTicker(30 * time.Second)
@@ -348,7 +357,7 @@ func (w *Worker) claimStaleLoop() {
 			return
 		case <-ticker.C:
 			for _, tier := range w.tiers {
-				msgs, err := w.store.ClaimStaleMessages(w.ctx, tier.Name, w.nodeID, 5*time.Minute, 10)
+				msgs, err := w.store.ClaimStaleMessages(w.ctx, tier.Name, w.nodeID, staleClaimMinIdle, 10)
 				if err != nil {
 					if w.ctx.Err() == nil {
 						w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: XAUTOCLAIM error")
@@ -396,11 +405,13 @@ func parseStreamMessage(entry rueidis.XRangeEntry, tierName string) *streamMessa
 }
 
 // runHeartbeat periodically updates the run's LastHeartbeatAt field while the job executes.
-// Also refreshes the operation ledger TTL to prevent expiry during long-running jobs.
-func (w *Worker) runHeartbeat(ctx context.Context, run *types.JobRun, mu *sync.Mutex, operationKey string) {
+// Also refreshes the operation ledger TTL to prevent expiry during long-running jobs,
+// and the stream entry's idle time so claimStaleLoop doesn't reclaim a live run.
+func (w *Worker) runHeartbeat(ctx context.Context, run *types.JobRun, mu *sync.Mutex, operationKey string, sm *streamMessage) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
+	var lastClaimRefresh time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -415,6 +426,13 @@ func (w *Worker) runHeartbeat(ctx context.Context, run *types.JobRun, mu *sync.M
 			// Refresh operation ledger TTL to prevent expiry during long-running jobs.
 			if operationKey != "" {
 				w.store.RefreshOperationLedger(w.ctx, operationKey)
+			}
+			if now.Sub(lastClaimRefresh) >= claimRefreshInterval {
+				if err := w.store.RefreshMessageClaim(w.ctx, sm.TierName, w.nodeID, sm.StreamMsgID); err != nil {
+					w.logger.Warn().String("run_id", run.ID).Err(err).Msg("worker: stream claim refresh failed")
+				} else {
+					lastClaimRefresh = now
+				}
 			}
 		}
 	}
@@ -558,8 +576,11 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	rl, lockErr := w.locker.Lock(w.ctx, "run:"+work.RunID, lockOwner)
 	if lockErr != nil {
 		if errors.Is(lockErr, types.ErrLockFailed) {
-			w.logger.Info().String("run_id", work.RunID).Msg("worker: run already locked by another worker, skipping")
-			w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+			// Don't ack: this may be the very entry the lock holder is executing,
+			// reclaimed while it still runs. ACKing would drop it from the PEL and
+			// lose the run if the holder then crashes. The holder ACKs on completion;
+			// otherwise XAUTOCLAIM redelivers it once the lock expires.
+			w.logger.Info().String("run_id", work.RunID).Msg("worker: run already locked by another worker, leaving pending")
 			return
 		}
 		w.logger.Warn().String("run_id", work.RunID).Err(lockErr).Msg("worker: lock acquisition error")
@@ -646,7 +667,7 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	hbWg.Add(1)
 	go func() {
 		defer hbWg.Done()
-		w.runHeartbeat(hbCtx, run, &runMu, work.OperationKey)
+		w.runHeartbeat(hbCtx, run, &runMu, work.OperationKey, sm)
 	}()
 
 	// Publish started event.

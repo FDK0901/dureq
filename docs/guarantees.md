@@ -9,7 +9,7 @@ Every claim is backed by the specific Redis primitives and code paths that imple
 |--------|-----------|-----------|------------|
 | **Enqueue** | At-most-once per UniqueKey | `SET NX` on unique key | Without UniqueKey, every call creates a new job |
 | **Request ID** | At-most-once (5-min window) | `SET EX` dedup cache | TTL expiry allows duplicates after 5 minutes |
-| **Dispatch** | At-most-once per FiringID | FiringID `SET NX EX 1h` + RunID dedup + `XADD` | FiringID TTL expiry (1h) allows duplicate after long failover |
+| **Dispatch** | At-most-once per FiringID | FiringID + RunID dedup check, `XADD`, and dedup marks in one Lua script | FiringID TTL expiry (1h) allows duplicate after long failover |
 | **Handler start** | Duplicate-suppressed per RunID | Per-run lock `SET NX EX 30s` + auto-extend | Lock TTL expiry creates a race window (see below) |
 | **Completion** | Pipelined, not atomic | `DoMulti` 7-step pipeline | Partial failure recovered by orphan detection |
 | **Schedule** | At-most-once per tick (single leader) | Leader-only scheduler | Leader failover gap may re-fire the same schedule |
@@ -26,8 +26,10 @@ This is NOT the same as exactly-once outcome:
   If a worker crashes, XAUTOCLAIM reclaims the message for another worker.
 - **Duplicate-suppressed handler start**: A per-run distributed lock (`SET NX EX 30s`)
   ensures that at most one worker executes the handler for a given RunID at any time.
-  If XAUTOCLAIM delivers the message to a second worker while the first is still running,
-  the second worker fails to acquire the lock and skips execution.
+  A running handler refreshes its message's idle time every 30s, so XAUTOCLAIM does not
+  reclaim live runs. If a message is still delivered to a second worker while the first is
+  running, the second worker fails to acquire the lock, skips execution, and leaves the
+  message pending (not ACKed) so it can be redelivered if the first worker crashes.
 - **External side effects are NOT covered**: If your handler calls an external API, writes
   to a database, or sends an email, dureq does not guarantee that these operations happen
   exactly once. The handler may be cancelled mid-execution (lock lost) and retried. You must
@@ -68,20 +70,21 @@ No data loss occurs. Job executes normally.
 ```
 Leader A                Redis               Leader B
   |--- Dispatch (RunID=R1)->|
-  |    SET NX firing:{FID}  |  (FiringID dedup acquired)
-  |    XADD to stream      |
+  |    Lua: XADD to stream  |
+  |         SET firing:{FID}|  (FiringID mark set with the XADD)
   |--- [CRASH] ------------|  (advanceSchedule not called)
   |                         |<--- ListDueSchedules --- (new tick)
   |                         |    (same schedule, still due)
   |                         |----- Dispatch (RunID=R2) --->
-  |                         |    SET NX firing:{FID} → ALREADY EXISTS
+  |                         |    Lua: firing:{FID} EXISTS → DUP
   |                         |    (dispatch skipped — same FiringID)
 ```
 
 **FiringID** is a deterministic identifier: `"{jobID}:{firingTime.UnixMilli()}"`.
-When two leaders attempt to dispatch the same schedule firing, the `SET NX` on
-the FiringID key ensures only the first dispatch succeeds. The second leader
-sees the key already exists and skips the dispatch.
+When two leaders attempt to dispatch the same schedule firing, the atomic dispatch
+script ensures only the first dispatch succeeds. The FiringID key is checked and
+set in the same Lua script as the `XADD` (same `{tier}` slot), so a dispatch that
+fails before the `XADD` leaves no mark and the firing can be retried.
 
 The FiringID dedup key has a 1-hour TTL for automatic cleanup.
 
@@ -210,6 +213,9 @@ dureq does not use an explicit visibility timeout. Instead:
 - A message stays "pending" (invisible to other consumers) until `XACK`.
 - If a consumer crashes without ACKing, **XAUTOCLAIM** reclaims idle messages
   after 5 minutes (configurable).
-- The per-run lock prevents duplicate execution of reclaimed messages.
+- A running handler resets its message's idle time every 30s (`XCLAIM ... JUSTID`),
+  so only messages of crashed or stalled workers become eligible for reclaim.
+- The per-run lock prevents duplicate execution of reclaimed messages. A worker that
+  fails to acquire the lock leaves the message pending instead of ACKing it.
 
 This is equivalent to a 5-minute visibility timeout with lock-based dedup.

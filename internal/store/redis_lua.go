@@ -278,23 +278,33 @@ return redis.call('ZREM', KEYS[1], ARGV[1])
 // Exactly-once scripts (L2 operation ledger + atomic dispatch)
 // ============================================================
 
-// luaAtomicDispatch atomically checks dedup + XADD + sets dedup mark.
-// Both keys share {tierName} hash tag for Redis Cluster slot co-location.
+// luaAtomicDispatch atomically checks dedup + XADD + sets dedup marks.
+// All keys share {tierName} hash tag for Redis Cluster slot co-location.
+// The FiringID mark is only set once the XADD has succeeded, so a failed
+// dispatch never leaves a mark that blocks the retry of the same firing.
 // KEYS[1] = dureq:{tierName}:work (stream)
 // KEYS[2] = dureq:{tierName}:dedup:{runID}
-// ARGV[1] = dedup TTL seconds
-// ARGV[2..N] = field-value pairs for XADD (even count)
+// KEYS[3] = dureq:{tierName}:firing:{firingID} (optional)
+// ARGV[1] = run dedup TTL seconds
+// ARGV[2] = firing dedup TTL seconds (ignored without KEYS[3])
+// ARGV[3..N] = field-value pairs for XADD (even count)
 // Returns: stream message ID on success, "DUP" if already dispatched.
 const luaAtomicDispatch = `
 if redis.call('EXISTS', KEYS[2]) == 1 then
   return 'DUP'
 end
+if KEYS[3] and redis.call('EXISTS', KEYS[3]) == 1 then
+  return 'DUP'
+end
 local args = {}
-for i = 2, #ARGV do
+for i = 3, #ARGV do
   args[#args + 1] = ARGV[i]
 end
 local msgID = redis.call('XADD', KEYS[1], '*', unpack(args))
 redis.call('SET', KEYS[2], msgID, 'EX', tonumber(ARGV[1]))
+if KEYS[3] then
+  redis.call('SET', KEYS[3], msgID, 'EX', tonumber(ARGV[2]))
+end
 return msgID
 `
 

@@ -145,7 +145,7 @@ dureq provides **at-least-once delivery with L2 exactly-once internal completion
 |--------|-----------|-----------|
 | Enqueue | At-most-once per UniqueKey | `SET NX` dedup guard |
 | Dispatch | At-most-once per RunID | Atomic Lua script (dedup + XADD + mark) in single Redis slot |
-| Schedule firing | At-most-once per FiringID | `SET NX EX 1h` pre-check + deterministic firing identity |
+| Schedule firing | At-most-once per FiringID | FiringID dedup checked and set in the atomic dispatch script (1h TTL) + deterministic firing identity |
 | Handler start | Duplicate-suppressed | Operation ledger claim + per-run lock |
 | Internal completion | Exactly-once per OperationKey | Two-phase: ledger CAS commit (Phase 1) + idempotent pipeline (Phase 2) |
 | Business outcome | Exactly-once (opt-in) | `pkg/integration/postgres.CompleteTx` — same SQL TX as business write |

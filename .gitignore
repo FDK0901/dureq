@@ -41,3 +41,7 @@ configs/
 # IDE & Editor files
 .vscode
 .idea
+
+# agents
+resume-codex.sh
+resume.sh

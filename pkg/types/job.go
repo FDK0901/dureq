@@ -432,9 +432,9 @@ type WorkMessage struct {
 	// Workers with a mismatched version will skip and re-enqueue the message.
 	Version string `json:"version,omitempty"`
 
-	// FiringID is a deterministic identifier for schedule firings: "{jobID}:{firingTime.UnixMilli()}".
-	// When set, DispatchWork performs an additional SET NX dedup check to prevent
-	// duplicate dispatches of the same schedule firing under leader failover.
+	// FiringID is a deterministic identifier for schedule firings: "{jobID}:{scheduledAt.UnixMilli()}",
+	// derived from the firing's scheduled time. When set, DispatchWork's atomic script also
+	// dedups on it to prevent duplicate dispatches of the same firing under leader failover.
 	FiringID string `json:"firing_id,omitempty"`
 
 	// OperationKey is a stable, deterministic identifier for the logical operation.

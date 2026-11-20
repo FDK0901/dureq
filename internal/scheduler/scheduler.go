@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -17,8 +18,17 @@ import (
 // Dispatcher is the interface the scheduler uses to dispatch work.
 type Dispatcher interface {
 	Dispatch(ctx context.Context, job *types.Job, attempt int) error
+	// DispatchFiring reports false, without error, if the firing was already dispatched.
+	DispatchFiring(ctx context.Context, job *types.Job, attempt int) (bool, error)
 	PublishEvent(event types.JobEvent)
 }
+
+// Headers the scheduler adds to the work message of a schedule firing.
+const (
+	headerFiringID    = "x-dureq-firing-id"
+	headerBackfill    = "x-dureq-backfill"
+	headerScheduledAt = "x-dureq-scheduled-at"
+)
 
 // Config holds scheduler configuration.
 type Config struct {
@@ -277,7 +287,7 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 		s.logger.Info().String("job_id", entry.JobID).Int("missed_count", len(missedFirings)).Msg("scheduler: backfilling missed firings")
 		allOK := true
 		for _, firingTime := range missedFirings {
-			newRev, ok := s.dispatchFiring(ctx, job, rev, entry, firingTime, true)
+			newRev, ok := s.dispatchFiring(ctx, job, rev, entry, firingTime, firingTime, true)
 			if !ok {
 				allOK = false
 				break
@@ -290,8 +300,14 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 			entry.LastProcessedAt = &lastFiring
 		}
 	} else {
-		// Normal single dispatch.
-		_, ok := s.dispatchFiring(ctx, job, rev, entry, now, false)
+		// Normal single dispatch. The firing is identified by its scheduled time,
+		// not the tick time, so a leader that takes over before the schedule was
+		// advanced derives the same FiringID and the firing isn't dispatched twice.
+		scheduledAt := entry.NextRunAt
+		if scheduledAt.IsZero() {
+			scheduledAt = now
+		}
+		_, ok := s.dispatchFiring(ctx, job, rev, entry, now, scheduledAt, false)
 		if ok {
 			entry.LastProcessedAt = &now
 			dispatched = true
@@ -304,11 +320,21 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 	}
 }
 
-// dispatchFiring dispatches a single firing of a scheduled job.
-// Returns the new revision and true on success, or (0, false) on failure.
-func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime time.Time, isBackfill bool) (uint64, bool) {
+// dispatchFiring dispatches a single firing of a scheduled job. scheduledAt
+// identifies the firing (FiringID); firingTime is recorded as the job's LastRunAt.
+// Returns the new revision and true on success, including when the firing had
+// already been dispatched, or (0, false) on failure.
+func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime, scheduledAt time.Time, isBackfill bool) (uint64, bool) {
 	prevStatus := job.Status
 	prevLastRunAt := job.LastRunAt
+
+	// Firing headers belong to the work message only. Older versions stored them
+	// on the job, so later non-firing dispatches (retry, resume, orphan redispatch,
+	// overlap drain) carried a stale FiringID and were deduplicated away. Strip
+	// them so the update below also cleans up previously stored copies.
+	delete(job.Headers, headerFiringID)
+	delete(job.Headers, headerBackfill)
+	delete(job.Headers, headerScheduledAt)
 
 	job.Status = types.JobStatusPending
 	job.LastRunAt = &firingTime
@@ -320,31 +346,40 @@ func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint
 		return 0, false
 	}
 
-	// Generate deterministic FiringID for schedule firing dedup.
-	// This prevents duplicate dispatches when leader failover causes the same
-	// schedule entry to be processed by two leaders.
-	if job.Headers == nil {
-		job.Headers = make(map[string]string)
-	}
-	firingID := fmt.Sprintf("%s:%d", job.ID, firingTime.UnixMilli())
-	job.Headers["x-dureq-firing-id"] = firingID
-
+	// Deterministic FiringID for schedule firing dedup: every leader that
+	// processes the same firing derives the same ID.
+	headers := make(map[string]string, len(job.Headers)+3)
+	maps.Copy(headers, job.Headers)
+	headers[headerFiringID] = fmt.Sprintf("%s:%d", job.ID, scheduledAt.UnixMilli())
 	// Add backfill headers for missed firings being caught up.
 	if isBackfill {
-		job.Headers["x-dureq-backfill"] = "true"
-		job.Headers["x-dureq-scheduled-at"] = firingTime.Format(time.RFC3339Nano)
+		headers[headerBackfill] = "true"
+		headers[headerScheduledAt] = scheduledAt.Format(time.RFC3339Nano)
 	}
+	firingJob := *job
+	firingJob.Headers = headers
 
-	if err := s.dispatcher.Dispatch(ctx, job, job.Attempt); err != nil {
-		s.logger.Error().String("job_id", job.ID).Err(err).Msg("scheduler: dispatch failed, rolling back status")
-		// Rollback: revert job status to prevent state inconsistency.
+	dispatched, err := s.dispatcher.DispatchFiring(ctx, &firingJob, job.Attempt)
+	if err != nil || !dispatched {
+		// Rollback: revert job status to prevent state inconsistency. If the firing
+		// was already dispatched, the status must reflect that earlier run.
 		job.Status = prevStatus
 		job.LastRunAt = prevLastRunAt
 		job.UpdatedAt = time.Now()
-		if _, rbErr := s.store.UpdateJob(ctx, job, newRev); rbErr != nil {
-			s.logger.Error().String("job_id", job.ID).Err(rbErr).Msg("scheduler: rollback after dispatch failure also failed")
+		rbRev, rbErr := s.store.UpdateJob(ctx, job, newRev)
+		if err != nil {
+			s.logger.Error().String("job_id", job.ID).Err(err).Msg("scheduler: dispatch failed, rolling back status")
+			if rbErr != nil {
+				s.logger.Error().String("job_id", job.ID).Err(rbErr).Msg("scheduler: rollback after dispatch failure also failed")
+			}
+			return 0, false
 		}
-		return 0, false
+		s.logger.Info().String("job_id", job.ID).String("firing_id", headers[headerFiringID]).Msg("scheduler: firing already dispatched, skipping")
+		if rbErr != nil {
+			// The earlier run updated the job in the meantime; its state wins.
+			return newRev, true
+		}
+		return rbRev, true
 	}
 
 	s.dispatcher.PublishEvent(types.JobEvent{

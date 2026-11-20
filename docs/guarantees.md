@@ -80,7 +80,8 @@ Leader A                Redis               Leader B
   |                         |    (dispatch skipped — same FiringID)
 ```
 
-**FiringID** is a deterministic identifier: `"{jobID}:{firingTime.UnixMilli()}"`.
+**FiringID** is a deterministic identifier: `"{jobID}:{scheduledAt.UnixMilli()}"`, where
+`scheduledAt` is the firing's scheduled time (not the tick that processed it).
 When two leaders attempt to dispatch the same schedule firing, the atomic dispatch
 script ensures only the first dispatch succeeds. The FiringID key is checked and
 set in the same Lua script as the `XADD` (same `{tier}` slot), so a dispatch that

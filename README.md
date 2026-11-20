@@ -159,7 +159,7 @@ For full details including failure scenarios, see [docs/guarantees.md](docs/guar
 
 ### Prerequisites
 
-- Go 1.25+
+- Go 1.26.11+ (the go.mod minimum; older toolchains have known security vulnerabilities)
 - Redis 7+
 
 ### Quick Example

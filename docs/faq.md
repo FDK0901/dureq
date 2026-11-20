@@ -44,7 +44,7 @@ The scheduler runs only on the elected leader. During failover:
 **Risk**: If A dispatched a job but crashed before advancing the schedule,
 B will attempt to re-dispatch the same schedule entry.
 
-**Protection**: Each schedule firing generates a deterministic **FiringID** (`"{jobID}:{firingTime.UnixMilli()}"`).
+**Protection**: Each schedule firing generates a deterministic **FiringID** (`"{jobID}:{scheduledAt.UnixMilli()}"`, from the firing's scheduled time).
 The dispatcher checks the FiringID key and publishes to the work stream in one atomic Lua script;
 the key is set only when the publish succeeds. If Leader A already dispatched the same firing,
 Leader B finds the key and skips the dispatch.

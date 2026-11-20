@@ -8,7 +8,7 @@ This guide walks through installing dureq, starting a server, enqueuing jobs, an
 go get github.com/FDK0901/dureq
 ```
 
-Requires Go 1.22+ and Redis 7+.
+Requires Go 1.26.11+ and Redis 7+.
 
 ## Server
 

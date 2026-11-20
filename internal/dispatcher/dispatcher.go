@@ -44,6 +44,21 @@ func (d *Dispatcher) SetHandlerVersions(versions map[types.TaskType]string) {
 
 // Dispatch publishes a work message for a job to the tier-appropriate Redis Stream.
 func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) error {
+	_, err := d.dispatch(ctx, job, attempt)
+	return err
+}
+
+// DispatchFiring dispatches a schedule firing identified by the job's
+// x-dureq-firing-id header. It returns false, without error, when that
+// firing was already dispatched (e.g. by a previous leader).
+func (d *Dispatcher) DispatchFiring(ctx context.Context, job *types.Job, attempt int) (bool, error) {
+	msgID, err := d.dispatch(ctx, job, attempt)
+	return msgID != "", err
+}
+
+// dispatch publishes the work message and returns its stream ID, or "" when
+// the message was deduplicated.
+func (d *Dispatcher) dispatch(ctx context.Context, job *types.Job, attempt int) (string, error) {
 	priority := types.PriorityNormal
 	if job.Priority != nil {
 		priority = *job.Priority
@@ -86,7 +101,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) 
 
 	msgID, err := d.store.DispatchWork(ctx, tierName, &msg)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	d.logger.Debug().
@@ -97,7 +112,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) 
 		String("stream_id", msgID).
 		Msg("dispatched work")
 
-	return nil
+	return msgID, nil
 }
 
 // DispatchToDLQ moves a failed job to the dead letter queue.

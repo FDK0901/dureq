@@ -67,6 +67,12 @@ func New(rdb rueidis.Client, keyPrefix string) *Limiter {
 	return &Limiter{rdb: rdb, keyPrefix: keyPrefix}
 }
 
+// Return gives back n tokens that Allow has granted and that were not needed.
+func (l *Limiter) Return(ctx context.Context, tier string, n int, cfg Config) error {
+	_, err := l.Allow(ctx, tier, -n, cfg) // what exceeds the capacity is dropped on the next call
+	return err
+}
+
 // Allow checks if n tokens are available for the given tier.
 // Returns true if the request is allowed, false if rate-limited.
 func (l *Limiter) Allow(ctx context.Context, tier string, n int, cfg Config) (bool, error) {

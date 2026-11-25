@@ -98,3 +98,107 @@ func TestWorker_TakesJobsAsSoonAsThereIsRoom(t *testing.T) {
 	enqueueMany(t, cli, "quick", types.PriorityNormal, 300)
 	waitCount(t, 8*time.Second, &n, 300)
 }
+
+// Tiers without jobs do not hold up the others.
+func TestWorker_EmptyTiersDoNotHoldUpOthers(t *testing.T) {
+	var n atomic.Int64
+	tiers := []store.TierConfig{{Name: "high", Weight: 100}, {Name: "normal", Weight: 50}, {Name: "low", Weight: 10}}
+	_, cli := startTiered(t, 10, tiers, counter("quick", &n))
+	enqueueMany(t, cli, "quick", 1, 500)
+	waitCount(t, 8*time.Second, &n, 500)
+}
+
+// A rate limit below the batch size lets jobs through, at the rate, and other tiers are not
+// affected. Looking for jobs that are not there does not use it up.
+func TestWorker_RateLimit(t *testing.T) {
+	var limited, other atomic.Int64
+	tiers := []store.TierConfig{{Name: "limited", Weight: 100, FetchBatch: 10, RateLimit: 5}, {Name: "other", Weight: 10}}
+	_, cli := startTiered(t, 20, tiers, counter("limited", &limited), counter("other", &other))
+	enqueueMany(t, cli, "other", 1, 300)
+	waitCount(t, 8*time.Second, &other, 300)
+
+	start := time.Now()
+	enqueueMany(t, cli, "limited", 10, 15)
+	waitCount(t, 8*time.Second, &limited, 15)
+	// Five at once, and the rest at five a second.
+	if took := time.Since(start); took < 1500*time.Millisecond {
+		t.Errorf("15 jobs at 5 a second took only %v", took)
+	}
+}
+
+// A busy worker notices that a queue is paused, and that its node is draining.
+func TestWorker_PauseAndDrainWhileBusy(t *testing.T) {
+	var n atomic.Int64
+	nodeID, cli := startTiered(t, 2, nil, types.HandlerDefinition{TaskType: "busy", Handler: func(context.Context, json.RawMessage) error {
+		time.Sleep(5 * time.Millisecond)
+		n.Add(1)
+		return nil
+	}})
+	ctx := context.Background()
+	st := cli.Store()
+	stops := func(what string) {
+		t.Helper()
+		time.Sleep(300 * time.Millisecond)
+		before := n.Load()
+		time.Sleep(700 * time.Millisecond)
+		if after := n.Load(); after != before {
+			t.Errorf("%d jobs were processed after %s", after-before, what)
+		}
+	}
+	goesOn := func(what string) {
+		t.Helper()
+		before := n.Load()
+		waitFor(t, 5*time.Second, "jobs after "+what, func() bool { return n.Load() > before })
+	}
+	enqueueMany(t, cli, "busy", types.PriorityNormal, 3000)
+	goesOn("start")
+	if err := st.PauseQueue(ctx, "normal"); err != nil {
+		t.Fatal(err)
+	}
+	stops("the queue was paused")
+	if err := st.UnpauseQueue(ctx, "normal"); err != nil {
+		t.Fatal(err)
+	}
+	goesOn("the queue was resumed")
+	if err := st.SetNodeDrain(ctx, nodeID, true); err != nil {
+		t.Fatal(err)
+	}
+	stops("the node was drained")
+	if err := st.SetNodeDrain(ctx, nodeID, false); err != nil {
+		t.Fatal(err)
+	}
+	goesOn("the node was undrained")
+}
+
+// A worker is notified of jobs again after it has lost the connection for that. The Redis
+// client sees to it.
+func TestWorker_IsNotifiedAfterReconnect(t *testing.T) {
+	started := make(chan time.Time, 1)
+	_, cli := startTiered(t, 10, nil, types.HandlerDefinition{TaskType: "quick", Handler: func(context.Context, json.RawMessage) error {
+		started <- time.Now()
+		return nil
+	}})
+	ctx := context.Background()
+	time.Sleep(500 * time.Millisecond)
+	for _, node := range cli.Store().Client().Nodes() {
+		if err := node.Do(ctx, node.B().ClientKill().TypePubsub().Build()).Error(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(time.Second)
+
+	slow := 0
+	for range 10 {
+		at := time.Now()
+		if _, err := cli.Enqueue(ctx, "quick", nil); err != nil {
+			t.Fatal(err)
+		}
+		if took := (<-started).Sub(at); took > 100*time.Millisecond {
+			slow++
+		}
+		time.Sleep(130 * time.Millisecond)
+	}
+	if slow > 2 {
+		t.Errorf("%d of 10 jobs had to wait until the worker looked for them", slow)
+	}
+}

@@ -229,116 +229,172 @@ func (w *Worker) availableCapacity() int {
 	return avail
 }
 
+const (
+	// pollInterval is how often an idle worker looks for work without being notified of any.
+	pollInterval = 500 * time.Millisecond
+	// gateInterval is how often a busy worker checks whether it is draining and which
+	// queues are paused.
+	gateInterval = 50 * time.Millisecond
+	// A worker that is notified of work which another node has taken by the time it looks
+	// waits a little before it looks again, and the longer the more often that happens in a
+	// row: all nodes are notified of every job.
+	minMissDelay = 1 * time.Millisecond
+	maxMissDelay = 16 * time.Millisecond
+)
+
 // priorityFetchLoop polls tier streams in weight-descending order via XREADGROUP.
 // Higher-weight tiers are polled first and with larger batch sizes.
 // The batch size is dynamically capped by pool capacity to avoid dequeuing
 // more messages than can be immediately processed (backpressure).
 //
-// A Pub/Sub subscriber listens on JobNotifyChannel for push notifications
-// from DispatchWork, waking the fetch loop immediately instead of waiting
-// for the next polling interval (reduces dispatch-to-start latency from
-// ~500ms to near-zero). When there is no room, the end of a running message does.
+// A tier is read without waiting for messages, or an empty one would hold up the others.
+// When there is nothing to do, a Pub/Sub subscriber on JobNotifyChannel wakes the loop as
+// soon as work is dispatched (reduces dispatch-to-start latency from ~500ms to near-zero).
+// When there is no room, the end of a running message does.
 func (w *Worker) priorityFetchLoop() {
 	// Start push notification subscriber.
 	notify := make(chan struct{}, 1)
 	go w.jobNotifySubscriber(notify)
 
+	var (
+		gateAt    time.Time
+		draining  bool
+		paused    []bool // by tier
+		missDelay time.Duration
+	)
 	for {
 		select {
 		case <-w.quit:
 			return
 		default:
 		}
-		fetched, full := 0, false
 
+		if time.Since(gateAt) >= gateInterval {
+			draining, paused = w.store.FetchGate(w.ctx, w.nodeID)
+			gateAt = time.Now()
+		}
 		// Skip all tiers if this node is draining.
-		if draining, _ := w.store.IsNodeDraining(w.ctx, w.nodeID); draining {
-			select {
-			case <-time.After(1 * time.Second):
-				continue
-			case <-w.quit:
+		if draining {
+			if !w.pause(1 * time.Second) {
 				return
 			}
+			continue
 		}
 
-		for _, tier := range w.tiers {
+		fetched, full, poll := 0, false, pollInterval
+		for i, tier := range w.tiers {
 			// Skip paused queues.
-			if paused, _ := w.store.IsQueuePaused(w.ctx, tier.Name); paused {
+			if paused[i] {
 				continue
 			}
-
 			avail := w.availableCapacity()
 			if avail == 0 {
 				full = true
 				break
 			}
-			batchSize := min(tier.FetchBatch, avail)
-
-			// Check rate limit if configured.
-			if tier.RateLimit > 0 {
-				burst := tier.RateBurst
-				if burst <= 0 {
-					burst = int(math.Ceil(tier.RateLimit))
-					if burst < 1 {
-						burst = 1
-					}
-				}
-				allowed, err := w.rateLimiter.Allow(w.ctx, tier.Name, batchSize, ratelimit.Config{
-					MaxTokens:  burst,
-					RefillRate: tier.RateLimit,
-				})
-				if err != nil {
-					w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: rate limit check failed")
-				}
-				if !allowed {
-					continue
-				}
-			}
-
-			streamKey := store.WorkStreamKey(w.store.Prefix(), tier.Name)
-			cmd := w.store.Client().B().Xreadgroup().Group(store.ConsumerGroup, w.nodeID).Count(int64(batchSize)).Block(200).Streams().Key(streamKey).Id(">").Build()
-			xStreams, err := w.store.Client().Do(w.ctx, cmd).AsXRead()
-			if err != nil {
-				if !rueidis.IsRedisNil(err) && w.ctx.Err() == nil {
-					w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: XREADGROUP error")
-				}
-				continue
-			}
-
-			for streamKey, entries := range xStreams {
-				_ = streamKey
-				for _, entry := range entries {
-					fetched++
-					sm := parseStreamMessage(entry, tier.Name)
-
-					pool := w.poolForTaskType(sm.Work.TaskType)
-					if err := pool.submit(func() {
-						w.processMessage(sm)
-					}); err != nil {
-						w.logger.Error().Err(err).Msg("worker: pool submit failed")
-						// Don't ack — XAUTOCLAIM will reclaim it later.
-					}
-				}
+			n, retryIn := w.fetchTier(tier, min(tier.FetchBatch, avail))
+			fetched += n
+			if retryIn > 0 {
+				poll = min(poll, retryIn)
 			}
 		}
-		if fetched == 0 && full {
+
+		switch {
+		case fetched > 0:
+			missDelay = 0
+		case full:
 			// Wait for a running message to end.
 			select {
 			case <-w.freed:
-			case <-time.After(500 * time.Millisecond):
+			case <-time.After(pollInterval):
 			case <-w.quit:
 				return
 			}
-		} else if fetched == 0 {
+		default:
 			// Wait for either a push notification or a fallback poll interval.
 			select {
 			case <-notify:
-			case <-time.After(500 * time.Millisecond):
+				if missDelay > 0 && !w.pause(missDelay) {
+					return
+				}
+				missDelay = min(max(2*missDelay, minMissDelay), maxMissDelay)
+			case <-time.After(poll):
+				missDelay = 0
 			case <-w.quit:
 				return
 			}
 		}
 	}
+}
+
+// pause waits, and reports false if the worker is to quit.
+func (w *Worker) pause(d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-w.quit:
+		return false
+	}
+}
+
+// fetchTier takes up to count messages off a tier, has them processed, and returns how many
+// there were. If the rate limit of the tier does not allow any, it returns when to try again.
+func (w *Worker) fetchTier(tier store.TierConfig, count int) (fetched int, retryIn time.Duration) {
+	// Check rate limit if configured.
+	if tier.RateLimit > 0 {
+		burst := tier.RateBurst
+		if burst <= 0 {
+			burst = int(math.Ceil(tier.RateLimit))
+			if burst < 1 {
+				burst = 1
+			}
+		}
+		count = min(count, burst) // more than that is never allowed
+		limit := ratelimit.Config{
+			MaxTokens:  burst,
+			RefillRate: tier.RateLimit,
+		}
+		allowed, err := w.rateLimiter.Allow(w.ctx, tier.Name, count, limit)
+		if err != nil {
+			w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: rate limit check failed")
+		}
+		if !allowed {
+			return 0, time.Duration(float64(count) / tier.RateLimit * float64(time.Second))
+		}
+		defer func() {
+			if fetched < count {
+				if err := w.rateLimiter.Return(w.ctx, tier.Name, count-fetched, limit); err != nil && w.ctx.Err() == nil {
+					w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: rate limit return failed")
+				}
+			}
+		}()
+	}
+
+	streamKey := store.WorkStreamKey(w.store.Prefix(), tier.Name)
+	cmd := w.store.Client().B().Xreadgroup().Group(store.ConsumerGroup, w.nodeID).Count(int64(count)).Streams().Key(streamKey).Id(">").Build()
+	xStreams, err := w.store.Client().Do(w.ctx, cmd).AsXRead()
+	if err != nil {
+		if !rueidis.IsRedisNil(err) && w.ctx.Err() == nil {
+			w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: XREADGROUP error")
+		}
+		return 0, 0
+	}
+
+	for _, entries := range xStreams {
+		for _, entry := range entries {
+			fetched++
+			sm := parseStreamMessage(entry, tier.Name)
+
+			pool := w.poolForTaskType(sm.Work.TaskType)
+			if err := pool.submit(func() {
+				w.processMessage(sm)
+			}); err != nil {
+				w.logger.Error().Err(err).Msg("worker: pool submit failed")
+				// Don't ack — XAUTOCLAIM will reclaim it later.
+			}
+		}
+	}
+	return fetched, 0
 }
 
 // jobNotifySubscriber subscribes to the JobNotifyChannel and sends a wake-up

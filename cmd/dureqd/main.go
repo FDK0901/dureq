@@ -64,6 +64,9 @@ func main() {
 	if m := parseMode(cfg.DureqdConfig.Mode); m != 0 {
 		opts = append(opts, server.WithMode(m))
 	}
+	if h := cfg.DureqdConfig.RunHistoryRetentionHours; h > 0 {
+		opts = append(opts, server.WithRunHistoryRetention(time.Duration(h)*time.Hour))
+	}
 	apiAddr := ":8080"
 	if cfg.DureqdConfig.ApiAddress != "" {
 		apiAddr = cfg.DureqdConfig.ApiAddress

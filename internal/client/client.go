@@ -1266,6 +1266,13 @@ func (c *Client) enqueueWithID(ctx context.Context, jobID string, taskType types
 	return job, nil
 }
 
+// CleanupRunHistory removes the runs that finished before olderThan from the run history,
+// and returns how many. Jobs and their active runs are left alone. To have this done
+// regularly, start the servers with WithRunHistoryRetention.
+func (c *Client) CleanupRunHistory(ctx context.Context, olderThan time.Time) (int64, error) {
+	return c.store.Cleanup(ctx, olderThan)
+}
+
 // DrainNode puts a node into drain mode. The node stops fetching new messages
 // but continues processing in-flight tasks. Call with drain=false to resume.
 func (c *Client) DrainNode(ctx context.Context, nodeID string, drain bool) error {

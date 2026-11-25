@@ -1522,84 +1522,72 @@ func (s *RedisStore) SaveJobEvent(ctx context.Context, event *types.JobEvent) er
 // Cleanup
 // ============================================================
 
-// Cleanup removes history entries older than the given time.
+const cleanupChunkSize = 500
+
+// Cleanup removes the runs that finished before olderThan from the run history, and
+// returns how many.
 func (s *RedisStore) Cleanup(ctx context.Context, olderThan time.Time) (int64, error) {
-	cutoff := strconv.FormatFloat(float64(olderThan.UnixNano()), 'f', 0, 64)
-	var cleaned int64
-
-	// Clean old history runs.
-	runIDs, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(HistoryRunsKey(s.prefix)).Min("-inf").Max(cutoff).Build()).AsStrSlice()
-	if err != nil {
-		return 0, err
-	}
-	if len(runIDs) > 0 {
-		// Read run data to extract JobID/Status for secondary index cleanup.
-		readCmds := make(rueidis.Commands, 0, len(runIDs))
-		for _, id := range runIDs {
-			readCmds = append(readCmds, s.rdb.B().Hget().Key(HistoryRunKey(s.prefix, id)).Field("data").Build())
+	cutoff := strconv.FormatInt(olderThan.UnixNano(), 10)
+	var cleaned, kept int64
+	for {
+		// The history is in the order in which the runs started.
+		ids, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(HistoryRunsKey(s.prefix)).Min("-inf").Max("("+cutoff).
+			Limit(kept, cleanupChunkSize).Build()).AsStrSlice()
+		if err != nil {
+			return cleaned, fmt.Errorf("list run history: %w", err)
 		}
-		readResults := s.rdb.DoMulti(ctx, readCmds...)
+		if len(ids) == 0 {
+			return cleaned, nil
+		}
 
-		for i, id := range runIDs {
-			cmds := make(rueidis.Commands, 0, 5)
-			cmds = append(cmds, s.rdb.B().Del().Key(HistoryRunKey(s.prefix, id)).Build())
-			cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryRunsKey(s.prefix)).Member(id).Build())
+		reads := make(rueidis.Commands, 0, len(ids))
+		for _, id := range ids {
+			reads = append(reads, s.rdb.B().Hget().Key(HistoryRunKey(s.prefix, id)).Field("data").Build())
+		}
+		var old []string
+		byJob := make(map[string][]string)
+		for i, r := range s.rdb.DoMulti(ctx, reads...) {
+			data, err := r.ToString()
+			if err != nil && !rueidis.IsRedisNil(err) {
+				return cleaned, fmt.Errorf("read run %s: %w", ids[i], err)
+			}
+			var run types.JobRun
+			if err == nil && sonic.ConfigFastest.Unmarshal([]byte(data), &run) == nil {
+				if run.FinishedAt != nil && !run.FinishedAt.Before(olderThan) {
+					kept++
+					continue
+				}
+				byJob[run.JobID] = append(byJob[run.JobID], ids[i])
+			}
+			old = append(old, ids[i])
+		}
+		if len(old) == 0 {
+			continue
+		}
 
-			// Clean secondary indexes if we can read the run data.
-			if dataStr, err := readResults[i].ToString(); err == nil {
-				var run types.JobRun
-				if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &run) == nil {
-					if run.JobID != "" {
-						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryRunsByJobKey(s.prefix, run.JobID)).Member(id).Build())
-					}
-					if run.Status != "" {
-						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryRunsByStatusKey(s.prefix, string(run.Status))).Member(id).Build())
-					}
+		// The indexes of the job and the status first: it takes the run to find them, so a
+		// cleanup that is cut short finds them again.
+		indexes := make(rueidis.Commands, 0, len(byJob)+len(historyRunStatuses))
+		for jobID, runIDs := range byJob {
+			indexes = append(indexes, s.rdb.B().Zrem().Key(HistoryRunsByJobKey(s.prefix, jobID)).Member(runIDs...).Build())
+		}
+		for _, status := range historyRunStatuses {
+			indexes = append(indexes, s.rdb.B().Zrem().Key(HistoryRunsByStatusKey(s.prefix, string(status))).Member(old...).Build())
+		}
+		runs := make(rueidis.Commands, 0, len(old)+1)
+		for _, id := range old {
+			runs = append(runs, s.rdb.B().Del().Key(HistoryRunKey(s.prefix, id)).Build())
+		}
+		runs = append(runs, s.rdb.B().Zrem().Key(HistoryRunsKey(s.prefix)).Member(old...).Build())
+		for _, cmds := range []rueidis.Commands{indexes, runs} {
+			for _, r := range s.rdb.DoMulti(ctx, cmds...) {
+				if err := r.Error(); err != nil {
+					return cleaned, fmt.Errorf("remove runs: %w", err)
 				}
 			}
-
-			s.rdb.DoMulti(ctx, cmds...)
-			cleaned++
 		}
+		cleaned += int64(len(old))
 	}
-
-	// Clean old history events.
-	eventIDs, err := s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(HistoryEventsKey(s.prefix)).Min("-inf").Max(cutoff).Build()).AsStrSlice()
-	if err != nil {
-		return cleaned, err
-	}
-	if len(eventIDs) > 0 {
-		// Read event data to extract JobID/Type for secondary index cleanup.
-		readCmds := make(rueidis.Commands, 0, len(eventIDs))
-		for _, id := range eventIDs {
-			readCmds = append(readCmds, s.rdb.B().Hget().Key(HistoryEventKey(s.prefix, id)).Field("data").Build())
-		}
-		readResults := s.rdb.DoMulti(ctx, readCmds...)
-
-		for i, id := range eventIDs {
-			cmds := make(rueidis.Commands, 0, 5)
-			cmds = append(cmds, s.rdb.B().Del().Key(HistoryEventKey(s.prefix, id)).Build())
-			cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryEventsKey(s.prefix)).Member(id).Build())
-
-			// Clean secondary indexes if we can read the event data.
-			if dataStr, err := readResults[i].ToString(); err == nil {
-				var event types.JobEvent
-				if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &event) == nil {
-					if event.JobID != "" {
-						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryEventsByJobKey(s.prefix, event.JobID)).Member(id).Build())
-					}
-					if event.Type != "" {
-						cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryEventsByTypeKey(s.prefix, string(event.Type))).Member(id).Build())
-					}
-				}
-			}
-
-			s.rdb.DoMulti(ctx, cmds...)
-			cleaned++
-		}
-	}
-
-	return cleaned, nil
 }
 
 // ============================================================

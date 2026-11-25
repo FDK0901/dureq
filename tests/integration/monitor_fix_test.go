@@ -3,6 +3,7 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -84,4 +85,26 @@ func TestNode_Totals(t *testing.T) {
 		ps := nodes[0].PoolStats
 		return ps.TotalFailed == 1 && ps.TotalCompleted >= 3 && ps.TotalSubmitted == ps.TotalCompleted+ps.TotalFailed
 	})
+}
+
+// Finished runs stay until they are cleaned up by hand.
+func TestRunHistory_CleanedUpByHand(t *testing.T) {
+	rec := &recorder{}
+	_, cli := startRecorder(t, "runs.cleanup", rec)
+	ctx := context.Background()
+	job, err := cli.Enqueue(ctx, "runs.cleanup", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	waitStatus(t, cli, job.ID, types.JobStatusCompleted)
+
+	if n, err := cli.CleanupRunHistory(ctx, time.Now().Add(-time.Hour)); err != nil || n != 0 {
+		t.Fatalf("removed %d runs (%v), want none that old", n, err)
+	}
+	if n, err := cli.CleanupRunHistory(ctx, time.Now().Add(time.Second)); err != nil || n != 1 {
+		t.Fatalf("removed %d runs (%v), want 1", n, err)
+	}
+	if got := statusOf(t, cli, job.ID); got != types.JobStatusCompleted {
+		t.Fatalf("job is %s", got)
+	}
 }

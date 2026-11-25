@@ -365,6 +365,14 @@ func (a *APIService) ListHistoryRuns(ctx context.Context, filter store.RunFilter
 	return a.store.ListJobRuns(ctx, filter)
 }
 
+// CleanupRunHistory removes the runs that finished longer than age ago from the history.
+func (a *APIService) CleanupRunHistory(ctx context.Context, age time.Duration) (int64, error) {
+	if age <= 0 {
+		return 0, &ApiError{Msg: "older_than must be positive", StatusCode: http.StatusBadRequest}
+	}
+	return a.store.Cleanup(ctx, time.Now().Add(-age))
+}
+
 func (a *APIService) ListHistoryEvents(ctx context.Context, filter store.EventFilter) ([]types.JobEvent, int, error) {
 	return a.store.ListJobEvents(ctx, filter)
 }

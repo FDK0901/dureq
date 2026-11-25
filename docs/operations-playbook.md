@@ -207,3 +207,13 @@ State transitions are recorded per job and workflow:
 Archival is off by default: jobs are kept until they are deleted. With
 `WithRetentionPeriod(d)`, completed/failed/dead/cancelled jobs are deleted once they have
 not been updated for `d` (a negative `d` means 7 days, 0 means off). Runs on the leader node.
+
+The run history is separate from that and is kept, too, until you clean it up:
+
+- by hand: `client.CleanupRunHistory(ctx, time.Now().Add(-30*24*time.Hour))` or
+  `DELETE /api/history/runs?older_than=720h`, which answers `{"removed": 1234}`;
+- or regularly: with `WithRunHistoryRetention(30*24*time.Hour)` the leader removes runs once they finished longer ago
+  than that (dureqd: `runHistoryRetentionHours`). It looks every hour, and when a node becomes the leader. Off by
+  default.
+
+Either removes finished runs only. Jobs, their audit trails and their active runs are left alone.

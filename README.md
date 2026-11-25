@@ -489,6 +489,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `POST`   | `/api/queues/{tier}/resume` | Resume a queue                     |
 | `GET`    | `/api/dlq`                  | Dead letter queue                  |
 | `GET`    | `/api/history/runs`         | Historical runs (filterable)       |
+| `DELETE` | `/api/history/runs`         | Remove runs (`?older_than=720h`)   |
 | `GET`    | `/api/history/events`       | Historical events                  |
 | `GET`    | `/api/runs/{id}`            | A run, active or finished          |
 | `GET`    | `/api/search/jobs`          | Search by payload JSONPath         |
@@ -536,6 +537,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `dureq.WithPriorityTiers(tiers)`  | -              | Custom priority tier mapping |
 | `dureq.WithGroupAggregation(cfg)` | disabled       | Enable group aggregation     |
 | `dureq.WithRetentionPeriod(d)`    | off            | Retention for completed jobs |
+| `dureq.WithRunHistoryRetention(d)` | off           | Retention for finished runs  |
 | `dureq.WithLogger(logger)`        | -              | Custom logger                |
 
 ### Client Options

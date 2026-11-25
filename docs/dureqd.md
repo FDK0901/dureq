@@ -48,6 +48,7 @@ See [configs/config.yaml](../configs/config.yaml) for a fully annotated sample.
 | `dureqd.mode` | string | `full` | Subsystem mode (see below) |
 | `dureqd.handlers` | []string | all | Handler filter list |
 | `dureqd.drainTimeoutMs` | int | `30000` | Shutdown drain timeout (ms) |
+| `dureqd.runHistoryRetentionHours` | int | `0` | Remove finished runs from the run history after so many hours; 0 = only by hand |
 
 ### Modes
 

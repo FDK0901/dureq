@@ -299,6 +299,30 @@ func TestHistoryRuns_OldIndexIsCorrected(t *testing.T) {
 	}
 }
 
+func TestCleanupRunHistory(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	saveRun(t, st, "old", types.RunStatusSucceeded, 50*time.Hour)
+	saveRun(t, st, "new", types.RunStatusSucceeded, time.Hour)
+	for _, query := range []string{"", "?older_than=", "?older_than=30", "?older_than=0s", "?older_than=-24h"} {
+		if code := call(t, srv, http.MethodDelete, "/api/history/runs"+query, nil); code != http.StatusBadRequest {
+			t.Errorf("%q: status %d, want 400", query, code)
+		}
+	}
+	if ids, total := listRuns(t, srv, ""); ids != "new old" || total != 2 {
+		t.Fatalf("runs after bad requests: %q of %d", ids, total)
+	}
+
+	var answer struct {
+		Removed int `json:"removed"`
+	}
+	if code := call(t, srv, http.MethodDelete, "/api/history/runs?older_than=24h", &answer); code != http.StatusOK || answer.Removed != 1 {
+		t.Fatalf("status %d, removed %d, want 200 and 1", code, answer.Removed)
+	}
+	if ids, total := listRuns(t, srv, ""); ids != "new" || total != 1 {
+		t.Fatalf("runs left: %q of %d", ids, total)
+	}
+}
+
 func TestGetRun_FinishedRun(t *testing.T) {
 	st, srv := newTestAPI(t, nil)
 	saveRun(t, st, "done", types.RunStatusFailed, time.Minute)

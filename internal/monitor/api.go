@@ -78,6 +78,7 @@ func (a *API) registerRoutes() {
 
 	// History
 	a.mux.HandleFunc("GET /api/history/runs", a.listHistoryRuns)
+	a.mux.HandleFunc("DELETE /api/history/runs", a.cleanupRunHistory)
 	a.mux.HandleFunc("GET /api/history/events", a.listHistoryEvents)
 
 	// DLQ
@@ -437,6 +438,20 @@ func (a *API) listHistoryRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, paginatedResponse{Data: runs, Total: total})
+}
+
+func (a *API) cleanupRunHistory(w http.ResponseWriter, r *http.Request) {
+	age, err := time.ParseDuration(r.URL.Query().Get("older_than"))
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: "older_than must be a duration, such as 720h", StatusCode: http.StatusBadRequest})
+		return
+	}
+	removed, err := a.svc.CleanupRunHistory(r.Context(), age)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int64{"removed": removed})
 }
 
 func (a *API) listHistoryEvents(w http.ResponseWriter, r *http.Request) {

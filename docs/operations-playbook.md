@@ -231,4 +231,5 @@ Nothing that is yet to be done is ever trimmed:
 
 - Work streams: the leader removes messages that have been processed, and only those.
 - Events that the orchestrator has to see (`events:orchestrator`): each is removed once it has been processed.
+- The dead letter queue keeps every entry. It is limited only if `DLQStreamMaxLen` is set.
 - The event stream is limited to about `EventStreamMaxLen` events, as it is a history only.

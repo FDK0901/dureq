@@ -431,6 +431,40 @@ func TestCompleteRun_TriedAgain(t *testing.T) {
 	}
 }
 
+// The dead letter queue keeps every job: for some it is all there is left of them.
+func TestDLQ_KeepsEveryJob(t *testing.T) {
+	st, _ := newTestAPI(t, nil)
+	ctx := context.Background()
+	rdb := st.Client()
+	const n = 10500
+	seed := make(rueidis.Commands, 0, n)
+	for range n {
+		seed = append(seed, rdb.B().Xadd().Key(store.DLQStreamKey(st.Prefix())).Id("*").FieldValue().FieldValue("job_id", "old").Build())
+	}
+	rdb.DoMulti(ctx, seed...)
+	if err := st.DispatchToDLQ(ctx, &types.WorkMessage{JobID: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := rdb.Do(ctx, rdb.B().Xlen().Key(store.DLQStreamKey(st.Prefix())).Build()).AsInt64()
+	if err != nil || got != n+1 {
+		t.Errorf("%d entries (%v), want %d", got, err, n+1)
+	}
+
+	cfg := st.Config()
+	cfg.DLQStreamMaxLen = 1000
+	limited, err := store.NewRedisStore(rdb, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := limited.DispatchToDLQ(ctx, &types.WorkMessage{JobID: "new"}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = rdb.Do(ctx, rdb.B().Xlen().Key(store.DLQStreamKey(st.Prefix())).Build()).AsInt64()
+	if err != nil || got > 1200 {
+		t.Errorf("%d entries (%v) with a limit of 1000", got, err)
+	}
+}
+
 // A scan goes over more than one chunk of the stream, and over the time span asked for.
 func TestListJobEvents_LongStream(t *testing.T) {
 	st, _ := newTestAPI(t, nil)

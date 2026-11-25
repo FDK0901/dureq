@@ -20,7 +20,8 @@ type RedisStoreConfig struct {
 	// the orchestrator has to see is kept apart until it has. Default: 50000.
 	EventStreamMaxLen int64
 
-	// DLQStreamMaxLen is the max length of the DLQ stream. Default: 10000.
+	// DLQStreamMaxLen, if set, is the max length of the DLQ stream: beyond it, the oldest
+	// entries are dropped. Default: 0, which keeps all.
 	DLQStreamMaxLen int64
 
 	// ResultTTL is the TTL for job result entries. Default: 1h.
@@ -98,9 +99,6 @@ func (c *RedisStoreConfig) defaults() {
 	}
 	if c.EventStreamMaxLen == 0 {
 		c.EventStreamMaxLen = 50000
-	}
-	if c.DLQStreamMaxLen == 0 {
-		c.DLQStreamMaxLen = 10000
 	}
 	if c.ResultTTL == 0 {
 		c.ResultTTL = 1 * time.Hour

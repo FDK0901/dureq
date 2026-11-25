@@ -116,9 +116,11 @@ func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *type
 
 // DispatchToDLQ adds a message to the dead letter queue stream.
 func (s *RedisStore) DispatchToDLQ(ctx context.Context, wm *types.WorkMessage) error {
-	_, err := s.rdb.Do(ctx, s.rdb.B().Xadd().Key(DLQStreamKey(s.prefix)).
-		Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.DLQStreamMaxLen, 10)).
-		Id("*").FieldValue().
+	add := s.rdb.B().Xadd().Key(DLQStreamKey(s.prefix)).Id("*")
+	if s.cfg.DLQStreamMaxLen > 0 {
+		add = s.rdb.B().Xadd().Key(DLQStreamKey(s.prefix)).Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.DLQStreamMaxLen, 10)).Id("*")
+	}
+	_, err := s.rdb.Do(ctx, add.FieldValue().
 		FieldValue("run_id", wm.RunID).
 		FieldValue("job_id", wm.JobID).
 		FieldValue("task_type", string(wm.TaskType)).

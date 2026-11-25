@@ -670,6 +670,8 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		Status:    types.RunStatusRunning,
 		Attempt:   work.Attempt,
 		StartedAt: now,
+
+		OperationKey: work.OperationKey,
 	}
 	w.store.SaveRun(w.ctx, run)
 

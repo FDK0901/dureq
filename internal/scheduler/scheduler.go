@@ -30,6 +30,9 @@ const (
 	headerScheduledAt = "x-dureq-scheduled-at"
 )
 
+// headerOperationKey sets the operation key of a work message.
+const headerOperationKey = "x-dureq-operation-key"
+
 // Config holds scheduler configuration.
 type Config struct {
 	Store        *store.RedisStore
@@ -555,15 +558,25 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 				retryPolicy = types.DefaultRetryPolicy()
 			}
 
-			attempt := lostAttempt(job, run, retryPolicy.MaxAttempts)
+			recurring := job.Schedule.Type.IsRecurring()
+			maxAttempts := retryPolicy.MaxAttempts
+			if recurring && job.DLQAfter != nil && *job.DLQAfter < maxAttempts {
+				maxAttempts = *job.DLQAfter
+			}
+			attempt := lostAttempt(job, run, maxAttempts)
 			switch {
 			case job.Status == types.JobStatusDead || job.Status == types.JobStatusCancelled:
 				// The job ended while this run was still going and gave up its unique
 				// key, so the run is dropped rather than redispatched.
 
-			case attempt < retryPolicy.MaxAttempts:
+			case attempt < maxAttempts:
 				// Auto-recover: redispatch.
-				prevStatus := job.Status
+				prevStatus, prevAttempt := job.Status, job.Attempt
+				if recurring {
+					// The lost run has used up an attempt, or else a firing that takes
+					// its worker down would be redispatched forever.
+					attempt++
+				}
 				job.Attempt = attempt
 				job.Status = types.JobStatusPending
 				job.LastError = &errMsg
@@ -573,9 +586,18 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 					s.logger.Error().String("job_id", run.JobID).Err(updateErr).Msg("scheduler: failed to update orphaned job for auto-recovery")
 					continue
 				}
-				if dispErr := s.dispatcher.Dispatch(ctx, job, job.Attempt); dispErr != nil {
+				// It is the same operation as the lost run, whose message may yet be
+				// reclaimed: the ledger lets only one of them complete.
+				recovered := *job
+				if run.OperationKey != "" {
+					recovered.Headers = make(map[string]string, len(job.Headers)+1)
+					maps.Copy(recovered.Headers, job.Headers)
+					recovered.Headers[headerOperationKey] = run.OperationKey
+				}
+				if dispErr := s.dispatcher.Dispatch(ctx, &recovered, job.Attempt); dispErr != nil {
 					s.logger.Error().String("job_id", run.JobID).Err(dispErr).Msg("scheduler: dispatch failed for orphan recovery, rolling back")
 					job.Status = prevStatus
+					job.Attempt = prevAttempt
 					job.UpdatedAt = time.Now()
 					s.store.UpdateJob(ctx, job, newRev)
 					continue
@@ -635,13 +657,14 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 //
 // A recurring job can have several firings going, so there it is the run's
 // attempt that counts. Versions before v0.2.5 counted a recurring job's attempts
-// up over its whole life; a run that has used up maxAttempts by that count goes
-// by the failures since the job's last success instead.
+// up over its whole life. A run with more attempts than an execution can have, or
+// one that such a version started at the limit (it did not record the operation),
+// goes by the failures since the job's last success instead.
 func lostAttempt(job *types.Job, run *types.JobRun, maxAttempts int) int {
 	if !job.Schedule.Type.IsRecurring() {
 		return job.Attempt
 	}
-	if run.Attempt >= maxAttempts {
+	if run.Attempt > maxAttempts || (run.Attempt == maxAttempts && run.OperationKey == "") {
 		return min(run.Attempt, job.ConsecutiveErrors)
 	}
 	return run.Attempt

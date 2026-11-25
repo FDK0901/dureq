@@ -105,7 +105,7 @@ func TestProcessScheduleEntry_DuplicateFiring_KeepsAttempt(t *testing.T) {
 }
 
 // Orphan recovery of a recurring job goes by the attempts of the run that was
-// lost, not by what is stored on the job.
+// lost, not by what is stored on the job. The lost run counts as one of them.
 func TestCheckOrphanedRuns_RecurringJob_GoesByRunAttempt(t *testing.T) {
 	for _, tc := range []struct {
 		name              string
@@ -115,11 +115,12 @@ func TestCheckOrphanedRuns_RecurringJob_GoesByRunAttempt(t *testing.T) {
 		wantStatus        types.JobStatus
 		wantAttempt       string // of the recovery message
 	}{
-		{"first attempt lost", 0, 0, 0, types.JobStatusPending, "0"},
-		{"last attempt lost", 2, 2, 2, types.JobStatusPending, "2"},
-		{"other firings failed meanwhile", 0, 3, 3, types.JobStatusPending, "0"},
-		{"count carried over from before v0.2.5", 63, 63, 0, types.JobStatusPending, "0"},
-		{"carried over, failed once since the last success", 63, 63, 1, types.JobStatusPending, "1"},
+		{"first attempt lost", 0, 0, 0, types.JobStatusPending, "1"},
+		{"last attempt lost", 2, 2, 2, types.JobStatusPending, "3"},
+		{"other firings failed meanwhile", 0, 3, 3, types.JobStatusPending, "1"},
+		{"count carried over from before v0.2.5", 63, 63, 0, types.JobStatusPending, "1"},
+		{"carried over, exactly at the limit", 3, 3, 0, types.JobStatusPending, "1"},
+		{"carried over, failed once since the last success", 63, 63, 1, types.JobStatusPending, "2"},
 		{"used up", 3, 3, 3, types.JobStatusDead, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

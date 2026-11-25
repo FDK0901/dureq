@@ -414,6 +414,7 @@ type JobRun struct {
 	Duration        time.Duration   `json:"duration,omitempty"`
 	LastHeartbeatAt *time.Time      `json:"last_heartbeat_at,omitempty"`
 	Progress        json.RawMessage `json:"progress,omitempty"` // user-reported progress data
+	OperationKey    string          `json:"operation_key,omitempty"` // the logical operation this run executes
 }
 
 // ScheduleEntry is the KV entry the leader's scheduler scans for due jobs.

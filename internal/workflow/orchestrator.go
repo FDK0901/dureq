@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -178,6 +179,8 @@ func (o *Orchestrator) processStreamEvent(ctx context.Context, entry rueidis.XRa
 		handlerErr = o.handleChildWorkflowCompleted(ctx, event)
 	case types.EventWorkflowFailed:
 		handlerErr = o.handleChildWorkflowFailed(ctx, event)
+	case types.EventWorkflowStarted:
+		handlerErr = o.handleWorkflowStarted(ctx, event)
 	case types.EventWorkflowSignalReceived:
 		o.handleWorkflowSignal(ctx, event)
 	case types.EventWorkflowResumed:
@@ -923,6 +926,35 @@ func (o *Orchestrator) ensureWorkflowJobs(ctx context.Context, wfID string) erro
 	}
 	o.markChecked(wfID)
 	return nil
+}
+
+// handleWorkflowStarted starts the root tasks that only the orchestrator can start: those
+// that are workflows of their own.
+func (o *Orchestrator) handleWorkflowStarted(ctx context.Context, event types.JobEvent) error {
+	wf, rev, err := o.store.GetWorkflow(ctx, event.JobID)
+	if errors.Is(err, types.ErrWorkflowNotFound) {
+		return nil // deleted in the meantime
+	}
+	if err != nil {
+		return err
+	}
+	if wf.Status.IsTerminal() || wf.Status == types.WorkflowStatusSuspended {
+		return nil
+	}
+	now := time.Now()
+	started := 0
+	for _, name := range RootTasks(&wf.Definition) {
+		if findTaskDef(&wf.Definition, name).ChildWorkflowDef != nil && wf.Tasks[name].Status == types.JobStatusPending {
+			o.dispatchWorkflowTask(ctx, wf, name, &now)
+			started++
+		}
+	}
+	if started == 0 {
+		return nil
+	}
+	wf.UpdatedAt = now
+	_, err = o.store.UpdateWorkflow(ctx, wf, rev)
+	return err
 }
 
 // resolveResultFromPayload builds the payload for a task that has ResultFrom set.

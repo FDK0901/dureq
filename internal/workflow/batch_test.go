@@ -363,7 +363,7 @@ func TestWorkflow_ReservedButNotStarted_IsStarted(t *testing.T) {
 		wf.Tasks[name] = types.WorkflowTaskState{Name: name, Status: types.JobStatusPending}
 	}
 	InitPendingDeps(wf)
-	jobs := ReserveTasks(wf, []string{"a", "b", "c"}, now)
+	jobs := ReserveRootTasks(wf, now)
 	if _, err := st.SaveWorkflow(ctx, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -396,5 +396,61 @@ func TestBatch_UnknownItem_IsIgnored(t *testing.T) {
 	}
 	if got := getBatch(t, st, batch.ID); got.CompletedItems != 0 || got.RunningItems != 2 {
 		t.Fatalf("%d completed, %d running", got.CompletedItems, got.RunningItems)
+	}
+}
+
+// newWorkflow stores a workflow with nothing started.
+func newWorkflow(t *testing.T, st *store.RedisStore, def types.WorkflowDefinition) *types.WorkflowInstance {
+	t.Helper()
+	wf := &types.WorkflowInstance{ID: xid.New().String(), WorkflowName: def.Name, Definition: def, Status: types.WorkflowStatusRunning, Attempt: 1, Tasks: map[string]types.WorkflowTaskState{}, CreatedAt: time.Now()}
+	for _, task := range def.Tasks {
+		wf.Tasks[task.Name] = types.WorkflowTaskState{Name: task.Name, Status: types.JobStatusPending}
+	}
+	InitPendingDeps(wf)
+	if _, err := st.SaveWorkflow(context.Background(), wf); err != nil {
+		t.Fatalf("save workflow: %v", err)
+	}
+	return wf
+}
+
+func getWorkflow(t *testing.T, st *store.RedisStore, id string) *types.WorkflowInstance {
+	t.Helper()
+	wf, _, err := st.GetWorkflow(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get workflow: %v", err)
+	}
+	return wf
+}
+
+// A child workflow at the root is started once, however often the event comes. Root tasks
+// that are jobs are left to the client.
+func TestWorkflowStarted_StartsChildWorkflowsOnce(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	inner := &types.WorkflowDefinition{Name: "inner", Tasks: []types.WorkflowTask{{Name: "x", TaskType: "t"}, {Name: "y", TaskType: "t", DependsOn: []string{"x"}}}}
+	wf := newWorkflow(t, st, types.WorkflowDefinition{Name: "outer", Tasks: []types.WorkflowTask{
+		{Name: "child", ChildWorkflowDef: inner}, {Name: "plain", TaskType: "t"}, {Name: "after", ChildWorkflowDef: inner, DependsOn: []string{"child"}},
+	}})
+	for range 2 {
+		event := types.JobEvent{Type: types.EventWorkflowStarted, JobID: wf.ID}
+		if err := newTestOrchestrator(st).handleWorkflowStarted(ctx, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := getWorkflow(t, st, wf.ID)
+	if got.Tasks["plain"].Status != types.JobStatusPending || got.Tasks["after"].Status != types.JobStatusPending {
+		t.Errorf("tasks %+v", got.Tasks)
+	}
+	all, err := st.ListWorkflows(ctx)
+	if err != nil || len(all) != 2 {
+		t.Fatalf("%d workflows (%v), want the two", len(all), err)
+	}
+	child := getWorkflow(t, st, got.Tasks["child"].ChildWorkflowID)
+	if count := dispatched(t, st); len(count) != 1 || count[child.Tasks["x"].JobID] != 1 {
+		t.Errorf("dispatched %v, want x of the child once", count)
+	}
+	// It is gone by the time the event comes.
+	if err := newTestOrchestrator(st).handleWorkflowStarted(ctx, types.JobEvent{JobID: "none"}); err != nil {
+		t.Errorf("event of a workflow that is gone: %v", err)
 	}
 }

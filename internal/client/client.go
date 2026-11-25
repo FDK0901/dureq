@@ -733,19 +733,22 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 	}
 
 	// Save workflow instance, with its root tasks (no dependencies) reserved.
-	jobs := workflow.ReserveTasks(wf, rootTasks(&def), now)
+	roots := workflow.ReserveRootTasks(wf, now)
 	if _, err := c.store.SaveWorkflow(ctx, wf); err != nil {
 		return nil, fmt.Errorf("save workflow: %w", err)
 	}
 
-	c.publishEvent(ctx, types.JobEvent{
+	// The event has the orchestrator start the root tasks that are not reserved.
+	err := c.store.PublishEvent(ctx, types.JobEvent{
 		Type:      types.EventWorkflowStarted,
 		JobID:     wf.ID,
 		Timestamp: now,
 	})
-
-	if err := c.startReserved(ctx, jobs); err != nil {
-		c.failWorkflow(ctx, wf.ID, jobs)
+	if len(roots) > 0 {
+		err = c.startReserved(ctx, roots)
+	}
+	if err != nil {
+		c.failWorkflow(ctx, wf.ID, roots)
 		return nil, fmt.Errorf("dispatch workflow: %w", err)
 	}
 	return wf, nil
@@ -1442,17 +1445,6 @@ func resolveTier(tiers []store.TierConfig, priority types.Priority) string {
 		idx = len(tiers) - 1
 	}
 	return tiers[idx].Name
-}
-
-// rootTasks returns task names that have no dependencies (DAG roots).
-func rootTasks(def *types.WorkflowDefinition) []string {
-	var roots []string
-	for _, t := range def.Tasks {
-		if len(t.DependsOn) == 0 {
-			roots = append(roots, t.Name)
-		}
-	}
-	return roots
 }
 
 // readyTasks returns pending task names whose dependencies are all completed.

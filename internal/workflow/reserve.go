@@ -81,6 +81,19 @@ func ReserveTasks(wf *types.WorkflowInstance, names []string, now time.Time) []*
 	return jobs
 }
 
+// ReserveRootTasks reserves the root tasks of a workflow that are jobs. Those that are
+// workflows of their own are left to the orchestrator, which starts them once it learns that
+// the workflow has started.
+func ReserveRootTasks(wf *types.WorkflowInstance, now time.Time) []*types.Job {
+	var names []string
+	for _, name := range RootTasks(&wf.Definition) {
+		if findTaskDef(&wf.Definition, name).ChildWorkflowDef == nil {
+			names = append(names, name)
+		}
+	}
+	return ReserveTasks(wf, names, now)
+}
+
 // batchOnetimeJob returns the job of the onetime task that is reserved.
 func batchOnetimeJob(batch *types.BatchInstance, now time.Time) *types.Job {
 	job := newJob(batch.OnetimeState.JobID, *batch.Definition.OnetimeTaskType, batch.Definition.OnetimePayload, now)

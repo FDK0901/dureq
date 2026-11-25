@@ -80,12 +80,16 @@ func (d *Dispatcher) dispatch(ctx context.Context, job *types.Job, attempt int) 
 	if fid, ok := job.Headers["x-dureq-firing-id"]; ok {
 		msg.FiringID = fid
 	}
-	// Derive OperationKey: FiringID for scheduled, JobID for immediate.
+	// Derive OperationKey: FiringID for scheduled, JobID for immediate. Any other
+	// execution of a recurring job (buffered or backfilled firing, resume, manual
+	// retry) is one of many under its JobID, so it goes by its RunID.
 	// Workflow orchestrator overrides via x-dureq-operation-key header.
 	if opk, ok := job.Headers["x-dureq-operation-key"]; ok {
 		msg.OperationKey = opk
 	} else if msg.FiringID != "" {
 		msg.OperationKey = msg.FiringID
+	} else if job.Schedule.Type.IsRecurring() {
+		msg.OperationKey = msg.RunID
 	} else {
 		msg.OperationKey = job.ID
 	}

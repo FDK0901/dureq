@@ -1116,6 +1116,11 @@ func (w *Worker) drainOverlapBuffer(jobID string, job *types.Job) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
+	// If another run is active, that one drains the buffer when it is done.
+	if hasActive, _ := w.store.HasActiveRunForJob(ctx, jobID); hasActive {
+		return
+	}
+
 	var found bool
 	var err error
 
@@ -1129,12 +1134,6 @@ func (w *Worker) drainOverlapBuffer(jobID string, job *types.Job) {
 	}
 
 	if err != nil || !found {
-		return
-	}
-
-	// Check if another run started in the meantime.
-	hasActive, _ := w.store.HasActiveRunForJob(ctx, jobID)
-	if hasActive {
 		return
 	}
 

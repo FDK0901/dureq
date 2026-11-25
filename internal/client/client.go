@@ -1169,6 +1169,8 @@ func (c *Client) dispatchJob(ctx context.Context, job *types.Job) error {
 	} else if fid, ok := job.Headers["x-dureq-firing-id"]; ok {
 		msg.FiringID = fid
 		msg.OperationKey = fid
+	} else if job.Schedule.Type.IsRecurring() {
+		msg.OperationKey = msg.RunID
 	} else {
 		msg.OperationKey = job.ID
 	}

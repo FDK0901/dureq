@@ -2014,52 +2014,70 @@ func (s *RedisStore) scanJobsByPayloadPath(ctx context.Context, jsonPath string,
 		indexKey = JobsByTaskTypeKey(s.prefix, taskType)
 	}
 
-	// Page by score rather than by rank: ranks shift while jobs are being created
-	// and deleted. A page starts at the last score of the previous one, past the
-	// jobs of that score that have been read.
+	return s.scanIndex(ctx, indexKey, "newest", jsonPathSearchChunkSize, func(ids []string) (bool, error) {
+		cmds := make(rueidis.Commands, 0, len(ids))
+		for _, id := range ids {
+			cmds = append(cmds, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, id)).Path(fullPath).Build())
+		}
+		var matches []string
+		for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+			if err := r.Error(); err != nil && !rueidis.IsRedisNil(err) {
+				return false, fmt.Errorf("search payload of job %s: %w", ids[i], err)
+			}
+			if matchJSONGetResult(r, valueStr) {
+				matches = append(matches, ids[i])
+			}
+		}
+		if len(matches) == 0 {
+			return true, nil
+		}
+		return visit(matches)
+	})
+}
+
+// scanIndex passes the members of a sorted set to visit, each of them once and chunk by
+// chunk, from the newest or the "oldest" on, until visit returns false or an error.
+func (s *RedisStore) scanIndex(ctx context.Context, indexKey, sort string, chunk int64, visit func(ids []string) (bool, error)) error {
+	// Page by score rather than by rank: ranks shift while members are being added and
+	// removed. A page starts at the last score of the previous one, past the members of
+	// that score that have been read.
 	seen := make(map[string]struct{})
-	upper, offset := "+inf", int64(0)
+	bound, offset := "+inf", int64(0)
+	if sort == "oldest" {
+		bound = "-inf"
+	}
 	for {
-		page, err := s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(upper).Min("-inf").
-			Withscores().Limit(offset, jsonPathSearchChunkSize).Build()).AsZScores()
+		var cmd rueidis.Completed
+		if sort == "oldest" {
+			cmd = s.rdb.B().Zrangebyscore().Key(indexKey).Min(bound).Max("+inf").Withscores().Limit(offset, chunk).Build()
+		} else {
+			cmd = s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(bound).Min("-inf").Withscores().Limit(offset, chunk).Build()
+		}
+		page, err := s.rdb.Do(ctx, cmd).AsZScores()
 		if err != nil {
-			return fmt.Errorf("list jobs: %w", err)
+			return fmt.Errorf("scan index: %w", err)
 		}
 
 		ids := make([]string, 0, len(page))
-		cmds := make(rueidis.Commands, 0, len(page))
 		for _, z := range page {
 			if _, ok := seen[z.Member]; ok {
 				continue
 			}
 			seen[z.Member] = struct{}{}
 			ids = append(ids, z.Member)
-			cmds = append(cmds, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, z.Member)).Path(fullPath).Build())
 		}
-
-		var matches []string
-		if len(cmds) > 0 {
-			for i, r := range s.rdb.DoMulti(ctx, cmds...) {
-				if err := r.Error(); err != nil && !rueidis.IsRedisNil(err) {
-					return fmt.Errorf("search payload of job %s: %w", ids[i], err)
-				}
-				if matchJSONGetResult(r, valueStr) {
-					matches = append(matches, ids[i])
-				}
-			}
-		}
-		if len(matches) > 0 {
-			if more, err := visit(matches); err != nil || !more {
+		if len(ids) > 0 {
+			if more, err := visit(ids); err != nil || !more {
 				return err
 			}
 		}
 
-		if len(page) < jsonPathSearchChunkSize {
+		if int64(len(page)) < chunk {
 			return nil
 		}
 		last := page[len(page)-1].Score
-		if next := strconv.FormatFloat(last, 'f', -1, 64); next != upper {
-			upper, offset = next, 0
+		if next := strconv.FormatFloat(last, 'f', -1, 64); next != bound {
+			bound, offset = next, 0
 		}
 		for i := len(page) - 1; i >= 0 && page[i].Score == last; i-- {
 			offset++

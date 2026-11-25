@@ -33,6 +33,10 @@ func (s *RedisStore) ListJobsPaginated(ctx context.Context, filter JobFilter) ([
 		indexKey = JobsByTagKey(s.prefix, *filter.Tag)
 	}
 
+	if filter.Search != nil && *filter.Search != "" {
+		return s.searchJobs(ctx, indexKey, filter)
+	}
+
 	// Total count from this index.
 	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64()
 	if err != nil {
@@ -65,23 +69,43 @@ func (s *RedisStore) ListJobsPaginated(ctx context.Context, filter JobFilter) ([
 		return nil, 0, err
 	}
 
-	// Apply search filter (substring match on ID or TaskType) in memory.
-	// When search is active, total from the index is inaccurate because
-	// filtering happens post-fetch. Signal this with total=-1.
-	if filter.Search != nil && *filter.Search != "" {
-		search := strings.ToLower(*filter.Search)
-		filtered := jobs[:0]
-		for _, j := range jobs {
-			if strings.Contains(strings.ToLower(j.ID), search) ||
-				strings.Contains(strings.ToLower(string(j.TaskType)), search) {
-				filtered = append(filtered, j)
-			}
-		}
-		jobs = filtered
-		total = -1
-	}
-
 	return jobs, int(total), nil
+}
+
+const (
+	jobSearchChunkSize = 500
+	// maxJobSearchScan bounds the work of a search: jobs past it are not looked at.
+	maxJobSearchScan = 100_000
+)
+
+// searchJobs returns the page of the jobs whose ID or task type contains filter.Search,
+// and how many there are. It reads the jobs of the index one by one.
+func (s *RedisStore) searchJobs(ctx context.Context, indexKey string, filter JobFilter) ([]types.Job, int, error) {
+	search := strings.ToLower(*filter.Search)
+	var page []types.Job
+	total, scanned := 0, 0
+	err := s.scanIndex(ctx, indexKey, filter.Sort, jobSearchChunkSize, func(ids []string) (bool, error) {
+		jobs, err := s.hydrateJobValues(ctx, ids)
+		if err != nil {
+			return false, err
+		}
+		for _, j := range jobs {
+			if !strings.Contains(strings.ToLower(j.ID), search) &&
+				!strings.Contains(strings.ToLower(string(j.TaskType)), search) {
+				continue
+			}
+			if total >= filter.Offset && len(page) < filter.Limit {
+				page = append(page, j)
+			}
+			total++
+		}
+		scanned += len(ids)
+		return scanned < maxJobSearchScan, ctx.Err()
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("search jobs: %w", err)
+	}
+	return page, total, nil
 }
 
 // ============================================================

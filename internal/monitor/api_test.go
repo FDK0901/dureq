@@ -474,3 +474,68 @@ func TestGetRun_FinishedRun(t *testing.T) {
 		t.Fatalf("no such run: status %d", code)
 	}
 }
+
+func TestListJobs_SearchIsPagedAndCounted(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	for i := range 30 {
+		taskType := types.TaskType("mail.Send")
+		if i%3 == 0 {
+			taskType = "image.resize"
+		}
+		createJob(t, st, fmt.Sprintf("job-%02d", i), taskType, types.JobStatusCompleted, time.Duration(i)*time.Minute)
+	}
+	createJob(t, st, "resized-by-name", "other", types.JobStatusDead, time.Hour)
+
+	find := func(query string) (string, int) {
+		t.Helper()
+		var page struct {
+			Data  []types.Job `json:"data"`
+			Total int         `json:"total"`
+		}
+		get(t, srv, "/api/jobs?"+query, &page)
+		var ids []string
+		for _, j := range page.Data {
+			ids = append(ids, j.ID)
+		}
+		return strings.Join(ids, " "), page.Total
+	}
+	for _, tc := range []struct {
+		query, want string
+		total       int
+	}{
+		{"search=RESIZE&limit=4", "job-00 job-03 job-06 job-09", 11},
+		{"search=resize&limit=4&offset=8", "job-24 job-27 resized-by-name", 11},
+		{"search=resize&limit=2&sort=oldest", "resized-by-name job-27", 11},
+		{"search=resize&status=dead", "resized-by-name", 1},
+		{"search=job-1&limit=2", "job-10 job-11", 10},
+		{"search=nothing", "", 0},
+		{"limit=1", "job-00", 31},
+	} {
+		if got, total := find(tc.query); got != tc.want || total != tc.total {
+			t.Errorf("%s: %q of %d, want %q of %d", tc.query, got, total, tc.want, tc.total)
+		}
+	}
+}
+
+// More jobs than a chunk, and many with the same score.
+func TestListJobs_SearchOverManyJobs(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	ctx := context.Background()
+	const n = 1300
+	created := time.Now()
+	for i := range n {
+		if _, err := st.CreateJob(ctx, &types.Job{ID: fmt.Sprintf("j%04d", i), TaskType: "t.x", Status: types.JobStatusCompleted, CreatedAt: created}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sort := range []string{"newest", "oldest"} {
+		var page struct {
+			Data  []types.Job `json:"data"`
+			Total int         `json:"total"`
+		}
+		get(t, srv, "/api/jobs?search=t.x&limit=100&offset=1250&sort="+sort, &page)
+		if page.Total != n || len(page.Data) != 50 {
+			t.Fatalf("%s: %d of %d, want 50 of %d", sort, len(page.Data), page.Total, n)
+		}
+	}
+}

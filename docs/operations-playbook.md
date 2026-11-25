@@ -132,6 +132,9 @@ Bulk operations: `POST /api/{jobs,workflows,batches}/bulk/{cancel,retry,delete}`
 
 Search by payload JSONPath: `GET /api/search/{jobs,workflows,batches}?path=field&value=val`
 
+`GET /api/jobs?search=text` finds jobs by a part of their ID or task type. It reads the jobs one by one, up to
+100,000 of them, so narrow it down with `status`, `task_type` or `tag` if there are many.
+
 `GET /api/history/events` reads the event stream, which keeps about the last `EventStreamMaxLen` events (50,000).
 
 ## Repair Operations

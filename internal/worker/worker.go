@@ -458,9 +458,18 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		return
 	}
 
+	job, rev, jobErr := w.store.GetJob(w.ctx, work.JobID)
+
+	// What is still queued of a cancelled job does not run any more. Workflow and
+	// batch jobs are left to the orchestrator, which waits for their outcome.
+	if jobErr == nil && job.Status == types.JobStatusCancelled && job.WorkflowID == nil && job.BatchID == nil {
+		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: job is cancelled, dropping message")
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		return
+	}
+
 	// ScheduleToStart timeout check.
 	if !work.DispatchedAt.IsZero() {
-		job, rev, jobErr := w.store.GetJob(w.ctx, work.JobID)
 		if jobErr == nil && job.ScheduleToStartTimeout != nil {
 			waited := time.Since(work.DispatchedAt)
 			if waited > job.ScheduleToStartTimeout.Std() {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/FDK0901/dureq/internal/client"
 	"github.com/FDK0901/dureq/internal/monitor"
+	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
 )
 
@@ -125,26 +126,38 @@ func TestUniqueKey_CancelledWhileRunning_IsNotRevived(t *testing.T) {
 	}
 }
 
-// No leftover run of a cancelled job changes its status: one that succeeds does not
-// complete it, and so one that fails after that does not turn it into a retry.
+// No run that was going when its job was cancelled changes the status of the job: one
+// that succeeds does not complete it, and so one that fails after that does not turn
+// it into a retry.
 func TestUniqueKey_CancelledJob_LeftoverRuns(t *testing.T) {
-	rec := &recorder{fail: func(run int) error {
+	started := make(chan struct{}, 2)
+	proceed := make(chan struct{})
+	rec := &recorder{}
+	rec.fail = func(run int) error {
+		if run > 1 {
+			return nil // a retry, which there must not be
+		}
+		started <- struct{}{}
+		<-proceed // whatever the context says
 		if run == 0 {
 			return nil
 		}
 		return errBoom
-	}}
+	}
 	_, cli := startRecorder(t, "rec.cancelled", rec)
 	job := mustEvery(t, cli, "rec.cancelled", time.Hour, fastRetry(3), "rec-cancelled")
+	for range 2 {
+		dispatchFiring(t, cli, job, 0)
+		<-started
+	}
 	if err := cli.Cancel(context.Background(), job.ID); err != nil {
 		t.Fatalf("cancel: %v", err)
 	}
 	current := mustEvery(t, cli, "rec.cancelled", time.Hour, fastRetry(3), "rec-cancelled")
-
-	for run := 1; run <= 2; run++ {
-		dispatchFiring(t, cli, job, 0)
-		waitFor(t, 10*time.Second, "leftover run", func() bool { return len(rec.seen()) == run })
+	for range 2 {
+		proceed <- struct{}{}
 	}
+
 	time.Sleep(3 * time.Second)
 	if got := statusOf(t, cli, job.ID); got != types.JobStatusCancelled {
 		t.Fatalf("cancelled job is now %s", got)
@@ -155,6 +168,71 @@ func TestUniqueKey_CancelledJob_LeftoverRuns(t *testing.T) {
 	if got := holderOf(t, cli, "rec-cancelled"); got != current.ID {
 		t.Fatalf("key holder = %q, want %s", got, current.ID)
 	}
+}
+
+// What is still queued of a cancelled job does not run: another job may have taken
+// its place under the key.
+func TestUniqueKey_CancelledWhileQueued_DoesNotRun(t *testing.T) {
+	rec := &recorder{}
+	_, cli := startRecorder(t, "rec.queued", rec)
+	job := mustEvery(t, cli, "rec.queued", time.Hour, fastRetry(3), "rec-queued")
+	if err := cli.Cancel(context.Background(), job.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	dispatchFiring(t, cli, job, 0)
+
+	waitFor(t, 10*time.Second, "message dropped", func() bool { return pendingAndUnread(t, cli) == 0 })
+	if n := len(rec.seen()); n != 0 {
+		t.Fatalf("%d executions of a cancelled job, want 0", n)
+	}
+	if got := statusOf(t, cli, job.ID); got != types.JobStatusCancelled {
+		t.Fatalf("cancelled job is now %s", got)
+	}
+}
+
+// Cancelling ends a handler that keeps asking to be repeated.
+func TestCancel_RepeatingHandler_Ends(t *testing.T) {
+	rec := &recorder{fail: func(int) error { return &types.RepeatError{Delay: 200 * time.Millisecond} }}
+	_, cli := startRecorder(t, "rec.repeat", rec)
+	job := mustEvery(t, cli, "rec.repeat", time.Hour, fastRetry(3), "rec-repeat")
+	dispatchFiring(t, cli, job, 0)
+	waitFor(t, 10*time.Second, "repeats", func() bool { return len(rec.seen()) >= 2 })
+	if err := cli.Cancel(context.Background(), job.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	time.Sleep(time.Second) // the run that may be going
+	n := len(rec.seen())
+	time.Sleep(4 * time.Second)
+	if got := len(rec.seen()); got != n {
+		t.Fatalf("%d executions after the cancel", got-n)
+	}
+}
+
+// pendingAndUnread returns how many messages of the work stream are unread or have not
+// been acknowledged.
+func pendingAndUnread(t *testing.T, cli *client.Client) int {
+	t.Helper()
+	ctx := context.Background()
+	rdb := cli.Store().Client()
+	groups, err := rdb.Do(ctx, rdb.B().XinfoGroups().Key(store.WorkStreamKey(cli.Store().Prefix(), "normal")).Build()).ToArray()
+	if err != nil {
+		t.Fatalf("XINFO GROUPS: %v", err)
+	}
+	for _, g := range groups {
+		m, err := g.AsMap()
+		if err != nil {
+			t.Fatalf("XINFO GROUPS: %v", err)
+		}
+		name, pending, lag := m["name"], m["pending"], m["lag"]
+		if n, _ := name.ToString(); n != store.ConsumerGroup {
+			continue
+		}
+		p, _ := pending.AsInt64()
+		l, _ := lag.AsInt64()
+		return int(p + l)
+	}
+	t.Fatal("no consumer group")
+	return 0
 }
 
 // A dead job's leftover firing may put it back on its schedule only if the key

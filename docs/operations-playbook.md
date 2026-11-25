@@ -88,6 +88,7 @@ The monitoring API is enabled with `ModeMonitor`. Key route groups:
 | `GET` | `/api/jobs/{id}` | Get job details |
 | `POST` | `/api/jobs/{id}/cancel` | Cancel a job |
 | `POST` | `/api/jobs/{id}/retry` | Retry a failed/dead job |
+| `POST` | `/api/jobs/{id}/resume` | Resume a paused job |
 | `PUT` | `/api/jobs/{id}/payload` | Update job payload |
 | `DELETE` | `/api/jobs/{id}` | Delete a job |
 

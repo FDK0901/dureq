@@ -226,6 +226,39 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// ResumeJob takes a paused job off hold and runs what it was paused on.
+func (a *APIService) ResumeJob(ctx context.Context, jobID string) error {
+	job, rev, err := a.store.GetJob(ctx, jobID)
+	if err != nil {
+		return &ApiError{Msg: "job not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	if !job.Status.IsPaused() {
+		return &ApiError{Msg: "cannot resume: job is " + string(job.Status), StatusCode: http.StatusConflict}
+	}
+
+	paused := *job
+	now := time.Now()
+	job.Resume(now)
+	newRev, err := a.store.UpdateJob(ctx, job, rev)
+	if err != nil {
+		return err
+	}
+	if err := a.dispatcher.Dispatch(ctx, job, job.Attempt); err != nil {
+		// Rollback: put it on hold again.
+		paused.UpdatedAt = time.Now()
+		a.store.UpdateJob(ctx, &paused, newRev)
+		return fmt.Errorf("dispatch failed: %w", err)
+	}
+
+	a.dispatcher.PublishEvent(types.JobEvent{
+		Type:      types.EventJobResumed,
+		JobID:     jobID,
+		TaskType:  job.TaskType,
+		Timestamp: now,
+	})
+	return nil
+}
+
 func (a *APIService) DeleteJob(ctx context.Context, jobID string) error {
 	// Guard: only delete terminal jobs to prevent orphaned in-flight work.
 	job, _, err := a.store.GetJob(ctx, jobID)

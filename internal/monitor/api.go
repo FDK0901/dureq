@@ -56,6 +56,7 @@ func (a *API) registerRoutes() {
 	a.mux.HandleFunc("DELETE /api/jobs/{jobID}", a.deleteJob)
 	a.mux.HandleFunc("POST /api/jobs/{jobID}/cancel", a.cancelJob)
 	a.mux.HandleFunc("POST /api/jobs/{jobID}/retry", a.retryJob)
+	a.mux.HandleFunc("POST /api/jobs/{jobID}/resume", a.resumeJob)
 
 	// Job history
 	a.mux.HandleFunc("GET /api/jobs/{jobID}/events", a.listJobEvents)
@@ -233,6 +234,15 @@ func (a *API) retryJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]string{"status": "retried", "job_id": jobID})
+}
+
+func (a *API) resumeJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobID")
+	if err := a.svc.ResumeJob(r.Context(), jobID); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "resumed", "job_id": jobID})
 }
 
 func (a *API) deleteJob(w http.ResponseWriter, r *http.Request) {

@@ -421,6 +421,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `DELETE` | `/api/jobs/{id}`         | Delete a job                      |
 | `POST`   | `/api/jobs/{id}/cancel`  | Cancel a running job              |
 | `POST`   | `/api/jobs/{id}/retry`   | Retry a failed job                |
+| `POST`   | `/api/jobs/{id}/resume`  | Resume a paused job               |
 | `PUT`    | `/api/jobs/{id}/payload` | Update job payload                |
 | `GET`    | `/api/jobs/{id}/events`  | Job event history                 |
 | `GET`    | `/api/jobs/{id}/runs`    | Job run history                   |

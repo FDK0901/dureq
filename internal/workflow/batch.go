@@ -272,7 +272,7 @@ func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.Job
 		return o.changeBatch(ctx, batchID, func(batch *types.BatchInstance, now time.Time) *batchStep {
 			state, ok := batch.ItemStates[itemID]
 			// An item that a retry has put back to pending is to run again. (Clients of versions
-			// before v0.2.6 store what they start later, so in a first attempt it may be running.)
+			// before v0.3.0 store what they start later, so in a first attempt it may be running.)
 			retried := state.Status == types.JobStatusPending && batch.Attempt > 1
 			if !ok || retried || staleJob(state.Status, state.JobID, event) {
 				return o.finishIfDone(batch, now)

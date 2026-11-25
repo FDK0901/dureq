@@ -616,7 +616,7 @@ func TestHistoryRuns_RecoveredRunIsNotFailed(t *testing.T) {
 	}
 }
 
-// The index of versions before v0.2.6 has recovered runs among the failed ones.
+// The index of versions before v0.3.0 has recovered runs among the failed ones.
 func TestHistoryRuns_OldIndexIsCorrected(t *testing.T) {
 	st, srv := newTestAPI(t, nil)
 	ctx := context.Background()
@@ -803,7 +803,7 @@ func TestSearchAllJobs(t *testing.T) {
 	}
 }
 
-// Workflows of versions before v0.2.6 have their task names as keys only.
+// Workflows of versions before v0.3.0 have their task names as keys only.
 func TestWorkflow_TaskNames(t *testing.T) {
 	st, srv := newTestAPI(t, nil)
 	_, err := st.SaveWorkflow(context.Background(), &types.WorkflowInstance{

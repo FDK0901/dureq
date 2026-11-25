@@ -98,7 +98,7 @@ func TestEvents_AreKeptUntilProcessed(t *testing.T) {
 	}
 }
 
-// Nodes before v0.2.6 write to the event stream only. What their orchestrator had taken but
+// Nodes before v0.3.0 write to the event stream only. What their orchestrator had taken but
 // not finished counts, too.
 func TestEvents_OfOlderNodes(t *testing.T) {
 	st := newTestStore(t)

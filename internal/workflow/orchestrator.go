@@ -104,7 +104,7 @@ const (
 	eventsPerRead = 500
 	// retryInterval is how often events that could not be processed are tried again.
 	retryInterval = 10 * time.Second
-	// forwardInterval is how often events of nodes before v0.2.6 are looked for.
+	// forwardInterval is how often events of nodes before v0.3.0 are looked for.
 	forwardInterval = 500 * time.Millisecond
 )
 
@@ -348,7 +348,7 @@ func isJobEvent(entry rueidis.XRangeEntry) bool {
 	return false
 }
 
-// forwardLoop has the events of nodes before v0.2.6 processed, too.
+// forwardLoop has the events of nodes before v0.3.0 processed, too.
 func (o *Orchestrator) forwardLoop(ctx context.Context) {
 	for ctx.Err() == nil {
 		n, err := o.store.ForwardEvents(ctx, consumerName, eventsPerRead)
@@ -851,7 +851,7 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 				return nil
 			}
 			// A task that a retry has put back to pending is to run again. (Clients of versions
-			// before v0.2.6 store what they start later, so in a first attempt it may be running.)
+			// before v0.3.0 store what they start later, so in a first attempt it may be running.)
 			if state.Status == types.JobStatusPending && wf.Attempt > 1 {
 				return nil
 			}

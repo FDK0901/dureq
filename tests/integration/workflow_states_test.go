@@ -36,6 +36,30 @@ func childTask(name string, inner types.WorkflowDefinition, deps ...string) type
 	return types.WorkflowTask{Name: name, DependsOn: deps, ChildWorkflowDef: &inner}
 }
 
+// waitChild waits for the task to have a child workflow with a task under way.
+func waitChild(t *testing.T, cli *client.Client, wfID, task string) string {
+	t.Helper()
+	var id string
+	waitFor(t, 10*time.Second, "child workflow", func() bool {
+		wf, _, err := cli.Store().GetWorkflow(context.Background(), wfID)
+		if err != nil || wf.Tasks[task].ChildWorkflowID == "" {
+			return false
+		}
+		id = wf.Tasks[task].ChildWorkflowID
+		child, _, err := cli.Store().GetWorkflow(context.Background(), id)
+		if err != nil {
+			return false
+		}
+		for _, st := range child.Tasks {
+			if st.Status == types.JobStatusRunning {
+				return true
+			}
+		}
+		return false
+	})
+	return id
+}
+
 // A suspended workflow stays so when what is under way ends, and goes on once it is resumed.
 func TestWorkflow_StaysSuspended(t *testing.T) {
 	var c tally
@@ -97,6 +121,177 @@ func TestWorkflow_StaysSuspended(t *testing.T) {
 			waitWorkflow(t, cli, wf.ID, types.WorkflowStatusCompleted)
 			if off := c.not(1, next); len(off) > 0 {
 				t.Errorf("did not run once: %v", off)
+			}
+		})
+	}
+}
+
+// A parent learns of its child workflow whichever way that ends.
+func TestWorkflow_ParentLearnsOfChild(t *testing.T) {
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		if kindOf(id) == "slow" {
+			time.Sleep(12 * time.Second)
+		}
+		return nil
+	})
+	api := newAPI(t, cli)
+	ctx := context.Background()
+	for name, stop := range map[string]func(id string) error{
+		"timeout": nil,
+		"client":  func(id string) error { return cli.CancelWorkflow(ctx, id) },
+		"api":     func(id string) error { return api.CancelWorkflow(ctx, id) },
+		"bulk": func(id string) error {
+			_, err := api.BulkCancelWorkflows(ctx, monitor.BulkRequest{IDs: []string{id}})
+			return err
+		},
+	} {
+		for _, lenient := range []bool{false, true} {
+			p := fmt.Sprintf("%s-%v-", name, lenient)
+			t.Run(p, func(t *testing.T) {
+				t.Parallel()
+				inner := types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "slow")}}
+				if stop == nil {
+					timeout := types.Duration(2 * time.Second)
+					inner.ExecutionTimeout = &timeout
+				}
+				child := childTask("child", inner)
+				child.AllowFailure = lenient
+				wf, err := cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{
+					Name: "outer", Tasks: []types.WorkflowTask{child, tallyTask(p+"after", "child")},
+					Hooks: &types.WorkflowHooks{OnSuccess: tallyHook(p + "success"), OnFailure: tallyHook(p + "failure")},
+				}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				childID := waitChild(t, cli, wf.ID, "child")
+				if stop != nil {
+					if err := stop(childID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				want, hook, after := types.WorkflowStatusFailed, "failure", 0
+				if lenient {
+					want, hook, after = types.WorkflowStatusCompleted, "success", 1
+				}
+				got := waitWorkflow(t, cli, wf.ID, want)
+				if st := got.Tasks["child"]; st.Status != types.JobStatusFailed || st.Error == nil {
+					t.Errorf("task of the child: %+v", st)
+				}
+				time.Sleep(500 * time.Millisecond)
+				if off := c.not(1, []string{p + hook}); len(off) > 0 {
+					t.Errorf("hook did not run once: %v", off)
+				}
+				if off := c.not(after, []string{p + "after"}); len(off) > 0 {
+					t.Errorf("after ran %v, want %d", off, after)
+				}
+			})
+		}
+	}
+}
+
+// A child that fails with its failure allowed does not fail its parent.
+func TestWorkflow_ChildFailureAllowed(t *testing.T) {
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		if id == "bad" {
+			return &types.NonRetryableError{Err: errBoom}
+		}
+		return nil
+	})
+	child := childTask("child", types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("bad")}})
+	child.AllowFailure = true
+	wf, err := cli.EnqueueWorkflow(context.Background(), types.WorkflowDefinition{Name: "outer", Tasks: []types.WorkflowTask{child, tallyTask("after", "child")}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitWorkflow(t, cli, wf.ID, types.WorkflowStatusCompleted)
+	if off := c.not(1, []string{"after"}); len(off) > 0 {
+		t.Errorf("did not run once: %v", off)
+	}
+}
+
+// A child that continues as new is done once the last of its instances is.
+func TestWorkflow_ChildContinuesAsNew(t *testing.T) {
+	for _, outcome := range []types.WorkflowStatus{types.WorkflowStatusCompleted, types.WorkflowStatusFailed} {
+		t.Run(string(outcome), func(t *testing.T) {
+			var c tally
+			cli := startTally(t, "tally.wf", &c, func(id string) error {
+				if id != "again" {
+					return nil
+				}
+				switch {
+				case len(c.not(1, []string{id})) == 0, len(c.not(2, []string{id})) == 0:
+					return &types.ContinueAsNewError{Input: json.RawMessage(`{"id":"again"}`)}
+				case outcome == types.WorkflowStatusFailed:
+					return &types.NonRetryableError{Err: errBoom}
+				}
+				return nil
+			})
+			child := childTask("child", types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("again")}})
+			wf, err := cli.EnqueueWorkflow(context.Background(), types.WorkflowDefinition{Name: "outer", Tasks: []types.WorkflowTask{child, tallyTask("after", "child")}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitWorkflow(t, cli, wf.ID, outcome)
+			after := 0
+			if outcome == types.WorkflowStatusCompleted {
+				after = 1
+			}
+			if off := c.not(3, []string{"again"}); len(off) > 0 {
+				t.Errorf("did not run three times: %v", off)
+			}
+			if off := c.not(after, []string{"after"}); len(off) > 0 {
+				t.Errorf("after ran %v, want %d", off, after)
+			}
+		})
+	}
+}
+
+// Ending a parent ends its child, and that does not change how the parent ended.
+func TestWorkflow_EndOfParentEndsChild(t *testing.T) {
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		if kindOf(id) == "slow" {
+			time.Sleep(12 * time.Second)
+		}
+		return nil
+	})
+	ctx := context.Background()
+	for name, want := range map[string]types.WorkflowStatus{"cancelled": types.WorkflowStatusCancelled, "timeout": types.WorkflowStatusFailed} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			p := name + "-"
+			def := types.WorkflowDefinition{
+				Name: "outer", Hooks: &types.WorkflowHooks{OnFailure: tallyHook(p + "failure")},
+				Tasks: []types.WorkflowTask{childTask("child", types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "slow")}}), tallyTask(p+"after", "child")},
+			}
+			if name == "timeout" {
+				timeout := types.Duration(2 * time.Second)
+				def.ExecutionTimeout = &timeout
+			}
+			wf, err := cli.EnqueueWorkflow(ctx, def, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			childID := waitChild(t, cli, wf.ID, "child")
+			if name == "cancelled" {
+				if err := cli.CancelWorkflow(ctx, wf.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waitWorkflow(t, cli, wf.ID, want)
+			waitWorkflow(t, cli, childID, types.WorkflowStatusCancelled)
+			time.Sleep(time.Second)
+			got := waitWorkflow(t, cli, wf.ID, want)
+			if st := got.Tasks["child"].Status; st != types.JobStatusCancelled {
+				t.Errorf("task of the child is %s, want cancelled", st)
+			}
+			if off := c.not(0, []string{p + "after"}); len(off) > 0 {
+				t.Errorf("ran: %v", off)
+			}
+			if off := c.not(1, []string{p + "failure"}); name == "timeout" && len(off) > 0 {
+				t.Errorf("hook did not run once: %v", off)
 			}
 		})
 	}

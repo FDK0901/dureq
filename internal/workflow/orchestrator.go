@@ -178,7 +178,7 @@ func (o *Orchestrator) processStreamEvent(ctx context.Context, entry rueidis.XRa
 		handlerErr = o.handleJobFailed(ctx, event)
 	case types.EventWorkflowCompleted:
 		handlerErr = o.handleChildWorkflowCompleted(ctx, event)
-	case types.EventWorkflowFailed:
+	case types.EventWorkflowFailed, types.EventWorkflowTimedOut, types.EventWorkflowCancelled:
 		handlerErr = o.handleChildWorkflowFailed(ctx, event)
 	case types.EventWorkflowStarted:
 		handlerErr = o.handleWorkflowStarted(ctx, event)
@@ -1131,8 +1131,8 @@ func (o *Orchestrator) handleChildWorkflowCompleted(ctx context.Context, event t
 	return nil
 }
 
-// handleChildWorkflowFailed is triggered when a workflow fails.
-// If it has a parent workflow, treat the failure as a task failure in the parent.
+// handleChildWorkflowFailed is triggered when a workflow fails, times out or is cancelled.
+// If it has a parent workflow, treat that as a task failure in the parent.
 func (o *Orchestrator) handleChildWorkflowFailed(ctx context.Context, event types.JobEvent) error {
 	childWfID := event.JobID
 	if childWfID == "" {
@@ -1146,16 +1146,45 @@ func (o *Orchestrator) handleChildWorkflowFailed(ctx context.Context, event type
 	if childWf.ParentWorkflowID == nil {
 		return nil // not a child workflow
 	}
+	if !childWf.Status.IsTerminal() {
+		return nil // retried in the meantime
+	}
 
 	errStr := "child workflow failed"
+	switch event.Type {
+	case types.EventWorkflowTimedOut:
+		errStr = "child workflow timed out"
+	case types.EventWorkflowCancelled:
+		errStr = "child workflow cancelled"
+	}
 	if event.Error != nil {
 		errStr = *event.Error
 	}
 
-	o.logger.Warn().String("child_workflow_id", childWfID).String("parent_workflow_id", *childWf.ParentWorkflowID).Msg("child workflow failed — failing parent task")
+	o.logger.Warn().String("child_workflow_id", childWfID).String("parent_workflow_id", *childWf.ParentWorkflowID).Msg(errStr + " — failing parent task")
 
 	o.progressParentWorkflowTask(ctx, childWf, types.JobStatusFailed, &errStr)
 	return nil
+}
+
+// replaceChild has the parent of a child workflow wait for the one it continues as.
+func (o *Orchestrator) replaceChild(ctx context.Context, childWf *types.WorkflowInstance, newID string) error {
+	for range 5 {
+		parentWf, rev, err := o.store.GetWorkflow(ctx, *childWf.ParentWorkflowID)
+		if err != nil {
+			return err
+		}
+		state, ok := parentWf.Tasks[*childWf.ParentTaskName]
+		if !ok || state.ChildWorkflowID != childWf.ID {
+			return nil
+		}
+		state.ChildWorkflowID = newID
+		parentWf.Tasks[*childWf.ParentTaskName] = state
+		if _, err = o.store.UpdateWorkflow(ctx, parentWf, rev); err != store.ErrCASConflict {
+			return err
+		}
+	}
+	return store.ErrCASConflict
 }
 
 // progressParentWorkflowTask updates the parent workflow task state based on the child outcome.
@@ -1184,7 +1213,8 @@ func (o *Orchestrator) progressParentWorkflowTask(ctx context.Context, childWf *
 		state.Error = errStr
 		parentWf.Tasks[taskName] = state
 
-		if status == types.JobStatusCompleted {
+		taskDef := findTaskDef(&parentWf.Definition, taskName)
+		if status == types.JobStatusCompleted || taskDef != nil && taskDef.AllowFailure {
 			// Decrement PendingDeps for downstream tasks that depend on this one.
 			DecrementPendingDeps(parentWf, taskName)
 
@@ -1383,7 +1413,7 @@ func (o *Orchestrator) handleWorkflowRetry(ctx context.Context, event types.JobE
 				lost = true
 			case err != nil:
 				return err
-			case child.Status.IsTerminal():
+			case child.Status.IsTerminal() && child.Status != types.WorkflowStatusContinued:
 				endedChildren = append(endedChildren, child)
 			}
 		} else if state.JobID != "" {
@@ -1496,28 +1526,29 @@ func (o *Orchestrator) timeoutWorkflow(ctx context.Context, wf *types.WorkflowIn
 		return
 	}
 	wf = freshWf
+	now := time.Now()
 	if wf.Status.IsTerminal() {
 		return
 	}
 
-	now := time.Now()
 	wf.Status = types.WorkflowStatusFailed
 	wf.CompletedAt = &now
 	wf.UpdatedAt = now
 
-	// Cancel all non-terminal tasks and signal running handlers.
+	// Cancel all non-terminal tasks, and once that is stored, signal running handlers and
+	// cancel child workflows.
+	errStr := types.ErrExecutionTimedOut.Error()
+	var jobs, children []string
 	for name, state := range wf.Tasks {
 		if !state.Status.IsTerminal() {
 			if state.JobID != "" {
-				o.signalCancelActiveRuns(ctx, state.JobID)
+				jobs = append(jobs, state.JobID)
 			}
-			// Cancel child workflows spawned by this task.
 			if state.ChildWorkflowID != "" {
-				o.cancelChildWorkflow(ctx, state.ChildWorkflowID)
+				children = append(children, state.ChildWorkflowID)
 			}
 			state.Status = types.JobStatusCancelled
 			state.FinishedAt = &now
-			errStr := types.ErrExecutionTimedOut.Error()
 			state.Error = &errStr
 			wf.Tasks[name] = state
 		}
@@ -1527,6 +1558,12 @@ func (o *Orchestrator) timeoutWorkflow(ctx context.Context, wf *types.WorkflowIn
 	if _, err := o.store.UpdateWorkflow(ctx, wf, rev); err != nil {
 		o.logger.Error().String("workflow_id", wf.ID).Err(err).Msg("orchestrator: failed to save workflow timeout")
 		return
+	}
+	for _, id := range jobs {
+		o.signalCancelActiveRuns(ctx, id)
+	}
+	for _, id := range children {
+		o.cancelChildWorkflow(ctx, id)
 	}
 	o.startHooks(ctx, wf, hooks)
 
@@ -1603,38 +1640,55 @@ func (o *Orchestrator) timeoutBatch(ctx context.Context, batch *types.BatchInsta
 	o.logger.Warn().String("batch_id", batch.ID).Msg("batch timed out")
 }
 
-// cancelChildWorkflow cancels a child workflow and all its tasks.
+// cancelChildWorkflow cancels a child workflow and all its tasks. That is stored before
+// anything is done about them, or the end of a task could be taken for a failure.
 func (o *Orchestrator) cancelChildWorkflow(ctx context.Context, childWfID string) {
-	childWf, rev, err := o.store.GetWorkflow(ctx, childWfID)
-	if err != nil || childWf.Status.IsTerminal() {
+	for range 5 {
+		childWf, rev, err := o.store.GetWorkflow(ctx, childWfID)
+		if err != nil || childWf.Status.IsTerminal() {
+			return
+		}
+
+		now := time.Now()
+		childWf.Status = types.WorkflowStatusCancelled
+		childWf.CompletedAt = &now
+		childWf.UpdatedAt = now
+
+		var jobs, children []string
+		for name, state := range childWf.Tasks {
+			if !state.Status.IsTerminal() {
+				if state.JobID != "" {
+					jobs = append(jobs, state.JobID)
+				}
+				if state.ChildWorkflowID != "" {
+					children = append(children, state.ChildWorkflowID)
+				}
+				state.Status = types.JobStatusCancelled
+				state.FinishedAt = &now
+				childWf.Tasks[name] = state
+			}
+		}
+		if _, err := o.store.UpdateWorkflow(ctx, childWf, rev); err != nil {
+			if err == store.ErrCASConflict {
+				continue
+			}
+			o.logger.Error().String("workflow_id", childWfID).Err(err).Msg("orchestrator: failed to cancel child workflow")
+			return
+		}
+
+		for _, id := range jobs {
+			o.signalCancelActiveRuns(ctx, id)
+		}
+		for _, id := range children {
+			o.cancelChildWorkflow(ctx, id)
+		}
+		o.dispatcher.PublishEvent(types.JobEvent{
+			Type:      types.EventWorkflowCancelled,
+			JobID:     childWfID,
+			Timestamp: now,
+		})
 		return
 	}
-
-	now := time.Now()
-	childWf.Status = types.WorkflowStatusCancelled
-	childWf.CompletedAt = &now
-	childWf.UpdatedAt = now
-
-	for name, state := range childWf.Tasks {
-		if !state.Status.IsTerminal() {
-			if state.JobID != "" {
-				o.signalCancelActiveRuns(ctx, state.JobID)
-			}
-			if state.ChildWorkflowID != "" {
-				o.cancelChildWorkflow(ctx, state.ChildWorkflowID)
-			}
-			state.Status = types.JobStatusCancelled
-			state.FinishedAt = &now
-			childWf.Tasks[name] = state
-		}
-	}
-
-	o.store.UpdateWorkflow(ctx, childWf, rev)
-	o.dispatcher.PublishEvent(types.JobEvent{
-		Type:      types.EventWorkflowCancelled,
-		JobID:     childWfID,
-		Timestamp: now,
-	})
 }
 
 // --- Precondition Evaluation ---
@@ -1868,6 +1922,9 @@ func (o *Orchestrator) continueWorkflowAsNew(ctx context.Context, wf *types.Work
 		ContinuedFrom: &wf.ID,
 		CreatedAt:     *now,
 		UpdatedAt:     *now,
+
+		ParentWorkflowID: wf.ParentWorkflowID,
+		ParentTaskName:   wf.ParentTaskName,
 	}
 
 	InitPendingDeps(newWf)
@@ -1882,6 +1939,11 @@ func (o *Orchestrator) continueWorkflowAsNew(ctx context.Context, wf *types.Work
 	if err != nil {
 		o.logger.Error().String("old_workflow_id", wf.ID).String("new_workflow_id", newID).Err(err).Msg("orchestrator: failed to save new workflow for continue-as-new")
 		return err
+	}
+	if wf.ParentWorkflowID != nil {
+		if err := o.replaceChild(ctx, wf, newID); err != nil {
+			o.logger.Error().String("parent_workflow_id", *wf.ParentWorkflowID).String("new_workflow_id", newID).Err(err).Msg("orchestrator: parent does not know of the new workflow of its child")
+		}
 	}
 
 	o.dispatcher.PublishEvent(types.JobEvent{

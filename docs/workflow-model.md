@@ -68,7 +68,8 @@ fan-out patterns.
 ### Child Workflow
 
 Set `ChildWorkflowDef` on a task to spawn an independent child workflow.
-The parent task completes when the child workflow reaches a terminal state.
+The parent task completes when the child workflow does, and fails when that fails, times out or is cancelled
+(`AllowFailure` applies). A child that continues as new is followed to its last instance.
 
 ## Result Piping
 

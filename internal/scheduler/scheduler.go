@@ -149,7 +149,8 @@ func (s *Scheduler) tickLoop(ctx context.Context) {
 	}
 }
 
-// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs and paused jobs.
+// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs and paused jobs
+// and trims the work streams.
 func (s *Scheduler) tick(ctx context.Context) {
 	now := time.Now()
 
@@ -159,15 +160,54 @@ func (s *Scheduler) tick(ctx context.Context) {
 		return
 	}
 
-	for _, entry := range dueSchedules {
-		s.processScheduleEntry(ctx, entry, now)
-	}
+	s.processDue(ctx, dueSchedules, now)
 
 	// Orphan detection runs less frequently than the main tick.
 	if s.orphanInterval > 0 && now.Sub(s.lastOrphanCheck) >= s.orphanInterval {
 		s.lastOrphanCheck = now
 		s.checkOrphanedRuns(ctx)
 		s.resumePausedJobs(ctx, now)
+		s.trimWorkStreams(ctx)
+	}
+}
+
+// dueConcurrency is how many schedules that are due are processed at once.
+const dueConcurrency = 32
+
+// processDue processes schedules that are due, each of which belongs to a job of its own.
+func (s *Scheduler) processDue(ctx context.Context, entries []*types.ScheduleEntry, now time.Time) {
+	due := make(chan *types.ScheduleEntry)
+	var wg sync.WaitGroup
+	for range min(dueConcurrency, len(entries)) {
+		wg.Go(func() {
+			for entry := range due {
+				s.processScheduleEntry(ctx, entry, now)
+			}
+		})
+	}
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			break // another leader goes on
+		}
+		due <- entry
+	}
+	close(due)
+	wg.Wait()
+}
+
+// trimWorkStreams removes what has been processed from the work streams.
+func (s *Scheduler) trimWorkStreams(ctx context.Context) {
+	for _, tier := range s.store.Config().Tiers {
+		n, err := s.store.TrimWorkStream(ctx, tier.Name)
+		if err != nil {
+			if ctx.Err() == nil {
+				s.logger.Warn().String("tier", tier.Name).Err(err).Msg("scheduler: failed to trim work stream")
+			}
+			continue
+		}
+		if n > 0 {
+			s.logger.Debug().String("tier", tier.Name).Int64("messages", n).Msg("scheduler: trimmed work stream")
+		}
 	}
 }
 
@@ -187,11 +227,7 @@ func (s *Scheduler) resumePausedJobs(ctx context.Context, now time.Time) {
 			continue
 		}
 
-		job.Status = types.JobStatusRetrying
-		job.PausedAt = nil
-		job.ResumeAt = nil
-		job.ConsecutiveErrors = 0
-		job.UpdatedAt = now
+		job.Resume(now)
 
 		if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
 			s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: failed to resume paused job")
@@ -239,6 +275,24 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 		// Normally done when the job ended, unless that process stopped in between.
 		s.releaseEndedJobUniqueKey(ctx, entry.JobID)
 		return
+	}
+
+	// A paused job does not fire. What falls due meanwhile is skipped rather than
+	// caught up on: resuming the job runs what it was paused on and then goes on
+	// with the schedule. The cached job may be older than the pause (or the resume),
+	// so it is read anew.
+	if job.Status.IsPaused() {
+		s.cache.InvalidateJob(entry.JobID)
+		if job, rev, err = s.cache.GetJob(ctx, entry.JobID); err != nil {
+			s.logger.Error().String("job_id", entry.JobID).Err(err).Msg("scheduler: failed to get paused job")
+			return
+		}
+		if job.Status.IsPaused() {
+			s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: job is paused, skipping firing")
+			entry.LastProcessedAt = &now
+			s.advanceSchedule(ctx, entry, now)
+			return
+		}
 	}
 
 	// --- Overlap policy check ---

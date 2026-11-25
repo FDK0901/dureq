@@ -315,6 +315,15 @@ func (h *hookedRedis) Do(ctx context.Context, cmd rueidis.Completed) rueidis.Red
 	return h.Client.Do(ctx, cmd)
 }
 
+func (h *hookedRedis) DoMulti(ctx context.Context, multi ...rueidis.Completed) []rueidis.RedisResult {
+	if h.before != nil {
+		for _, cmd := range multi {
+			h.before(cmd.Commands())
+		}
+	}
+	return h.Client.DoMulti(ctx, multi...)
+}
+
 // newHookedClient returns a client like cli whose commands can be intercepted.
 func newHookedClient(t *testing.T, cli *Client) (*Client, *hookedRedis) {
 	t.Helper()

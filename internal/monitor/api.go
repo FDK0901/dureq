@@ -56,6 +56,7 @@ func (a *API) registerRoutes() {
 	a.mux.HandleFunc("DELETE /api/jobs/{jobID}", a.deleteJob)
 	a.mux.HandleFunc("POST /api/jobs/{jobID}/cancel", a.cancelJob)
 	a.mux.HandleFunc("POST /api/jobs/{jobID}/retry", a.retryJob)
+	a.mux.HandleFunc("POST /api/jobs/{jobID}/resume", a.resumeJob)
 
 	// Job history
 	a.mux.HandleFunc("GET /api/jobs/{jobID}/events", a.listJobEvents)
@@ -77,6 +78,7 @@ func (a *API) registerRoutes() {
 
 	// History
 	a.mux.HandleFunc("GET /api/history/runs", a.listHistoryRuns)
+	a.mux.HandleFunc("DELETE /api/history/runs", a.cleanupRunHistory)
 	a.mux.HandleFunc("GET /api/history/events", a.listHistoryEvents)
 
 	// DLQ
@@ -145,6 +147,7 @@ func (a *API) registerRoutes() {
 
 	// Search (payload JSONPath)
 	a.mux.HandleFunc("GET /api/search/jobs", a.searchJobs)
+	a.mux.HandleFunc("GET /api/search/jobs/all", a.searchAllJobs)
 	a.mux.HandleFunc("GET /api/search/workflows", a.searchWorkflows)
 	a.mux.HandleFunc("GET /api/search/batches", a.searchBatches)
 
@@ -235,6 +238,15 @@ func (a *API) retryJob(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]string{"status": "retried", "job_id": jobID})
 }
 
+func (a *API) resumeJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("jobID")
+	if err := a.svc.ResumeJob(r.Context(), jobID); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]string{"status": "resumed", "job_id": jobID})
+}
+
 func (a *API) deleteJob(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("jobID")
 	if err := a.svc.DeleteJob(r.Context(), jobID); err != nil {
@@ -256,8 +268,9 @@ func (a *API) listJobEvents(w http.ResponseWriter, r *http.Request) {
 		limit = maxPageLimit
 	}
 	events, _, err := a.svc.ListJobEvents(r.Context(), store.EventFilter{
-		JobID: &jobID,
-		Limit: limit,
+		JobID:     &jobID,
+		Limit:     limit,
+		SkipTotal: true,
 	})
 	if err != nil {
 		writeServiceError(w, err)
@@ -427,6 +440,20 @@ func (a *API) listHistoryRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, paginatedResponse{Data: runs, Total: total})
+}
+
+func (a *API) cleanupRunHistory(w http.ResponseWriter, r *http.Request) {
+	age, err := time.ParseDuration(r.URL.Query().Get("older_than"))
+	if err != nil {
+		writeServiceError(w, &ApiError{Msg: "older_than must be a duration, such as 720h", StatusCode: http.StatusBadRequest})
+		return
+	}
+	removed, err := a.svc.CleanupRunHistory(r.Context(), age)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]int64{"removed": removed})
 }
 
 func (a *API) listHistoryEvents(w http.ResponseWriter, r *http.Request) {
@@ -758,6 +785,27 @@ func (a *API) searchJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, job)
+}
+
+func (a *API) searchAllJobs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	query := store.PayloadQuery{TaskType: q.Get("task_type"), Limit: parsePageParams(r).Limit}
+	if live := q.Get("live"); live != "" {
+		var err error
+		if query.LiveOnly, err = strconv.ParseBool(live); err != nil {
+			writeServiceError(w, &ApiError{Msg: "live must be true or false", StatusCode: http.StatusBadRequest})
+			return
+		}
+	}
+	for _, status := range q["status"] {
+		query.Statuses = append(query.Statuses, types.JobStatus(status))
+	}
+	jobs, more, err := a.svc.SearchAllJobsByPayload(r.Context(), q.Get("path"), q.Get("value"), query)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]any{"data": jobs, "has_more": more})
 }
 
 func (a *API) searchWorkflows(w http.ResponseWriter, r *http.Request) {

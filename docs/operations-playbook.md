@@ -88,6 +88,7 @@ The monitoring API is enabled with `ModeMonitor`. Key route groups:
 | `GET` | `/api/jobs/{id}` | Get job details |
 | `POST` | `/api/jobs/{id}/cancel` | Cancel a job |
 | `POST` | `/api/jobs/{id}/retry` | Retry a failed/dead job |
+| `POST` | `/api/jobs/{id}/resume` | Resume a paused job |
 | `PUT` | `/api/jobs/{id}/payload` | Update job payload |
 | `DELETE` | `/api/jobs/{id}` | Delete a job |
 
@@ -120,7 +121,7 @@ The monitoring API is enabled with `ModeMonitor`. Key route groups:
 | `GET` | `/api/stats/daily` | Daily aggregated statistics |
 | `GET` | `/api/nodes` | Worker nodes and pool stats |
 | `GET` | `/api/schedules` | Active schedules |
-| `GET` | `/api/queues` | Queue tiers (size, weight, paused) |
+| `GET` | `/api/queues` | Queue tiers: weight, paused, `waiting` (no worker has it yet), `in_flight`, `delayed` (due later, such as retries). `size` is the length of the stream, which includes what has been processed but not trimmed yet |
 | `GET` | `/api/dlq` | Dead letter queue entries |
 | `GET` | `/api/redis/info` | Redis server info |
 | `GET` | `/api/ws` | WebSocket real-time event stream |
@@ -129,7 +130,16 @@ The monitoring API is enabled with `ModeMonitor`. Key route groups:
 
 Bulk operations: `POST /api/{jobs,workflows,batches}/bulk/{cancel,retry,delete}`
 
-Search by payload JSONPath: `GET /api/search/{jobs,workflows,batches}?path=field&value=val`
+Search by payload JSONPath: `GET /api/search/{jobs,workflows,batches}?path=field&value=val` returns the newest match.
+
+`GET /api/search/jobs/all?path=field&value=val` returns all jobs that match, newest first, as
+`{"data": [...], "has_more": false}`. Narrow it down with `task_type`, `live=true` (leaves out completed, dead
+and cancelled jobs), `status` (repeatable) and `limit` (10 by default, 100 at most).
+
+`GET /api/jobs?search=text` finds jobs by a part of their ID or task type. It reads the jobs one by one, up to
+100,000 of them, so narrow it down with `status`, `task_type` or `tag` if there are many.
+
+`GET /api/history/events` reads the event stream, which keeps about the last `EventStreamMaxLen` events (50,000).
 
 ## Repair Operations
 
@@ -206,3 +216,20 @@ State transitions are recorded per job and workflow:
 Archival is off by default: jobs are kept until they are deleted. With
 `WithRetentionPeriod(d)`, completed/failed/dead/cancelled jobs are deleted once they have
 not been updated for `d` (a negative `d` means 7 days, 0 means off). Runs on the leader node.
+
+The run history is separate from that and is kept, too, until you clean it up:
+
+- by hand: `client.CleanupRunHistory(ctx, time.Now().Add(-30*24*time.Hour))` or
+  `DELETE /api/history/runs?older_than=720h`, which answers `{"removed": 1234}`;
+- or regularly: with `WithRunHistoryRetention(30*24*time.Hour)` the leader removes runs once they finished longer ago
+  than that (dureqd: `runHistoryRetentionHours`). It looks every hour, and when a node becomes the leader. Off by
+  default.
+
+Either removes finished runs only. Jobs, their audit trails and their active runs are left alone.
+
+Nothing that is yet to be done is ever trimmed:
+
+- Work streams: the leader removes messages that have been processed, and only those.
+- Events that the orchestrator has to see (`events:orchestrator`): each is removed once it has been processed.
+- The dead letter queue keeps every entry. It is limited only if `DLQStreamMaxLen` is set.
+- The event stream is limited to about `EventStreamMaxLen` events, as it is a history only.

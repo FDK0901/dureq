@@ -604,11 +604,7 @@ func (c *Client) ResumeJob(ctx context.Context, jobID string) error {
 	}
 
 	now := time.Now()
-	job.Status = types.JobStatusRetrying
-	job.PausedAt = nil
-	job.ResumeAt = nil
-	job.ConsecutiveErrors = 0
-	job.UpdatedAt = now
+	job.Resume(now)
 
 	newRev, err := c.store.UpdateJob(ctx, job, rev)
 	if err != nil {
@@ -711,6 +707,7 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 	tasks := make(map[string]types.WorkflowTaskState, len(def.Tasks))
 	for _, t := range def.Tasks {
 		tasks[t.Name] = types.WorkflowTaskState{
+			Name:   t.Name,
 			Status: types.JobStatusPending,
 		}
 	}
@@ -735,28 +732,26 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 		wf.Deadline = &deadline
 	}
 
-	// Save workflow instance.
-	rev, err := c.store.SaveWorkflow(ctx, wf)
-	if err != nil {
+	// Save workflow instance, with its init hook and root tasks (no dependencies) reserved.
+	hooks, roots := workflow.ReserveInitHook(wf, now), workflow.ReserveRootTasks(wf, now)
+	if _, err := c.store.SaveWorkflow(ctx, wf); err != nil {
 		return nil, fmt.Errorf("save workflow: %w", err)
 	}
 
-	c.publishEvent(ctx, types.JobEvent{
+	// The event has the orchestrator start the root tasks that are not reserved.
+	err := c.store.PublishEvent(ctx, types.JobEvent{
 		Type:      types.EventWorkflowStarted,
 		JobID:     wf.ID,
 		Timestamp: now,
 	})
-
-	// Dispatch root tasks (no dependencies).
-	roots := rootTasks(&def)
-	for _, taskName := range roots {
-		c.dispatchWorkflowTask(ctx, wf, taskName, &now)
+	c.startReserved(ctx, hooks) // the orchestrator makes up for it if that fails
+	if len(roots) > 0 {
+		err = c.startReserved(ctx, roots)
 	}
-
-	// Save again after dispatch updates task states.
-	// Use CAS to avoid overwriting orchestrator state if a root task already completed.
-	c.store.UpdateWorkflow(ctx, wf, rev)
-
+	if err != nil {
+		c.failWorkflow(ctx, wf.ID, roots)
+		return nil, fmt.Errorf("dispatch workflow: %w", err)
+	}
 	return wf, nil
 }
 
@@ -917,36 +912,20 @@ func (c *Client) RetryWorkflow(ctx context.Context, workflowID string) (*types.W
 	}
 
 	now := time.Now()
-	wf.Attempt++
-	wf.Status = types.WorkflowStatusRunning
-	wf.UpdatedAt = now
-	wf.CompletedAt = nil
-
-	// Reset only failed/dead/cancelled tasks — keep completed tasks.
-	for name, state := range wf.Tasks {
-		if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
-			state.Status = types.JobStatusPending
-			state.JobID = ""
-			state.Error = nil
-			state.StartedAt = nil
-			state.FinishedAt = nil
-			wf.Tasks[name] = state
-		}
-	}
-
-	newRev, err := c.store.UpdateWorkflow(ctx, wf, rev)
-	if err != nil {
+	workflow.ResetWorkflow(wf, now)
+	if _, err := c.store.UpdateWorkflow(ctx, wf, rev); err != nil {
 		return nil, err
 	}
 
-	// Dispatch tasks whose dependencies are all completed.
-	ready := readyTasks(wf)
-	for _, taskName := range ready {
-		c.dispatchWorkflowTask(ctx, wf, taskName, &now)
+	// The orchestrator goes on with it.
+	if err := c.store.PublishEvent(ctx, types.JobEvent{
+		Type:      types.EventWorkflowRetrying,
+		JobID:     wf.ID,
+		Attempt:   wf.Attempt,
+		Timestamp: now,
+	}); err != nil {
+		return nil, fmt.Errorf("retry workflow: %w", err)
 	}
-	// Use CAS to avoid overwriting orchestrator state.
-	c.store.UpdateWorkflow(ctx, wf, newRev)
-
 	return wf, nil
 }
 
@@ -983,9 +962,9 @@ func (c *Client) EnqueueBatch(ctx context.Context, def types.BatchDefinition) (*
 		batch.Deadline = &deadline
 	}
 
-	// Save batch instance.
-	batchRev, err := c.store.SaveBatch(ctx, batch)
-	if err != nil {
+	// Save batch instance, with its onetime task or first chunk reserved.
+	jobs := workflow.ReserveBatch(batch, now)
+	if _, err := c.store.SaveBatch(ctx, batch); err != nil {
 		return nil, fmt.Errorf("save batch: %w", err)
 	}
 
@@ -995,16 +974,10 @@ func (c *Client) EnqueueBatch(ctx context.Context, def types.BatchDefinition) (*
 		Timestamp: now,
 	})
 
-	// If onetime task is defined, dispatch it first.
-	if def.OnetimeTaskType != nil && *def.OnetimeTaskType != "" {
-		c.dispatchBatchOnetime(ctx, batch, &now)
-		c.store.UpdateBatch(ctx, batch, batchRev)
-	} else {
-		// Dispatch first chunk directly.
-		c.dispatchBatchChunk(ctx, batch, &now)
-		c.store.UpdateBatch(ctx, batch, batchRev)
+	if err := c.startReserved(ctx, jobs); err != nil {
+		c.failBatch(ctx, batch.ID, jobs)
+		return nil, fmt.Errorf("dispatch batch: %w", err)
 	}
-
 	return batch, nil
 }
 
@@ -1099,49 +1072,20 @@ func (c *Client) RetryBatch(ctx context.Context, batchID string, retryFailedOnly
 	}
 
 	now := time.Now()
-	batch.Attempt++
-	batch.Status = types.WorkflowStatusRunning
-	batch.UpdatedAt = now
-	batch.CompletedAt = nil
-
-	batch.FailedItems = 0
-	batch.RunningItems = 0
-	batch.PendingItems = 0
-	batch.CompletedItems = 0
-
-	for id, state := range batch.ItemStates {
-		if retryFailedOnly && state.Status != types.JobStatusFailed {
-			if state.Status == types.JobStatusCompleted {
-				batch.CompletedItems++
-			}
-			continue
-		}
-		state.Status = types.JobStatusPending
-		state.JobID = ""
-		state.Error = nil
-		state.StartedAt = nil
-		state.FinishedAt = nil
-		batch.ItemStates[id] = state
-		batch.PendingItems++
-	}
-	batch.NextChunkIndex = 0
-
-	newBatchRev, err := c.store.UpdateBatch(ctx, batch, rev)
-	if err != nil {
+	workflow.ResetBatch(batch, retryFailedOnly, now)
+	if _, err := c.store.UpdateBatch(ctx, batch, rev); err != nil {
 		return nil, err
 	}
 
-	// Re-dispatch: onetime first if needed, otherwise chunks.
-	needsOnetime := batch.Definition.OnetimeTaskType != nil && *batch.Definition.OnetimeTaskType != "" &&
-		(batch.OnetimeState == nil || batch.OnetimeState.Status != types.JobStatusCompleted)
-	if needsOnetime {
-		batch.OnetimeState = nil
-		c.dispatchBatchOnetime(ctx, batch, &now)
-	} else {
-		c.dispatchBatchChunk(ctx, batch, &now)
+	// The orchestrator goes on with it.
+	if err := c.store.PublishEvent(ctx, types.JobEvent{
+		Type:      types.EventBatchRetrying,
+		JobID:     batch.ID,
+		Attempt:   batch.Attempt,
+		Timestamp: now,
+	}); err != nil {
+		return nil, fmt.Errorf("retry batch: %w", err)
 	}
-	c.store.UpdateBatch(ctx, batch, newBatchRev)
-
 	return batch, nil
 }
 
@@ -1270,6 +1214,13 @@ func (c *Client) enqueueWithID(ctx context.Context, jobID string, taskType types
 	return job, nil
 }
 
+// CleanupRunHistory removes the runs that finished before olderThan from the run history,
+// and returns how many. Jobs and their active runs are left alone. To have this done
+// regularly, start the servers with WithRunHistoryRetention.
+func (c *Client) CleanupRunHistory(ctx context.Context, olderThan time.Time) (int64, error) {
+	return c.store.Cleanup(ctx, olderThan)
+}
+
 // DrainNode puts a node into drain mode. The node stops fetching new messages
 // but continues processing in-flight tasks. Call with drain=false to resume.
 func (c *Client) DrainNode(ctx context.Context, nodeID string, drain bool) error {
@@ -1365,127 +1316,72 @@ func (c *Client) cancelChildWorkflow(ctx context.Context, childWfID string) {
 	c.store.UpdateWorkflow(ctx, childWf, rev)
 }
 
-func (c *Client) dispatchWorkflowTask(ctx context.Context, wf *types.WorkflowInstance, taskName string, now *time.Time) {
-	var taskDef *types.WorkflowTask
-	for i := range wf.Definition.Tasks {
-		if wf.Definition.Tasks[i].Name == taskName {
-			taskDef = &wf.Definition.Tasks[i]
+// startReserved creates and dispatches the jobs that are reserved in a workflow or batch.
+// One that exists was started by the orchestrator, which starts what it finds missing once
+// the first of them is done. So it is an error only if none of them could be started.
+func (c *Client) startReserved(ctx context.Context, jobs []*types.Job) error {
+	var firstErr error
+	started := 0
+	for _, job := range jobs {
+		_, err := c.store.CreateJob(ctx, job)
+		if err == nil {
+			if err = c.dispatchJob(ctx, job); err != nil {
+				c.store.DeleteJob(ctx, job.ID)
+			}
+		}
+		if err != nil && !errors.Is(err, store.ErrAlreadyExists) {
+			firstErr = err
 			break
 		}
+		started++
 	}
-	if taskDef == nil {
-		return
+	if started > 0 {
+		return nil
 	}
-
-	job := &types.Job{
-		ID:           xid.New().String(),
-		TaskType:     taskDef.TaskType,
-		Payload:      taskDef.Payload,
-		Schedule:     types.Schedule{Type: types.ScheduleImmediate},
-		Status:       types.JobStatusPending,
-		Priority:     wf.Definition.DefaultPriority,
-		WorkflowID:   &wf.ID,
-		WorkflowTask: &taskName,
-		CreatedAt:    *now,
-		UpdatedAt:    *now,
-	}
-
-	if _, err := c.store.CreateJob(ctx, job); err != nil {
-		return
-	}
-	if err := c.dispatchJob(ctx, job); err != nil {
-		c.store.DeleteJob(ctx, job.ID)
-		return
-	}
-
-	if state, ok := wf.Tasks[taskName]; ok {
-		state.JobID = job.ID
-		state.Status = types.JobStatusRunning
-		state.StartedAt = now
-		wf.Tasks[taskName] = state
-	}
+	return firstErr
 }
 
-func (c *Client) dispatchBatchOnetime(ctx context.Context, batch *types.BatchInstance, now *time.Time) {
-	job := &types.Job{
-		ID:        xid.New().String(),
-		TaskType:  *batch.Definition.OnetimeTaskType,
-		Payload:   batch.Definition.OnetimePayload,
-		Schedule:  types.Schedule{Type: types.ScheduleImmediate},
-		Status:    types.JobStatusPending,
-		Priority:  batch.Definition.DefaultPriority,
-		BatchID:   &batch.ID,
-		BatchRole: strPtr("onetime"),
-		CreatedAt: *now,
-		UpdatedAt: *now,
-	}
-
-	if _, err := c.store.CreateJob(ctx, job); err != nil {
+// failWorkflow ends a workflow of which none of the reserved jobs could be started.
+func (c *Client) failWorkflow(ctx context.Context, id string, jobs []*types.Job) {
+	wf, rev, err := c.store.GetWorkflow(ctx, id)
+	if err != nil {
 		return
 	}
-	if err := c.dispatchJob(ctx, job); err != nil {
-		c.store.DeleteJob(ctx, job.ID)
-		return
+	now := time.Now()
+	wf.Status = types.WorkflowStatusFailed
+	wf.CompletedAt, wf.UpdatedAt = &now, now
+	for _, job := range jobs {
+		state := wf.Tasks[*job.WorkflowTask]
+		state.Status = types.JobStatusFailed
+		state.FinishedAt = &now
+		wf.Tasks[*job.WorkflowTask] = state
 	}
-
-	batch.OnetimeState = &types.BatchOnetimeState{
-		JobID:     job.ID,
-		Status:    types.JobStatusRunning,
-		StartedAt: now,
-	}
+	c.store.UpdateWorkflow(ctx, wf, rev)
 }
 
-func (c *Client) dispatchBatchChunk(ctx context.Context, batch *types.BatchInstance, now *time.Time) {
-	chunkSize := batch.Definition.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 100
+// failBatch ends a batch of which none of the reserved jobs could be started.
+func (c *Client) failBatch(ctx context.Context, id string, jobs []*types.Job) {
+	batch, rev, err := c.store.GetBatch(ctx, id)
+	if err != nil {
+		return
 	}
-
-	items := batch.Definition.Items
-	dispatched := 0
-
-	for batch.NextChunkIndex < len(items) && dispatched < chunkSize && batch.RunningItems < chunkSize {
-		item := items[batch.NextChunkIndex]
-
-		if state, ok := batch.ItemStates[item.ID]; ok && state.Status != types.JobStatusPending {
-			batch.NextChunkIndex++
+	now := time.Now()
+	batch.Status = types.WorkflowStatusFailed
+	batch.CompletedAt, batch.UpdatedAt = &now, now
+	for _, job := range jobs {
+		if job.BatchItem == nil {
+			batch.OnetimeState.Status = types.JobStatusFailed
+			batch.OnetimeState.FinishedAt = &now
 			continue
 		}
-
-		job := &types.Job{
-			ID:          xid.New().String(),
-			TaskType:    batch.Definition.ItemTaskType,
-			Payload:     item.Payload,
-			Schedule:    types.Schedule{Type: types.ScheduleImmediate},
-			Status:      types.JobStatusPending,
-			Priority:    batch.Definition.DefaultPriority,
-			BatchID:     &batch.ID,
-			BatchItem:   &item.ID,
-			BatchRole:   strPtr("item"),
-			RetryPolicy: batch.Definition.ItemRetryPolicy,
-			CreatedAt:   *now,
-			UpdatedAt:   *now,
-		}
-
-		if _, err := c.store.CreateJob(ctx, job); err != nil {
-			break
-		}
-		if err := c.dispatchJob(ctx, job); err != nil {
-			c.store.DeleteJob(ctx, job.ID)
-			break
-		}
-
-		batch.ItemStates[item.ID] = types.BatchItemState{
-			ItemID:    item.ID,
-			JobID:     job.ID,
-			Status:    types.JobStatusRunning,
-			StartedAt: now,
-		}
-		batch.NextChunkIndex++
-		batch.RunningItems++
-		batch.PendingItems--
-		dispatched++
+		state := batch.ItemStates[*job.BatchItem]
+		state.Status = types.JobStatusFailed
+		state.FinishedAt = &now
+		batch.ItemStates[*job.BatchItem] = state
+		batch.RunningItems--
+		batch.FailedItems++
 	}
+	c.store.UpdateBatch(ctx, batch, rev)
 }
 
 // resolveTier maps a numeric priority to a configured tier name.
@@ -1516,46 +1412,3 @@ func resolveTier(tiers []store.TierConfig, priority types.Priority) string {
 	}
 	return tiers[idx].Name
 }
-
-// rootTasks returns task names that have no dependencies (DAG roots).
-func rootTasks(def *types.WorkflowDefinition) []string {
-	var roots []string
-	for _, t := range def.Tasks {
-		if len(t.DependsOn) == 0 {
-			roots = append(roots, t.Name)
-		}
-	}
-	return roots
-}
-
-// readyTasks returns pending task names whose dependencies are all completed.
-func readyTasks(wf *types.WorkflowInstance) []string {
-	taskDefs := make(map[string]types.WorkflowTask, len(wf.Definition.Tasks))
-	for _, t := range wf.Definition.Tasks {
-		taskDefs[t.Name] = t
-	}
-	var ready []string
-	for name, state := range wf.Tasks {
-		if state.Status != types.JobStatusPending {
-			continue
-		}
-		def, ok := taskDefs[name]
-		if !ok {
-			continue
-		}
-		allDepsDone := true
-		for _, dep := range def.DependsOn {
-			depState, exists := wf.Tasks[dep]
-			if !exists || depState.Status != types.JobStatusCompleted {
-				allDepsDone = false
-				break
-			}
-		}
-		if allDepsDone {
-			ready = append(ready, name)
-		}
-	}
-	return ready
-}
-
-func strPtr(s string) *string { return &s }

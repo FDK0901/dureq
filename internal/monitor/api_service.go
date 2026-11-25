@@ -226,6 +226,39 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 	return nil
 }
 
+// ResumeJob takes a paused job off hold and runs what it was paused on.
+func (a *APIService) ResumeJob(ctx context.Context, jobID string) error {
+	job, rev, err := a.store.GetJob(ctx, jobID)
+	if err != nil {
+		return &ApiError{Msg: "job not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	}
+	if !job.Status.IsPaused() {
+		return &ApiError{Msg: "cannot resume: job is " + string(job.Status), StatusCode: http.StatusConflict}
+	}
+
+	paused := *job
+	now := time.Now()
+	job.Resume(now)
+	newRev, err := a.store.UpdateJob(ctx, job, rev)
+	if err != nil {
+		return err
+	}
+	if err := a.dispatcher.Dispatch(ctx, job, job.Attempt); err != nil {
+		// Rollback: put it on hold again.
+		paused.UpdatedAt = time.Now()
+		a.store.UpdateJob(ctx, &paused, newRev)
+		return fmt.Errorf("dispatch failed: %w", err)
+	}
+
+	a.dispatcher.PublishEvent(types.JobEvent{
+		Type:      types.EventJobResumed,
+		JobID:     jobID,
+		TaskType:  job.TaskType,
+		Timestamp: now,
+	})
+	return nil
+}
+
 func (a *APIService) DeleteJob(ctx context.Context, jobID string) error {
 	// Guard: only delete terminal jobs to prevent orphaned in-flight work.
 	job, _, err := a.store.GetJob(ctx, jobID)
@@ -243,6 +276,14 @@ func (a *APIService) DeleteJob(ctx context.Context, jobID string) error {
 }
 
 func (a *APIService) ListJobEvents(ctx context.Context, filter store.EventFilter) ([]types.JobEvent, int, error) {
+	// A job has no events from before it was created, so these need not be gone through.
+	// The clocks of the nodes may differ a little.
+	if filter.JobID != nil && filter.Since == nil {
+		if job, _, err := a.store.GetJob(ctx, *filter.JobID); err == nil {
+			since := job.CreatedAt.Add(-time.Minute)
+			filter.Since = &since
+		}
+	}
 	return a.store.ListJobEvents(ctx, filter)
 }
 
@@ -311,11 +352,15 @@ func (a *APIService) ListActiveRuns(ctx context.Context) ([]*types.JobRun, error
 }
 
 func (a *APIService) GetRun(ctx context.Context, runID string) (*types.JobRun, error) {
+	// An active run first: one that is retried is also in the history, as it was before.
 	run, _, err := a.store.GetRun(ctx, runID)
-	if err != nil {
-		return nil, &ApiError{Msg: "run not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	if errors.Is(err, types.ErrRunNotFound) {
+		run, _, err = a.store.GetHistoryRun(ctx, runID)
 	}
-	return run, nil
+	if errors.Is(err, types.ErrRunNotFound) {
+		return nil, &ApiError{Msg: "run not found", StatusCode: http.StatusNotFound}
+	}
+	return run, err
 }
 
 func (a *APIService) GetJobActiveRuns(ctx context.Context, jobID string) ([]*types.JobRun, error) {
@@ -328,8 +373,16 @@ func (a *APIService) ListHistoryRuns(ctx context.Context, filter store.RunFilter
 	return a.store.ListJobRuns(ctx, filter)
 }
 
+// CleanupRunHistory removes the runs that finished longer than age ago from the history.
+func (a *APIService) CleanupRunHistory(ctx context.Context, age time.Duration) (int64, error) {
+	if age <= 0 {
+		return 0, &ApiError{Msg: "older_than must be positive", StatusCode: http.StatusBadRequest}
+	}
+	return a.store.Cleanup(ctx, time.Now().Add(-age))
+}
+
 func (a *APIService) ListHistoryEvents(ctx context.Context, filter store.EventFilter) ([]types.JobEvent, int, error) {
-	return a.store.ListJobEvents(ctx, filter)
+	return a.ListJobEvents(ctx, filter)
 }
 
 // ===================== DLQ =====================
@@ -531,23 +584,7 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 	}
 
 	now := time.Now()
-	wf.Attempt++
-	wf.Status = types.WorkflowStatusRunning
-	wf.UpdatedAt = now
-	wf.CompletedAt = nil
-
-	// Reset only failed/dead/cancelled tasks — keep completed tasks.
-	for name, state := range wf.Tasks {
-		if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
-			state.Status = types.JobStatusPending
-			state.JobID = ""
-			state.Error = nil
-			state.StartedAt = nil
-			state.FinishedAt = nil
-			wf.Tasks[name] = state
-		}
-	}
-
+	workflow.ResetWorkflow(wf, now)
 	if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
 		return err
 	}
@@ -667,39 +704,7 @@ func (a *APIService) RetryBatch(ctx context.Context, batchID string, retryFailed
 	}
 
 	now := time.Now()
-	batch.Attempt++
-	batch.Status = types.WorkflowStatusRunning
-	batch.UpdatedAt = now
-	batch.CompletedAt = nil
-
-	batch.FailedItems = 0
-	batch.RunningItems = 0
-	batch.PendingItems = 0
-	batch.CompletedItems = 0
-
-	for id, state := range batch.ItemStates {
-		if retryFailedOnly && state.Status != types.JobStatusFailed {
-			if state.Status == types.JobStatusCompleted {
-				batch.CompletedItems++
-			}
-			continue
-		}
-		state.Status = types.JobStatusPending
-		state.JobID = ""
-		state.Error = nil
-		state.StartedAt = nil
-		state.FinishedAt = nil
-		batch.ItemStates[id] = state
-		batch.PendingItems++
-	}
-	batch.NextChunkIndex = 0
-
-	// Reset onetime state if it hasn't completed (orchestrator will re-dispatch).
-	if batch.Definition.OnetimeTaskType != nil && *batch.Definition.OnetimeTaskType != "" &&
-		(batch.OnetimeState == nil || batch.OnetimeState.Status != types.JobStatusCompleted) {
-		batch.OnetimeState = nil
-	}
-
+	workflow.ResetBatch(batch, retryFailedOnly, now)
 	if _, err := a.store.UpdateBatch(ctx, batch, rev); err != nil {
 		return err
 	}
@@ -745,7 +750,12 @@ type QueueInfo struct {
 	RateLimit  float64 `json:"rate_limit,omitempty"`
 	RateBurst  int     `json:"rate_burst,omitempty"`
 	Paused     bool    `json:"paused"`
-	Size       int64   `json:"size"`
+	Size       int64   `json:"size"` // length of the stream, including what has been processed but not trimmed yet
+
+	// Left out if the server cannot tell; Waiting takes Redis 7.0.
+	Waiting  *int64 `json:"waiting,omitempty"`   // no worker has taken it yet
+	InFlight *int64 `json:"in_flight,omitempty"` // taken by a worker and not finished yet
+	Delayed  *int64 `json:"delayed,omitempty"`   // due later, such as retries
 }
 
 func (a *APIService) ListQueues(ctx context.Context) ([]QueueInfo, error) {
@@ -759,7 +769,7 @@ func (a *APIService) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	queues := make([]QueueInfo, 0, len(tiers))
 	for _, tier := range tiers {
 		size, _ := a.store.Client().Do(ctx, a.store.Client().B().Xlen().Key(store.WorkStreamKey(a.store.Prefix(), tier.Name)).Build()).AsInt64()
-		queues = append(queues, QueueInfo{
+		queue := QueueInfo{
 			Name:       tier.Name,
 			Weight:     tier.Weight,
 			FetchBatch: tier.FetchBatch,
@@ -767,7 +777,11 @@ func (a *APIService) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 			RateBurst:  tier.RateBurst,
 			Paused:     pausedSet[tier.Name],
 			Size:       size,
-		})
+		}
+		if depth, err := a.store.GetQueueDepth(ctx, tier.Name); err == nil {
+			queue.Waiting, queue.InFlight, queue.Delayed = depth.Waiting, &depth.InFlight, &depth.Delayed
+		}
+		queues = append(queues, queue)
 	}
 	return queues, nil
 }
@@ -960,6 +974,24 @@ func (a *APIService) SearchJobsByPayload(ctx context.Context, path, value, taskT
 		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
 	}
 	return job, nil
+}
+
+// SearchAllJobsByPayload returns the jobs whose payload matches and that q selects,
+// newest first, and whether there are more of them than q.Limit.
+func (a *APIService) SearchAllJobsByPayload(ctx context.Context, path, value string, q store.PayloadQuery) ([]*types.Job, bool, error) {
+	if path == "" || value == "" {
+		return nil, false, &ApiError{Msg: "path and value are required", StatusCode: http.StatusBadRequest}
+	}
+	limit := q.Limit
+	q.Limit++
+	jobs, err := a.store.FindJobsByPayloadPath(ctx, path, value, q)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(jobs) > limit {
+		return jobs[:limit], true, nil
+	}
+	return jobs, false, nil
 }
 
 func (a *APIService) SearchWorkflowsByPayload(ctx context.Context, path, value string) (*types.WorkflowInstance, error) {
@@ -1204,22 +1236,9 @@ func (a *APIService) BulkRetryWorkflows(ctx context.Context, req BulkRequest) (*
 		if !wf.Status.IsRetryable() {
 			continue
 		}
-		wf.Attempt++
-		wf.Status = types.WorkflowStatusRunning
-		wf.UpdatedAt = now
-		wf.CompletedAt = nil
 		// Only reset failed/dead/cancelled tasks — preserve completed work
 		// (matches single-retry behavior in RetryWorkflow).
-		for name, state := range wf.Tasks {
-			if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
-				state.Status = types.JobStatusPending
-				state.JobID = ""
-				state.Error = nil
-				state.StartedAt = nil
-				state.FinishedAt = nil
-				wf.Tasks[name] = state
-			}
-		}
+		workflow.ResetWorkflow(wf, now)
 		if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err == nil {
 			a.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventWorkflowRetrying, JobID: id, Attempt: wf.Attempt, Timestamp: now,
@@ -1360,31 +1379,8 @@ func (a *APIService) BulkRetryBatches(ctx context.Context, req BulkRequest) (*Bu
 		if !batch.Status.IsRetryable() {
 			continue
 		}
-		batch.Attempt++
-		batch.Status = types.WorkflowStatusRunning
-		batch.UpdatedAt = now
-		batch.CompletedAt = nil
 		// Only reset failed/dead/cancelled items — preserve completed work.
-		pendingCount := 0
-		completedCount := 0
-		for itemID, state := range batch.ItemStates {
-			if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
-				state.Status = types.JobStatusPending
-				state.JobID = ""
-				state.Error = nil
-				state.StartedAt = nil
-				state.FinishedAt = nil
-				batch.ItemStates[itemID] = state
-				pendingCount++
-			} else if state.Status == types.JobStatusCompleted {
-				completedCount++
-			}
-		}
-		batch.FailedItems = 0
-		batch.RunningItems = 0
-		batch.PendingItems = pendingCount
-		batch.CompletedItems = completedCount
-		batch.NextChunkIndex = 0
+		workflow.ResetBatch(batch, true, now)
 		if _, err := a.store.UpdateBatch(ctx, batch, rev); err == nil {
 			a.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventBatchRetrying, JobID: id, Attempt: batch.Attempt, Timestamp: now,
@@ -1499,15 +1495,9 @@ func (a *APIService) IsNodeDraining(ctx context.Context, nodeID string) (bool, e
 
 // RequeueRun re-dispatches a failed or dead run's parent job.
 func (a *APIService) RequeueRun(ctx context.Context, runID string) error {
-	// Try active runs first, then history.
-	run, _, err := a.store.GetRun(ctx, runID)
+	run, err := a.GetRun(ctx, runID)
 	if err != nil {
-		// Look up from history hash directly.
-		histRun, _, hErr := a.store.GetHistoryRun(ctx, runID)
-		if hErr != nil {
-			return &ApiError{Msg: "run not found", StatusCode: http.StatusNotFound}
-		}
-		run = histRun
+		return err
 	}
 
 	if !run.Status.IsTerminal() {

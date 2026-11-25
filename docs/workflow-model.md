@@ -22,7 +22,8 @@ def := types.WorkflowDefinition{
 wf, err := client.EnqueueWorkflow(ctx, def, orderInput)
 ```
 
-Tasks with no `DependsOn` are root tasks and are dispatched immediately.
+Tasks with no `DependsOn` are root tasks and are dispatched immediately. `EnqueueWorkflow`
+returns an error, and the workflow is `failed`, if none of them could be dispatched.
 Downstream tasks are dispatched when all their dependencies complete.
 
 ## Task Types
@@ -67,7 +68,8 @@ fan-out patterns.
 ### Child Workflow
 
 Set `ChildWorkflowDef` on a task to spawn an independent child workflow.
-The parent task completes when the child workflow reaches a terminal state.
+The parent task completes when the child workflow does, and fails when that fails, times out or is cancelled
+(`AllowFailure` applies). A child that continues as new is followed to its last instance.
 
 ## Result Piping
 
@@ -84,7 +86,8 @@ The `enrich` task receives that output as its payload (the static `Payload` fiel
 
 Tasks can define `Preconditions` that gate dispatch based on upstream output.
 If any precondition fails, the task is skipped. Each precondition specifies
-a `Type` ("upstream_output"), a `Task`, a JSONPath `Path`, and an `Expected` value.
+a `Type` ("upstream_output"), a `Task`, a JSONPath `Path`, and an `Expected` value. A skipped task counts as
+completed, so a workflow whose last tasks are skipped completes.
 
 ## AllowFailure
 
@@ -99,6 +102,8 @@ Individual task jobs use the standard `RetryPolicy` on the handler definition
 or the job's own retry policy.
 
 ### Workflow-level retry
+
+A task that was still under way when the workflow failed is not started again by a retry. What became of it counts.
 
 Set `RetryPolicy` on the `WorkflowDefinition` to retry the entire workflow
 when it fails. On retry, only failed/dead/cancelled tasks are reset. Completed
@@ -160,6 +165,9 @@ Lifecycle hooks fire automatically at workflow lifecycle events:
 | `OnFailure` | Workflow fails (all retries exhausted) |
 | `OnExit` | Always, after completion or failure |
 
+A workflow that times out has failed. One that is retried ends once more, and its hooks start again. Child workflows
+have hooks of their own.
+
 Each hook is a `WorkflowHookDef` with a `TaskType` and optional `Payload`.
 The hook job runs as a regular task.
 
@@ -171,8 +179,11 @@ pending -> running -> completed | failed | cancelled | continued | suspended
 
 Terminal states: `completed`, `failed`, `cancelled`, `continued`.
 
+A suspended workflow dispatches nothing. What is under way goes on, and what becomes ready is dispatched when the
+workflow is resumed. It can still fail, time out, or complete if nothing is left to dispatch.
+
 ## Execution Timeout and Priority
 
 Set `ExecutionTimeout` on the definition to enforce a deadline for the entire
-workflow. Set `DefaultPriority` to control dispatch priority of all tasks
+workflow. Each retry has it to itself. Set `DefaultPriority` to control dispatch priority of all tasks
 (individual tasks can override via their own `Priority` field).

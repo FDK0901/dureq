@@ -41,6 +41,12 @@ Items are dispatched in chunks of `ChunkSize` (default: 100). When running items
 in a chunk complete, the next chunk is dispatched. This prevents flooding the
 work stream with thousands of messages at once.
 
+The batch records which jobs it starts before it starts them, so that an item is dispatched
+once, however fast the first ones finish. If the process that does so stops in between, the
+orchestrator starts what is missing as soon as another item of the batch finishes.
+`EnqueueBatch` and `RetryBatch` return an error, and the batch is `failed`, if nothing could
+be dispatched.
+
 ## Failure Policy
 
 | Policy | Behavior |
@@ -79,7 +85,9 @@ batch, err := client.RetryBatch(ctx, batchID, false)
 ```
 
 On retry, the batch increments its `Attempt` counter. If `retryFailedOnly` is true,
-completed items are preserved and only failed items are re-dispatched.
+completed items are preserved, and only failed and cancelled items and those that were never
+dispatched are. An item that was still under way when the batch ended is not started again:
+what became of it counts. Otherwise completed items run again, too.
 
 ## Cancellation
 
@@ -91,4 +99,4 @@ All non-terminal item jobs and the onetime job (if running) are cancelled.
 
 ## Execution Timeout
 
-Set `ExecutionTimeout` on the definition to enforce a deadline for the entire batch.
+Set `ExecutionTimeout` on the definition to enforce a deadline for the entire batch. Each retry has it to itself.

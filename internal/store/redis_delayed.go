@@ -46,13 +46,19 @@ func (p *DelayedPoller) Start(ctx context.Context) {
 
 func (p *DelayedPoller) poll(ctx context.Context) {
 	for _, tier := range p.store.cfg.Tiers {
-		moved, err := p.store.MoveDelayedToStream(ctx, tier.Name, p.maxMove)
-		if err != nil {
-			p.logger.Warn().Err(err).String("tier", tier.Name).Msg("delayed-poller: failed to move messages")
-			continue
-		}
-		if moved > 0 {
-			p.logger.Debug().Int64("moved", moved).String("tier", tier.Name).Msg("delayed-poller: moved ripe messages to work stream")
+		// In steps, as Redis does nothing else meanwhile, until no more are ripe.
+		for ctx.Err() == nil {
+			moved, err := p.store.MoveDelayedToStream(ctx, tier.Name, p.maxMove)
+			if err != nil {
+				p.logger.Warn().Err(err).String("tier", tier.Name).Msg("delayed-poller: failed to move messages")
+				break
+			}
+			if moved > 0 {
+				p.logger.Debug().Int64("moved", moved).String("tier", tier.Name).Msg("delayed-poller: moved ripe messages to work stream")
+			}
+			if moved < int64(p.maxMove) {
+				break
+			}
 		}
 	}
 }

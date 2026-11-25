@@ -14,6 +14,9 @@ type DureqdConfig struct {
 	Mode           string   `koanf:"mode"`           // "full", "queue", "scheduler", "workflow", "monitor" or comma-separated combo
 	Handlers       []string `koanf:"handlers"`        // enabled handler task types; empty = all
 	DrainTimeoutMs int      `koanf:"drainTimeoutMs"`  // max time (ms) to wait for in-flight jobs during shutdown; 0 = 30s default
+
+	// RunHistoryRetentionHours is how long (h) finished runs are kept in the run history; 0 = until removed by hand
+	RunHistoryRetentionHours int `koanf:"runHistoryRetentionHours"`
 }
 
 type RedisConfig struct {

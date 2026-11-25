@@ -45,6 +45,7 @@ var (
 	WithRedisCluster          = server.WithRedisCluster
 	WithGroupAggregation      = server.WithGroupAggregation
 	WithRetentionPeriod       = server.WithRetentionPeriod
+	WithRunHistoryRetention   = server.WithRunHistoryRetention
 	WithShutdownTimeout       = server.WithShutdownTimeout
 	WithMode                  = server.WithMode
 )

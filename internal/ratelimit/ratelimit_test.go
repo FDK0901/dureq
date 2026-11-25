@@ -136,3 +136,32 @@ func TestLimiter_Allow_Refill(t *testing.T) {
 		t.Fatal("Allow() should be allowed after refill period")
 	}
 }
+
+func TestLimiter_Return(t *testing.T) {
+	rdb := newTestClient(t)
+	ctx := context.Background()
+	limiter := New(rdb, "dureq_test_return_"+time.Now().Format("20060102150405.000"))
+	cfg := Config{MaxTokens: 5}
+	want := func(n int, want bool) {
+		t.Helper()
+		got, err := limiter.Allow(ctx, "tier1", n, cfg)
+		if err != nil || got != want {
+			t.Fatalf("allow %d: %v (%v), want %v", n, got, err, want)
+		}
+	}
+	want(5, true)
+	want(1, false)
+	if err := limiter.Return(ctx, "tier1", 3, cfg); err != nil {
+		t.Fatal(err)
+	}
+	want(4, false)
+	want(3, true)
+	want(1, false)
+	// More than the capacity does not come back.
+	if err := limiter.Return(ctx, "tier1", 100, cfg); err != nil {
+		t.Fatal(err)
+	}
+	want(6, false)
+	want(5, true)
+	want(1, false)
+}

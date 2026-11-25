@@ -20,6 +20,13 @@ func WithRetentionPeriod(d time.Duration) Option {
 	return func(c *Config) { c.RetentionPeriod = &d }
 }
 
+// WithRunHistoryRetention removes runs from the run history once they finished longer than d ago.
+// Without this option they are kept until they are removed with Client.CleanupRunHistory or
+// DELETE /api/history/runs.
+func WithRunHistoryRetention(d time.Duration) Option {
+	return func(c *Config) { c.RunHistoryRetention = d }
+}
+
 // Mode controls which subsystems are started.
 type Mode int
 
@@ -80,6 +87,10 @@ type Config struct {
 	// RetentionPeriod controls how long completed/failed/dead/cancelled jobs are kept.
 	// Nil or a pointer to 0 = archival off (jobs are kept forever). Negative = 7 days.
 	RetentionPeriod *time.Duration
+
+	// RunHistoryRetention controls how long finished runs are kept in the run history.
+	// 0 or negative = until they are removed by hand.
+	RunHistoryRetention time.Duration
 
 	// Logger is the structured logger. Default: slog.Default().
 	Logger chainedlog.Logger

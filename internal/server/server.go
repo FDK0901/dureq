@@ -232,8 +232,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// Initialize archival cleaner (runs only on leader, requires ModeScheduler).
 	if s.cfg.Mode.Has(ModeScheduler) {
 		archCfg := archival.Config{
-			Store:  s.store,
-			Logger: s.logger,
+			Store:               s.store,
+			RunHistoryRetention: s.cfg.RunHistoryRetention,
+			Logger:              s.logger,
 		}
 		if s.cfg.RetentionPeriod != nil {
 			archCfg.RetentionPeriod = *s.cfg.RetentionPeriod

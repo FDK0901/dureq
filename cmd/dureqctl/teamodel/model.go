@@ -542,7 +542,7 @@ func (m *model) clampCursor() {
 }
 
 var (
-	jobFilters      = []string{"", "pending", "scheduled", "running", "completed", "failed", "dead", "cancelled"}
+	jobFilters      = []string{"", "pending", "scheduled", "running", "completed", "failed", "paused", "dead", "cancelled"}
 	workflowFilters = []string{"", "pending", "running", "completed", "failed", "cancelled"}
 	batchFilters    = []string{"", "pending", "running", "completed", "failed", "cancelled"}
 	runFilters      = []string{"", "claimed", "running", "succeeded", "failed", "timed_out", "cancelled"}
@@ -709,7 +709,7 @@ func (m model) viewDashboard() string {
 	b.WriteString("\n")
 
 	b.WriteString(subtitleStyle.Render("Jobs by Status") + "\n\n")
-	for _, status := range []string{"pending", "scheduled", "running", "completed", "failed", "retrying", "dead", "cancelled"} {
+	for _, status := range []string{"pending", "scheduled", "running", "completed", "failed", "retrying", "paused", "dead", "cancelled"} {
 		count := m.stats.JobCounts[status]
 		style := dimStyle
 		if count > 0 {

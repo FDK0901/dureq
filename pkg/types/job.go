@@ -486,14 +486,36 @@ type NodeInfo struct {
 	HandlerVersions map[string]string `json:"handler_versions,omitempty"`
 }
 
+// Pause puts the job on hold. It resumes by itself after retryAfter, or only when it is
+// resumed if that is 0.
+func (j *Job) Pause(now time.Time, retryAfter time.Duration) {
+	j.Status = JobStatusPaused
+	j.PausedAt = &now
+	j.ResumeAt = nil
+	if retryAfter > 0 {
+		resumeAt := now.Add(retryAfter)
+		j.ResumeAt = &resumeAt
+	}
+	j.UpdatedAt = now
+}
+
+// Resume takes the job off hold. The caller stores and dispatches it.
+func (j *Job) Resume(now time.Time) {
+	j.Status = JobStatusRetrying
+	j.PausedAt = nil
+	j.ResumeAt = nil
+	j.ConsecutiveErrors = 0
+	j.UpdatedAt = now
+}
+
 // PoolStats captures worker pool metrics for a node.
 type PoolStats struct {
 	RunningWorkers int    `json:"running_workers"`
 	IdleWorkers    int    `json:"idle_workers"`
 	MaxConcurrency int    `json:"max_concurrency"`
-	TotalSubmitted uint64 `json:"total_submitted"`
-	TotalCompleted uint64 `json:"total_completed"`
-	TotalFailed    uint64 `json:"total_failed"`
+	TotalSubmitted uint64 `json:"total_submitted"` // executions started since the node did
+	TotalCompleted uint64 `json:"total_completed"` // of these, the ones that succeeded
+	TotalFailed    uint64 `json:"total_failed"`    // and the ones that failed, retried or not
 	QueueLength    int    `json:"queue_length"`
 }
 
@@ -825,6 +847,9 @@ type BatchItemState struct {
 	Error      *string    `json:"error,omitempty"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// Iteration tracks how many times the item was to run again although it had completed.
+	// The OperationKey includes it, so that the ledger does not block that.
+	Iteration int `json:"iteration,omitempty"`
 }
 
 // BatchItemResult stores the output of a single batch item execution.

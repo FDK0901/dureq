@@ -78,4 +78,7 @@ type JobEvent struct {
 	// WorkflowID is set for task-level workflow events so they can be indexed
 	// under the parent workflow rather than the task's job ID.
 	WorkflowID string `json:"workflow_id,omitempty"`
+	// Standalone says that the job is known not to be part of a workflow or batch, so that
+	// the orchestrator need not see the event. It is not stored.
+	Standalone bool `json:"-"`
 }

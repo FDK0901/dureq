@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bytedance/sonic"
 
@@ -30,6 +31,10 @@ func (s *RedisStore) ListJobsPaginated(ctx context.Context, filter JobFilter) ([
 		indexKey = JobsByTaskTypeKey(s.prefix, string(*filter.TaskType))
 	} else if filter.Tag != nil {
 		indexKey = JobsByTagKey(s.prefix, *filter.Tag)
+	}
+
+	if filter.Search != nil && *filter.Search != "" {
+		return s.searchJobs(ctx, indexKey, filter)
 	}
 
 	// Total count from this index.
@@ -64,23 +69,43 @@ func (s *RedisStore) ListJobsPaginated(ctx context.Context, filter JobFilter) ([
 		return nil, 0, err
 	}
 
-	// Apply search filter (substring match on ID or TaskType) in memory.
-	// When search is active, total from the index is inaccurate because
-	// filtering happens post-fetch. Signal this with total=-1.
-	if filter.Search != nil && *filter.Search != "" {
-		search := strings.ToLower(*filter.Search)
-		filtered := jobs[:0]
-		for _, j := range jobs {
-			if strings.Contains(strings.ToLower(j.ID), search) ||
-				strings.Contains(strings.ToLower(string(j.TaskType)), search) {
-				filtered = append(filtered, j)
-			}
-		}
-		jobs = filtered
-		total = -1
-	}
-
 	return jobs, int(total), nil
+}
+
+const (
+	jobSearchChunkSize = 500
+	// maxJobSearchScan bounds the work of a search: jobs past it are not looked at.
+	maxJobSearchScan = 100_000
+)
+
+// searchJobs returns the page of the jobs whose ID or task type contains filter.Search,
+// and how many there are. It reads the jobs of the index one by one.
+func (s *RedisStore) searchJobs(ctx context.Context, indexKey string, filter JobFilter) ([]types.Job, int, error) {
+	search := strings.ToLower(*filter.Search)
+	var page []types.Job
+	total, scanned := 0, 0
+	err := s.scanIndex(ctx, indexKey, filter.Sort, jobSearchChunkSize, func(ids []string) (bool, error) {
+		jobs, err := s.hydrateJobValues(ctx, ids)
+		if err != nil {
+			return false, err
+		}
+		for _, j := range jobs {
+			if !strings.Contains(strings.ToLower(j.ID), search) &&
+				!strings.Contains(strings.ToLower(string(j.TaskType)), search) {
+				continue
+			}
+			if total >= filter.Offset && len(page) < filter.Limit {
+				page = append(page, j)
+			}
+			total++
+		}
+		scanned += len(ids)
+		return scanned < maxJobSearchScan, ctx.Err()
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("search jobs: %w", err)
+	}
+	return page, total, nil
 }
 
 // ============================================================
@@ -152,80 +177,135 @@ func (s *RedisStore) ListJobRuns(ctx context.Context, filter RunFilter) ([]types
 		max = strconv.FormatFloat(float64(filter.Until.UnixNano()), 'f', 0, 64)
 	}
 
-	total, err := s.rdb.Do(ctx, s.rdb.B().Zcount().Key(indexKey).Min(min).Max(max).Build()).AsInt64()
-	if err != nil {
-		return nil, 0, fmt.Errorf("count runs: %w", err)
-	}
-	if total == 0 {
-		return nil, 0, nil
-	}
+	for {
+		total, err := s.rdb.Do(ctx, s.rdb.B().Zcount().Key(indexKey).Min(min).Max(max).Build()).AsInt64()
+		if err != nil {
+			return nil, 0, fmt.Errorf("count runs: %w", err)
+		}
+		if total == 0 {
+			return nil, 0, nil
+		}
 
-	var ids []string
-	if filter.Sort == "oldest" {
-		ids, err = s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(indexKey).Min(min).Max(max).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
-	} else {
-		ids, err = s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(max).Min(min).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
-	}
-	if err != nil {
-		return nil, 0, fmt.Errorf("paginate runs: %w", err)
-	}
-	if len(ids) == 0 {
-		return nil, int(total), nil
-	}
+		var ids []string
+		if filter.Sort == "oldest" {
+			ids, err = s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(indexKey).Min(min).Max(max).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
+		} else {
+			ids, err = s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(max).Min(min).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
+		}
+		if err != nil {
+			return nil, 0, fmt.Errorf("paginate runs: %w", err)
+		}
+		if len(ids) == 0 {
+			return nil, int(total), nil
+		}
 
-	runs, err := s.hydrateRunValues(ctx, ids)
-	if err != nil {
-		return nil, 0, err
+		runs, err := s.hydrateRunValues(ctx, ids)
+		if err != nil {
+			return nil, 0, err
+		}
+		if filter.JobID == nil && filter.Status != nil {
+			removed, err := s.removeStaleRuns(ctx, indexKey, *filter.Status, runs)
+			if err != nil {
+				return nil, 0, err
+			}
+			if removed {
+				continue
+			}
+		}
+		return runs, int(total), nil
 	}
-	return runs, int(total), nil
+}
+
+// removeStaleRuns removes the runs that have a different status by now from the index of
+// a status, and reports whether there were any. Versions before v0.3.0 left a run that
+// was retried in the index of every status it has had.
+func (s *RedisStore) removeStaleRuns(ctx context.Context, indexKey string, status types.RunStatus, runs []types.JobRun) (bool, error) {
+	var stale []string
+	for _, run := range runs {
+		if run.Status != status {
+			stale = append(stale, run.ID)
+		}
+	}
+	if len(stale) == 0 {
+		return false, nil
+	}
+	if err := s.rdb.Do(ctx, s.rdb.B().Zrem().Key(indexKey).Member(stale...).Build()).Error(); err != nil {
+		return false, fmt.Errorf("remove stale runs: %w", err)
+	}
+	return true, nil
 }
 
 // ============================================================
 // Paginated Job Event listing (history)
 // ============================================================
 
-// ListJobEvents returns paginated job events from history.
+const (
+	eventScanChunkSize = 1000
+	// eventClockSkew is how far the clock of the node that published an event, which is
+	// the event's Timestamp, may be off that of Redis, which is the ID in the stream.
+	eventClockSkew = time.Minute
+)
+
+// ListJobEvents returns a page of the events, newest first, and how many there are. They
+// are read from the event stream, which keeps about the last EventStreamMaxLen of them.
+// If filter.SkipTotal is set, the count goes no further than the page.
 func (s *RedisStore) ListJobEvents(ctx context.Context, filter EventFilter) ([]types.JobEvent, int, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = 20
 	}
 
-	indexKey := HistoryEventsKey(s.prefix)
-	if filter.JobID != nil {
-		indexKey = HistoryEventsByJobKey(s.prefix, *filter.JobID)
-	} else if filter.EventType != nil {
-		indexKey = HistoryEventsByTypeKey(s.prefix, string(*filter.EventType))
-	}
-
-	min, max := "-inf", "+inf"
+	start, end := "-", "+"
 	if filter.Since != nil {
-		min = strconv.FormatFloat(float64(filter.Since.UnixNano()), 'f', 0, 64)
+		start = strconv.FormatInt(max(0, filter.Since.Add(-eventClockSkew).UnixMilli()), 10)
 	}
 	if filter.Until != nil {
-		max = strconv.FormatFloat(float64(filter.Until.UnixNano()), 'f', 0, 64)
+		end = strconv.FormatInt(max(0, filter.Until.Add(eventClockSkew).UnixMilli()), 10)
 	}
 
-	total, err := s.rdb.Do(ctx, s.rdb.B().Zcount().Key(indexKey).Min(min).Max(max).Build()).AsInt64()
-	if err != nil {
-		return nil, 0, fmt.Errorf("count events: %w", err)
-	}
-	if total == 0 {
-		return nil, 0, nil
-	}
+	// Without a filter there is no need to read all events to count them.
+	unfiltered := filter.JobID == nil && filter.EventType == nil && filter.Since == nil && filter.Until == nil
 
-	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(max).Min(min).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
-	if err != nil {
-		return nil, 0, fmt.Errorf("paginate events: %w", err)
+	var page []types.JobEvent
+	total := 0
+	for {
+		entries, err := s.rdb.Do(ctx, s.rdb.B().Xrevrange().Key(EventsStreamKey(s.prefix)).End(end).Start(start).Count(eventScanChunkSize).Build()).AsXRange()
+		if err != nil {
+			return nil, 0, fmt.Errorf("list events: %w", err)
+		}
+		for _, entry := range entries {
+			if filter.JobID != nil && entry.FieldValues["job_id"] != *filter.JobID {
+				continue
+			}
+			if filter.EventType != nil && entry.FieldValues["type"] != string(*filter.EventType) {
+				continue
+			}
+			inPage := total >= filter.Offset && len(page) < filter.Limit
+			if inPage || filter.Since != nil || filter.Until != nil {
+				var event types.JobEvent
+				if err := sonic.ConfigFastest.Unmarshal([]byte(entry.FieldValues["data"]), &event); err != nil {
+					continue
+				}
+				if filter.Since != nil && event.Timestamp.Before(*filter.Since) || filter.Until != nil && event.Timestamp.After(*filter.Until) {
+					continue
+				}
+				if inPage {
+					page = append(page, event)
+				}
+			}
+			total++
+		}
+		if len(entries) < eventScanChunkSize || filter.SkipTotal && len(page) == filter.Limit {
+			return page, total, nil
+		}
+		if unfiltered && len(page) == filter.Limit {
+			n, err := s.rdb.Do(ctx, s.rdb.B().Xlen().Key(EventsStreamKey(s.prefix)).Build()).AsInt64()
+			if err != nil {
+				return nil, 0, fmt.Errorf("count events: %w", err)
+			}
+			return page, int(n), nil
+		}
+		end = "(" + entries[len(entries)-1].ID
 	}
-	if len(ids) == 0 {
-		return nil, int(total), nil
-	}
-
-	events, err := s.hydrateEventValues(ctx, ids)
-	if err != nil {
-		return nil, 0, err
-	}
-	return events, int(total), nil
 }
 
 // ============================================================
@@ -445,27 +525,6 @@ func (s *RedisStore) hydrateRunValues(ctx context.Context, ids []string) ([]type
 	return runs, nil
 }
 
-func (s *RedisStore) hydrateEventValues(ctx context.Context, ids []string) ([]types.JobEvent, error) {
-	cmds := make(rueidis.Commands, 0, len(ids))
-	for _, id := range ids {
-		cmds = append(cmds, s.rdb.B().Hget().Key(HistoryEventKey(s.prefix, id)).Field("data").Build())
-	}
-	results := s.rdb.DoMulti(ctx, cmds...)
-
-	var events []types.JobEvent
-	for _, r := range results {
-		dataStr, err := r.ToString()
-		if err != nil {
-			continue
-		}
-		var event types.JobEvent
-		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &event) == nil {
-			events = append(events, event)
-		}
-	}
-	return events, nil
-}
-
 func (s *RedisStore) hydrateWorkflowValues(ctx context.Context, ids []string) ([]types.WorkflowInstance, error) {
 	cmds := make(rueidis.Commands, 0, len(ids))
 	for _, id := range ids {
@@ -481,6 +540,7 @@ func (s *RedisStore) hydrateWorkflowValues(ctx context.Context, ids []string) ([
 		}
 		var wf types.WorkflowInstance
 		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &wf) == nil {
+			nameWorkflowTasks(&wf)
 			wfs = append(wfs, wf)
 		}
 	}

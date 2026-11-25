@@ -16,6 +16,9 @@ type Config struct {
 	// RetentionPeriod is how long completed/failed/dead/cancelled jobs are kept.
 	// Jobs older than this are deleted. 0 (the zero value) = archival off, negative = 7 days.
 	RetentionPeriod time.Duration
+	// RunHistoryRetention is how long finished runs are kept in the run history.
+	// Older ones are removed. 0 (the zero value) or negative = they are kept.
+	RunHistoryRetention time.Duration
 	// ScanInterval is how often the cleaner runs. Default: 1 hour.
 	ScanInterval time.Duration
 	// BatchSize is the number of jobs to process per scan iteration. Default: 100.
@@ -23,14 +26,16 @@ type Config struct {
 	Logger    chainedlog.Logger
 }
 
-// Cleaner periodically removes completed jobs older than the retention period.
+// Cleaner periodically removes completed jobs older than the retention period, and runs
+// older than the retention of the run history.
 type Cleaner struct {
-	store           *store.RedisStore
-	retentionPeriod time.Duration
-	scanInterval    time.Duration
-	batchSize       int
-	logger          chainedlog.Logger
-	cancel          context.CancelFunc
+	store               *store.RedisStore
+	retentionPeriod     time.Duration
+	runHistoryRetention time.Duration
+	scanInterval        time.Duration
+	batchSize           int
+	logger              chainedlog.Logger
+	cancel              context.CancelFunc
 }
 
 // New creates a new archival cleaner.
@@ -48,18 +53,19 @@ func New(cfg Config) *Cleaner {
 		cfg.Logger = chainedslog.NewSlog(chainedslog.NewSlogBase())
 	}
 	return &Cleaner{
-		store:           cfg.Store,
-		retentionPeriod: cfg.RetentionPeriod,
-		scanInterval:    cfg.ScanInterval,
-		batchSize:       cfg.BatchSize,
-		logger:          cfg.Logger,
+		store:               cfg.Store,
+		retentionPeriod:     cfg.RetentionPeriod,
+		runHistoryRetention: cfg.RunHistoryRetention,
+		scanInterval:        cfg.ScanInterval,
+		batchSize:           cfg.BatchSize,
+		logger:              cfg.Logger,
 	}
 }
 
 // Start begins the archival loop. Non-blocking.
-// If RetentionPeriod is 0, archival is disabled and Start is a no-op.
+// If neither jobs nor runs are to be removed, Start is a no-op.
 func (c *Cleaner) Start(ctx context.Context) {
-	if c.retentionPeriod == 0 {
+	if c.retentionPeriod == 0 && c.runHistoryRetention <= 0 {
 		return
 	}
 	ctx, c.cancel = context.WithCancel(ctx)
@@ -91,6 +97,25 @@ func (c *Cleaner) loop(ctx context.Context) {
 }
 
 func (c *Cleaner) cleanup(ctx context.Context) {
+	if c.retentionPeriod != 0 {
+		c.cleanupJobs(ctx)
+	}
+	if c.runHistoryRetention > 0 {
+		c.cleanupRuns(ctx)
+	}
+}
+
+func (c *Cleaner) cleanupRuns(ctx context.Context) {
+	removed, err := c.store.Cleanup(ctx, time.Now().Add(-c.runHistoryRetention))
+	if err != nil && ctx.Err() == nil {
+		c.logger.Warn().Err(err).Msg("archival: failed to clean up the run history")
+	}
+	if removed > 0 {
+		c.logger.Info().Int64("removed", removed).Msg("archival: cleaned up the run history")
+	}
+}
+
+func (c *Cleaner) cleanupJobs(ctx context.Context) {
 	cutoff := time.Now().Add(-c.retentionPeriod)
 	deleted := 0
 

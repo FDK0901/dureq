@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -33,10 +34,13 @@ func (s *RedisStore) EnsureStreams(ctx context.Context) error {
 		return fmt.Errorf("create DLQ consumer group: %w", err)
 	}
 
-	// Orchestrator consumer group on events stream.
-	err = s.rdb.Do(ctx, s.rdb.B().XgroupCreate().Key(EventsStreamKey(s.prefix)).Group(OrchestratorConsumerGroup).Id("0").Mkstream().Build()).Error()
-	if err != nil && !isGroupExistsErr(err) {
-		return fmt.Errorf("create orchestrator consumer group: %w", err)
+	// Orchestrator consumer groups: on its stream, and on the events stream for events from
+	// nodes before v0.3.0.
+	for _, key := range []string{OrchestratorStreamKey(s.prefix), EventsStreamKey(s.prefix)} {
+		err = s.rdb.Do(ctx, s.rdb.B().XgroupCreate().Key(key).Group(OrchestratorConsumerGroup).Id("0").Mkstream().Build()).Error()
+		if err != nil && !isGroupExistsErr(err) {
+			return fmt.Errorf("create orchestrator consumer group: %w", err)
+		}
 	}
 
 	return nil
@@ -112,9 +116,11 @@ func (s *RedisStore) DispatchWork(ctx context.Context, tierName string, wm *type
 
 // DispatchToDLQ adds a message to the dead letter queue stream.
 func (s *RedisStore) DispatchToDLQ(ctx context.Context, wm *types.WorkMessage) error {
-	_, err := s.rdb.Do(ctx, s.rdb.B().Xadd().Key(DLQStreamKey(s.prefix)).
-		Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.DLQStreamMaxLen, 10)).
-		Id("*").FieldValue().
+	add := s.rdb.B().Xadd().Key(DLQStreamKey(s.prefix)).Id("*")
+	if s.cfg.DLQStreamMaxLen > 0 {
+		add = s.rdb.B().Xadd().Key(DLQStreamKey(s.prefix)).Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.DLQStreamMaxLen, 10)).Id("*")
+	}
+	_, err := s.rdb.Do(ctx, add.FieldValue().
 		FieldValue("run_id", wm.RunID).
 		FieldValue("job_id", wm.JobID).
 		FieldValue("task_type", string(wm.TaskType)).
@@ -131,13 +137,37 @@ func (s *RedisStore) DispatchToDLQ(ctx context.Context, wm *types.WorkMessage) e
 
 // PublishEvent publishes an event to both Pub/Sub (real-time) and the event stream (history).
 func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) error {
+	cmds, publish, err := s.eventCmds(event)
+	if err != nil {
+		return err
+	}
+	return s.doAndPublish(ctx, cmds, publish)
+}
+
+// StartRun stores a run that starts, and publishes the event of that.
+func (s *RedisStore) StartRun(ctx context.Context, run *types.JobRun, event types.JobEvent) error {
+	cmds, err := s.runCmds(run)
+	if err != nil {
+		return err
+	}
+	eventCmds, publish, err := s.eventCmds(event)
+	if err != nil {
+		return err
+	}
+	return s.doAndPublish(ctx, append(cmds, eventCmds...), publish)
+}
+
+// eventCmds returns the commands that store an event, and those that publish it.
+func (s *RedisStore) eventCmds(event types.JobEvent) (cmds, publish rueidis.Commands, err error) {
 	data, err := sonic.ConfigFastest.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
+		return nil, nil, fmt.Errorf("marshal event: %w", err)
 	}
 
-	// Slot-targeted commands (XADD, ZADD) — safe for cluster DoMulti.
-	cmds := make(rueidis.Commands, 0, 2)
+	// For the orchestrator, until it has processed the event.
+	if forOrchestrator(event) {
+		cmds = append(cmds, s.addOrchestratorEventCmd(string(event.Type), event.JobID, string(data)))
+	}
 
 	// Append to durable event stream for history replay.
 	cmds = append(cmds, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
@@ -148,6 +178,7 @@ func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) err
 		FieldValue("run_id", event.RunID).
 		FieldValue("node_id", event.NodeID).
 		FieldValue("data", string(data)).
+		FieldValue(routedField, "1").
 		Build())
 
 	// Per-workflow event index: index workflow-related events by workflow ID.
@@ -163,17 +194,119 @@ func (s *RedisStore) PublishEvent(ctx context.Context, event types.JobEvent) err
 				ScoreMember().ScoreMember(score, string(data)).Build())
 		}
 	}
+	return cmds, s.publishEventCmds(event, data), nil
+}
 
-	for _, resp := range s.rdb.DoMulti(ctx, cmds...) {
-		if err := resp.Error(); err != nil {
+// routedField marks an event in the event stream whose writer has given the orchestrator its
+// own copy, if that has to see it. Nodes before v0.3.0 do not set it.
+const routedField = "routed"
+
+// forOrchestrator reports whether the orchestrator has to see an event.
+func forOrchestrator(event types.JobEvent) bool {
+	return OrchestratorHandles(event.Type) && !event.Standalone
+}
+
+// OrchestratorHandles reports whether there is something for the orchestrator to do on events
+// of a type.
+func OrchestratorHandles(t types.EventType) bool {
+	switch t {
+	case types.EventJobCompleted, types.EventJobFailed, types.EventJobDead,
+		types.EventWorkflowStarted, types.EventWorkflowSignalReceived, types.EventWorkflowResumed, types.EventWorkflowRetrying,
+		types.EventWorkflowCompleted, types.EventWorkflowFailed, types.EventWorkflowTimedOut, types.EventWorkflowCancelled,
+		types.EventBatchRetrying:
+		return true
+	}
+	return false
+}
+
+// addOrchestratorEventCmd returns the command that gives an event to the orchestrator. It is
+// not limited in length: an event stays until it has been processed.
+func (s *RedisStore) addOrchestratorEventCmd(eventType, jobID, data string) rueidis.Completed {
+	return s.rdb.B().Xadd().Key(OrchestratorStreamKey(s.prefix)).Id("*").FieldValue().
+		FieldValue("type", eventType).
+		FieldValue("job_id", jobID).
+		FieldValue("data", data).
+		Build()
+}
+
+// DoneOrchestratorEvents removes events that have been processed.
+func (s *RedisStore) DoneOrchestratorEvents(ctx context.Context, ids ...string) {
+	if len(ids) == 0 {
+		return
+	}
+	key := OrchestratorStreamKey(s.prefix)
+	s.rdb.DoMulti(ctx,
+		s.rdb.B().Xack().Key(key).Group(OrchestratorConsumerGroup).Id(ids...).Build(),
+		s.rdb.B().Xdel().Key(key).Id(ids...).Build())
+}
+
+// ForwardEvents gives the orchestrator its copy of events in the event stream from nodes
+// before v0.3.0, which do not. It looks at up to count events and returns how many there were.
+// Those that an orchestrator of such a version had taken and not finished come first.
+func (s *RedisStore) ForwardEvents(ctx context.Context, consumer string, count int64) (int, error) {
+	key := EventsStreamKey(s.prefix)
+	read := func(id string) ([]rueidis.XRangeEntry, error) {
+		streams, err := s.rdb.Do(ctx, s.rdb.B().Xreadgroup().Group(OrchestratorConsumerGroup, consumer).Count(count).Streams().Key(key).Id(id).Build()).AsXRead()
+		if err != nil && !rueidis.IsRedisNil(err) {
+			return nil, fmt.Errorf("forward events: %w", err)
+		}
+		return streams[key], nil
+	}
+	entries, err := read("0")
+	if err == nil && len(entries) == 0 {
+		entries, err = read(">")
+	}
+	if err != nil || len(entries) == 0 {
+		return 0, err
+	}
+
+	ids := make([]string, 0, len(entries))
+	var forward rueidis.Commands
+	for _, e := range entries {
+		ids = append(ids, e.ID)
+		if e.FieldValues[routedField] == "" && OrchestratorHandles(types.EventType(e.FieldValues["type"])) {
+			forward = append(forward, s.addOrchestratorEventCmd(e.FieldValues["type"], e.FieldValues["job_id"], e.FieldValues["data"]))
+		}
+	}
+	for _, r := range s.rdb.DoMulti(ctx, forward...) {
+		if err := r.Error(); err != nil {
+			return 0, fmt.Errorf("forward events: %w", err)
+		}
+	}
+	if err := s.rdb.Do(ctx, s.rdb.B().Xack().Key(key).Group(OrchestratorConsumerGroup).Id(ids...).Build()).Error(); err != nil {
+		return 0, fmt.Errorf("forward events: %w", err)
+	}
+	return len(entries), nil
+}
+
+// publishEventCmds returns the commands that publish an event via Pub/Sub.
+func (s *RedisStore) publishEventCmds(event types.JobEvent, data []byte) rueidis.Commands {
+	cmds := rueidis.Commands{s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(data)).Build()}
+	if event.BatchProgress != nil {
+		cmds = append(cmds, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, event.BatchProgress.BatchID)).Message(string(data)).Build())
+	}
+	return cmds
+}
+
+// doAndPublish runs cmds and then publish, which are PUBLISH commands, in one round trip. With
+// Redis Cluster and several cmds it takes two: the latter have no slot and cannot be mixed
+// with several. It returns the first error of cmds.
+func (s *RedisStore) doAndPublish(ctx context.Context, cmds, publish rueidis.Commands) error {
+	n := len(cmds)
+	apart := n > 1 && s.rdb.Mode() == rueidis.ClientModeCluster
+	if !apart {
+		cmds = append(cmds, publish...)
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	for _, r := range s.rdb.DoMulti(ctx, cmds...)[:n] {
+		if err := r.Error(); err != nil {
 			return err
 		}
 	}
-
-	// Pub/Sub (no-slot) — must be sent separately for Redis Cluster compatibility.
-	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(data)).Build())
-	if event.BatchProgress != nil {
-		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, event.BatchProgress.BatchID)).Message(string(data)).Build())
+	if apart && len(publish) > 0 {
+		s.rdb.DoMulti(ctx, publish...)
 	}
 	return nil
 }
@@ -271,6 +404,10 @@ type CompletionBatch struct {
 	// If set, CompleteRun performs a two-phase commit: Lua ledger mark (atomic commit
 	// point) followed by the DoMulti bookkeeping pipeline. Empty = skip ledger (backward compat).
 	OperationKey string
+
+	// How far CompleteRun got, if it fails and is called again.
+	committed bool // this batch has marked the ledger, or may have
+	stored    bool // nothing but the acknowledgement is missing
 }
 
 // CompleteRun performs a two-phase completion:
@@ -284,65 +421,76 @@ type CompletionBatch struct {
 // Slot-targeted commands are pipelined via DoMulti; PUBLISH (no-slot)
 // commands are sent separately for Redis Cluster compatibility.
 func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) error {
+	var publish rueidis.Commands
+	if !batch.stored {
+		var err error
+		if publish, err = s.storeCompletion(ctx, batch); err != nil {
+			return err
+		}
+		batch.stored = true
+	}
+
+	// Phase 3: AckMessage, now that nothing is left to do, and Pub/Sub notifications.
+	// Crash recovery notifications are handled by RepairCompletedOperation.
+	if err := s.doAndPublish(ctx, s.ackCmds(batch.AckTierName, batch.AckMessageID), publish); err != nil {
+		return fmt.Errorf("complete run ack: %w", err)
+	}
+	return nil
+}
+
+// storeCompletion is the first two phases of CompleteRun. It returns the commands that
+// publish the notifications.
+func (s *RedisStore) storeCompletion(ctx context.Context, batch *CompletionBatch) (publish rueidis.Commands, err error) {
 	resultData, err := sonic.ConfigFastest.Marshal(batch.Result)
 	if err != nil {
-		return fmt.Errorf("marshal result: %w", err)
+		return nil, fmt.Errorf("marshal result: %w", err)
 	}
 
 	// Phase 1: Operation ledger commit (exactly-once gate).
 	// The ledger CAS is the atomic commit point. Phase 2 always runs for
-	// idempotent ops (result, history, cleanup, XACK). Non-idempotent ops
-	// (stats increment, event stream append) only run on first completion.
+	// idempotent ops (result, history, cleanup). Non-idempotent ops
+	// (stats increment, event stream append) only run on first completion (of the
+	// operation, and of the job).
 	firstCompletion := true
+	firstOfJob := true
 	if batch.OperationKey != "" {
 		isNew, err := s.CompleteOperation(ctx, batch.OperationKey, batch.Run.ID, string(resultData))
 		if err != nil {
-			return fmt.Errorf("operation ledger commit: %w", err)
+			batch.committed = true // perhaps; an event too many does no harm
+			return nil, fmt.Errorf("operation ledger commit: %w", err)
 		}
 		firstCompletion = isNew
+		batch.committed = batch.committed || isNew
+		firstOfJob = batch.committed || s.completedByOtherJob(ctx, batch.OperationKey, batch.Run.JobID)
 		if isNew {
 			if durErr := s.waitDurability(ctx); durErr != nil {
 				s.logger.Warn().Err(durErr).Msg("durability wait failed after ledger commit")
 			}
 		}
-		// isNew=false → replay: run idempotent Phase 2 ops only (result, history, cleanup, XACK).
+		// isNew=false → replay: run idempotent Phase 2 ops only (result, history, cleanup).
 	}
 
 	// Phase 2: Bookkeeping pipeline.
-	// Idempotent ops (HSET, ZADD, SREM, DEL, XACK) always run.
+	// Idempotent ops (HSET, ZADD, SREM, DEL) always run.
 	// Non-idempotent ops (HINCRBY stats, XADD events) only run on firstCompletion.
 	runData, err := sonic.ConfigFastest.Marshal(batch.Run)
 	if err != nil {
-		return fmt.Errorf("marshal run: %w", err)
-	}
-	eventData, err := sonic.ConfigFastest.Marshal(batch.Event)
-	if err != nil {
-		return fmt.Errorf("marshal event: %w", err)
+		return nil, fmt.Errorf("marshal run: %w", err)
 	}
 
 	cmds := make(rueidis.Commands, 0, 24)
 
-	// 1. SaveRun (terminal status)
-	cmds = append(cmds, s.rdb.B().Hset().Key(RunKey(s.prefix, batch.Run.ID)).FieldValue().FieldValue("data", string(runData)).Build())
-	cmds = append(cmds, s.rdb.B().Hincrby().Key(RunKey(s.prefix, batch.Run.ID)).Field("_version").Increment(1).Build())
-	cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveKey(s.prefix)).Member(batch.Run.ID).Build())
-	cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveByJobKey(s.prefix, batch.Run.JobID)).Member(batch.Run.ID).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(RunsByJobKey(s.prefix, batch.Run.JobID)).ScoreMember().ScoreMember(float64(batch.Run.StartedAt.UnixNano()), batch.Run.ID).Build())
+	// 1. SaveJobRun (history)
+	cmds = append(cmds, s.historyRunCmds(batch.Run, runData)...)
 
-	// 2. SaveJobRun (history) — uses same marshaled data
-	score := float64(batch.Run.StartedAt.UnixNano())
-	cmds = append(cmds, s.rdb.B().Hset().Key(HistoryRunKey(s.prefix, batch.Run.ID)).FieldValue().FieldValue("data", string(runData)).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsKey(s.prefix)).ScoreMember().ScoreMember(score, batch.Run.ID).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByJobKey(s.prefix, batch.Run.JobID)).ScoreMember().ScoreMember(score, batch.Run.ID).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByStatusKey(s.prefix, string(batch.Run.Status))).ScoreMember().ScoreMember(score, batch.Run.ID).Build())
-
-	// 3. DeleteRun — data already in history, clean active tracking
+	// 2. DeleteRun — data already in history, clean active tracking
 	cmds = append(cmds, s.rdb.B().Del().Key(RunKey(s.prefix, batch.Run.ID)).Build())
 	cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveKey(s.prefix)).Member(batch.Run.ID).Build())
 	cmds = append(cmds, s.rdb.B().Zrem().Key(RunsByJobKey(s.prefix, batch.Run.JobID)).Member(batch.Run.ID).Build())
 	cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveByJobKey(s.prefix, batch.Run.JobID)).Member(batch.Run.ID).Build())
+	cmds = append(cmds, s.rdb.B().Del().Key(CancelFlagKey(s.prefix, batch.Run.ID)).Build())
 
-	// 4. IncrDailyStat — non-idempotent, skip on replay to avoid double-count.
+	// 3. IncrDailyStat — non-idempotent, skip on replay to avoid double-count.
 	if firstCompletion {
 		date := time.Now().Format("2006-01-02")
 		statsKey := DailyStatsKey(s.prefix, date)
@@ -350,22 +498,21 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 		cmds = append(cmds, s.rdb.B().Expire().Key(statsKey).Seconds(int64((91 * 24 * time.Hour).Seconds())).Build())
 	}
 
-	// 5. Event stream — only on first completion to avoid duplicate events.
+	// 4. Event stream — only on first completion to avoid duplicate events, but for every
+	// job: whoever waits for this one does not see the event of the other.
 	// Crash recovery (different worker via XAUTOCLAIM) is handled by
 	// RepairCompletedOperation which has its own XADD.
-	if firstCompletion {
-		cmds = append(cmds, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
-			Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.EventStreamMaxLen, 10)).
-			Id("*").FieldValue().
-			FieldValue("type", string(batch.Event.Type)).
-			FieldValue("job_id", batch.Event.JobID).
-			FieldValue("run_id", batch.Event.RunID).
-			FieldValue("node_id", batch.Event.NodeID).
-			FieldValue("data", string(eventData)).
-			Build())
+	if firstOfJob {
+		eventCmds, publishCmds, err := s.eventCmds(batch.Event)
+		if err != nil {
+			return nil, err
+		}
+		cmds = append(cmds, eventCmds...)
+		publish = append(publishCmds,
+			s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, batch.Result.JobID)).Message(string(resultData)).Build())
 	}
 
-	// 6. Result hash + TTL (slot-targeted)
+	// 5. Result hash + TTL
 	resultKey := ResultKey(s.prefix, batch.Result.JobID)
 	resultTTL := s.cfg.ResultTTL
 	if batch.ResultTTLOverride > 0 {
@@ -374,28 +521,35 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 	cmds = append(cmds, s.rdb.B().Hset().Key(resultKey).FieldValue().FieldValue("data", string(resultData)).Build())
 	cmds = append(cmds, s.rdb.B().Expire().Key(resultKey).Seconds(int64(resultTTL.Seconds())).Build())
 
-	// 7. AckMessage (v1 only — stream message acknowledgment)
-	if batch.AckTierName != "" && batch.AckMessageID != "" {
-		cmds = append(cmds, s.rdb.B().Xack().Key(WorkStreamKey(s.prefix, batch.AckTierName)).Group(ConsumerGroup).Id(batch.AckMessageID).Build())
-	}
-
 	for _, resp := range s.rdb.DoMulti(ctx, cmds...) {
 		if err := resp.Error(); err != nil {
-			return fmt.Errorf("complete run pipeline: %w", err)
+			return nil, fmt.Errorf("complete run pipeline: %w", err)
 		}
 	}
 
-	// Pub/Sub notifications (no-slot) — only on first completion.
-	// Crash recovery notifications are handled by RepairCompletedOperation.
-	if firstCompletion {
-		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(eventData)).Build())
-		if batch.Event.BatchProgress != nil {
-			s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, batch.Event.BatchProgress.BatchID)).Message(string(eventData)).Build())
-		}
-		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, batch.Result.JobID)).Message(string(resultData)).Build())
-	}
+	return publish, nil
+}
 
-	return nil
+// ackCmds returns the command that acknowledges a work message, if there is one.
+func (s *RedisStore) ackCmds(tierName, msgID string) rueidis.Commands {
+	if tierName == "" || msgID == "" {
+		return nil
+	}
+	return rueidis.Commands{s.rdb.B().Xack().Key(WorkStreamKey(s.prefix, tierName)).Group(ConsumerGroup).Id(msgID).Build()}
+}
+
+// completedByOtherJob reports whether an operation in the ledger was completed by a job other
+// than jobID: a retry that overlaps with the execution it retries is a job of its own.
+func (s *RedisStore) completedByOtherJob(ctx context.Context, opKey, jobID string) bool {
+	data, err := s.rdb.Do(ctx, s.rdb.B().Hget().Key(OperationLedgerKey(s.prefix, opKey)).Field("result").Build()).ToString()
+	if err != nil {
+		return false
+	}
+	var result types.WorkResult
+	if err := sonic.ConfigFastest.Unmarshal([]byte(data), &result); err != nil {
+		return false
+	}
+	return result.JobID != "" && result.JobID != jobID
 }
 
 // RepairCompletedOperation stores the result from the operation ledger, ACKs the
@@ -403,37 +557,35 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 // picks up a message via XAUTOCLAIM after the original worker crashed between
 // ledger commit and Phase 2 completion. All ops are idempotent.
 func (s *RedisStore) RepairCompletedOperation(ctx context.Context, jobID, tierName, msgID, resultJSON string) {
+	// The message is acknowledged last: until then, this is done again if it is interrupted.
 	resultKey := ResultKey(s.prefix, jobID)
-	cmds := make(rueidis.Commands, 0, 3)
-	cmds = append(cmds, s.rdb.B().Hset().Key(resultKey).FieldValue().FieldValue("data", resultJSON).Build())
-	cmds = append(cmds, s.rdb.B().Expire().Key(resultKey).Seconds(int64(s.cfg.ResultTTL.Seconds())).Build())
-	if tierName != "" && msgID != "" {
-		cmds = append(cmds, s.rdb.B().Xack().Key(WorkStreamKey(s.prefix, tierName)).Group(ConsumerGroup).Id(msgID).Build())
-	}
-	for _, resp := range s.rdb.DoMulti(ctx, cmds...) {
-		if err := resp.Error(); err != nil {
-			s.logger.Warn().Err(err).String("job_id", jobID).Msg("repair: pipeline error")
-		}
+	cmds := rueidis.Commands{
+		s.rdb.B().Hset().Key(resultKey).FieldValue().FieldValue("data", resultJSON).Build(),
+		s.rdb.B().Expire().Key(resultKey).Seconds(int64(s.cfg.ResultTTL.Seconds())).Build(),
 	}
 	// Publish completion event to the durable events stream so the orchestrator
 	// can progress workflow/batch state. The data field MUST be a serialized
 	// JobEvent (not WorkResult), because the orchestrator unmarshals it as JobEvent.
-	repairEvent := types.JobEvent{
+	eventCmds, publish, err := s.eventCmds(types.JobEvent{
 		Type:      types.EventJobCompleted,
 		JobID:     jobID,
 		Timestamp: time.Now(),
+	})
+	if err != nil {
+		s.logger.Warn().Err(err).String("job_id", jobID).Msg("repair: event error")
+		return
 	}
-	eventData, _ := sonic.ConfigFastest.Marshal(repairEvent)
-	s.rdb.Do(ctx, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
-		Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.EventStreamMaxLen, 10)).
-		Id("*").FieldValue().
-		FieldValue("type", string(types.EventJobCompleted)).
-		FieldValue("job_id", jobID).
-		FieldValue("data", string(eventData)).
-		Build())
+	for _, resp := range s.rdb.DoMulti(ctx, append(cmds, eventCmds...)...) {
+		if err := resp.Error(); err != nil {
+			s.logger.Warn().Err(err).String("job_id", jobID).Msg("repair: pipeline error")
+			return
+		}
+	}
 	// Pub/Sub for real-time listeners (WebSocket, result waiters).
-	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(eventData)).Build())
-	s.rdb.Do(ctx, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, jobID)).Message(resultJSON).Build())
+	publish = append(publish, s.rdb.B().Publish().Channel(ResultNotifyChannel(s.prefix, jobID)).Message(resultJSON).Build())
+	if err := s.doAndPublish(ctx, s.ackCmds(tierName, msgID), publish); err != nil {
+		s.logger.Warn().Err(err).String("job_id", jobID).Msg("repair: ack error")
+	}
 }
 
 // ============================================================
@@ -442,6 +594,45 @@ func (s *RedisStore) RepairCompletedOperation(ctx context.Context, jobID, tierNa
 
 // AddDelayed adds a work message to the delayed sorted set for future re-dispatch.
 func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.WorkMessage, executeAt time.Time) error {
+	data, err := delayedMessage(tierName, wm)
+	if err != nil {
+		return err
+	}
+
+	return s.rdb.Do(ctx, s.rdb.B().Zadd().Key(DelayedKey(s.prefix, tierName)).ScoreMember().ScoreMember(float64(executeAt.UnixNano()), string(data)).Build()).Error()
+}
+
+// PostponedMessage is a message that a worker has taken from a work stream and cannot process
+// for now.
+type PostponedMessage struct {
+	Work      *types.WorkMessage
+	MessageID string
+	Until     time.Time
+}
+
+// Postpone moves messages from the work stream of a tier to its delayed sorted set.
+func (s *RedisStore) Postpone(ctx context.Context, tierName string, msgs []PostponedMessage) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	args := make([]string, 0, 1+3*len(msgs))
+	args = append(args, ConsumerGroup)
+	for _, m := range msgs {
+		data, err := delayedMessage(tierName, m.Work)
+		if err != nil {
+			return err
+		}
+		args = append(args, strconv.FormatFloat(float64(m.Until.UnixNano()), 'f', 0, 64), string(data), m.MessageID)
+	}
+	keys := []string{DelayedKey(s.prefix, tierName), WorkStreamKey(s.prefix, tierName)}
+	if err := s.scriptPostpone.Exec(ctx, s.rdb, keys, args).Error(); err != nil {
+		return fmt.Errorf("postpone: %w", err)
+	}
+	return nil
+}
+
+// delayedMessage returns a work message as it is stored in the delayed sorted set.
+func delayedMessage(tierName string, wm *types.WorkMessage) ([]byte, error) {
 	m := map[string]interface{}{
 		"run_id":        wm.RunID,
 		"job_id":        wm.JobID,
@@ -472,12 +663,7 @@ func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.
 			m["concurrency_keys"] = string(ck)
 		}
 	}
-	data, err := sonic.ConfigFastest.Marshal(m)
-	if err != nil {
-		return err
-	}
-
-	return s.rdb.Do(ctx, s.rdb.B().Zadd().Key(DelayedKey(s.prefix, tierName)).ScoreMember().ScoreMember(float64(executeAt.UnixNano()), string(data)).Build()).Error()
+	return sonic.ConfigFastest.Marshal(m)
 }
 
 // MoveDelayedToStream atomically moves ripe delayed messages back to the work stream.
@@ -522,6 +708,11 @@ func (s *RedisStore) ReenqueueWork(ctx context.Context, tierName string, wm *typ
 	if len(wm.Headers) > 0 {
 		if hdr, err := sonic.ConfigFastest.Marshal(wm.Headers); err == nil {
 			fv = fv.FieldValue("headers", string(hdr))
+		}
+	}
+	if len(wm.ConcurrencyKeys) > 0 {
+		if ck, err := sonic.ConfigFastest.Marshal(wm.ConcurrencyKeys); err == nil {
+			fv = fv.FieldValue("concurrency_keys", string(ck))
 		}
 	}
 
@@ -570,6 +761,152 @@ func (s *RedisStore) ClaimStaleMessages(ctx context.Context, tierName, consumerN
 func (s *RedisStore) RefreshMessageClaim(ctx context.Context, tierName, consumerName, messageID string) error {
 	return s.rdb.Do(ctx, s.rdb.B().Xclaim().Key(WorkStreamKey(s.prefix, tierName)).Group(ConsumerGroup).Consumer(consumerName).MinIdleTime("0").Id(messageID).Justid().Build()).Error()
 }
+
+// QueueDepth tells how much work a tier has.
+type QueueDepth struct {
+	Waiting  *int64 // messages no worker has taken yet; nil if the server cannot tell (Redis before 7.0)
+	InFlight int64  // messages taken by a worker and not acknowledged yet
+	Delayed  int64  // messages due later, such as retries
+}
+
+// GetQueueDepth returns the depth of a tier. The length of its stream is no measure of
+// that: the stream also holds the messages that have been processed.
+func (s *RedisStore) GetQueueDepth(ctx context.Context, tierName string) (QueueDepth, error) {
+	var depth QueueDepth
+	results := s.rdb.DoMulti(ctx,
+		s.rdb.B().XinfoGroups().Key(WorkStreamKey(s.prefix, tierName)).Build(),
+		s.rdb.B().Zcard().Key(DelayedKey(s.prefix, tierName)).Build(),
+	)
+	groups, err := results[0].ToArray()
+	if err != nil && strings.Contains(err.Error(), "no such key") { // nothing was ever dispatched
+		groups, err, depth.Waiting = nil, nil, new(int64)
+	}
+	if err != nil {
+		return depth, fmt.Errorf("queue depth of %s: %w", tierName, err)
+	}
+	if depth.Delayed, err = results[1].AsInt64(); err != nil {
+		return depth, fmt.Errorf("queue depth of %s: %w", tierName, err)
+	}
+	for _, g := range groups {
+		info, err := g.AsMap()
+		if err != nil {
+			return depth, fmt.Errorf("queue depth of %s: %w", tierName, err)
+		}
+		name := info["name"]
+		if group, _ := name.ToString(); group != ConsumerGroup {
+			continue
+		}
+		pending, lag := info["pending"], info["lag"]
+		if depth.InFlight, err = pending.AsInt64(); err != nil {
+			return depth, fmt.Errorf("queue depth of %s: %w", tierName, err)
+		}
+		if n, err := lag.AsInt64(); err == nil {
+			depth.Waiting = &n
+		}
+	}
+	return depth, nil
+}
+
+// trimRounds bounds how much TrimWorkStream does at once: Redis removes up to about
+// 10,000 messages a round.
+const trimRounds = 50
+
+// TrimWorkStream removes messages from a tier's stream that every consumer group has
+// taken and acknowledged, and returns how many. Acknowledging a message leaves it in the
+// stream. It removes whole blocks of messages only, so that about a hundred stay.
+func (s *RedisStore) TrimWorkStream(ctx context.Context, tierName string) (int64, error) {
+	key := WorkStreamKey(s.prefix, tierName)
+	groups, err := s.rdb.Do(ctx, s.rdb.B().XinfoGroups().Key(key).Build()).ToArray()
+	if err != nil {
+		if strings.Contains(err.Error(), "no such key") {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+	}
+
+	// Up to what a group has taken, all messages but its pending ones are done. One that
+	// is taken from here on comes after that.
+	var oldest streamID
+	for i, g := range groups {
+		info, err := g.AsMap()
+		if err != nil {
+			return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		nameMsg, deliveredMsg := info["name"], info["last-delivered-id"]
+		name, err := nameMsg.ToString()
+		if err != nil {
+			return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		delivered, err := deliveredMsg.ToString()
+		if err != nil {
+			return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		needed, err := parseStreamID(delivered)
+		if err != nil {
+			return 0, err
+		}
+
+		// [count, smallest ID, largest ID, consumers]; the IDs are nil if there are none.
+		pending, err := s.rdb.Do(ctx, s.rdb.B().Xpending().Key(key).Group(name).Build()).ToArray()
+		if err != nil {
+			return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		if len(pending) > 1 && !pending[1].IsNil() {
+			smallest, err := pending[1].ToString()
+			if err != nil {
+				return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+			}
+			id, err := parseStreamID(smallest)
+			if err != nil {
+				return 0, err
+			}
+			if id.before(needed) {
+				needed = id
+			}
+		}
+		if i == 0 || needed.before(oldest) {
+			oldest = needed
+		}
+	}
+	if len(groups) == 0 || oldest == (streamID{}) {
+		return 0, nil
+	}
+
+	var trimmed int64
+	for range trimRounds {
+		n, err := s.rdb.Do(ctx, s.rdb.B().Xtrim().Key(key).Minid().Almost().Threshold(oldest.String()).Build()).AsInt64()
+		if err != nil {
+			return trimmed, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		if n == 0 {
+			break
+		}
+		trimmed += n
+	}
+	return trimmed, nil
+}
+
+// streamID is the ID of a stream entry.
+type streamID struct{ ms, seq uint64 }
+
+func parseStreamID(id string) (streamID, error) {
+	ms, seq, _ := strings.Cut(id, "-")
+	var parsed streamID
+	var err error
+	if parsed.ms, err = strconv.ParseUint(ms, 10, 64); err != nil {
+		return streamID{}, fmt.Errorf("stream ID %q: %w", id, err)
+	}
+	if parsed.seq, err = strconv.ParseUint(seq, 10, 64); err != nil {
+		return streamID{}, fmt.Errorf("stream ID %q: %w", id, err)
+	}
+	return parsed, nil
+}
+
+func (id streamID) before(other streamID) bool {
+	return id.ms < other.ms || id.ms == other.ms && id.seq < other.seq
+}
+
+func (id streamID) String() string { return fmt.Sprintf("%d-%d", id.ms, id.seq) }
 
 // ============================================================
 // Helpers

@@ -1,0 +1,135 @@
+// Package integration — paused recurring jobs, node totals, workflow task names.
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/FDK0901/dureq/pkg/types"
+)
+
+// A recurring job that is paused after too many errors in a row stays so until it is
+// resumed, and then runs what it was paused on and goes on with its schedule.
+func TestRecurring_AutoPaused_DoesNotFireUntilResumed(t *testing.T) {
+	const threshold = 2
+	rec := &recorder{fail: func(run int) error {
+		if run < threshold {
+			return errBoom
+		}
+		return nil
+	}}
+	_, cli := startRecorder(t, "rec.paused", rec)
+	policy := fastRetry(10)
+	policy.PauseAfterErrCount = threshold
+	job := mustEvery(t, cli, "rec.paused", time.Second, policy, "rec-paused")
+
+	waitStatus(t, cli, job.ID, types.JobStatusPaused)
+	time.Sleep(4 * time.Second) // four firings
+	if got := len(rec.seen()); got != threshold {
+		t.Fatalf("ran %d times, want it to stop at %d", got, threshold)
+	}
+	if got := statusOf(t, cli, job.ID); got != types.JobStatusPaused {
+		t.Fatalf("job is %s, want it to stay paused", got)
+	}
+
+	if err := cli.ResumeJob(context.Background(), job.ID); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	waitFor(t, 10*time.Second, "runs after the resume", func() bool { return len(rec.seen()) >= threshold+3 })
+	if got := statusOf(t, cli, job.ID); got == types.JobStatusPaused {
+		t.Fatal("job is paused again")
+	}
+}
+
+// The same for a pause that ends by itself.
+func TestRecurring_AutoPaused_ResumesByItself(t *testing.T) {
+	const threshold = 2
+	rec := &recorder{fail: func(run int) error {
+		if run < threshold {
+			return errBoom
+		}
+		return nil
+	}}
+	_, cli := startRecorder(t, "rec.selfresume", rec)
+	policy := fastRetry(10)
+	policy.PauseAfterErrCount = threshold
+	policy.PauseRetryDelay = 3 * time.Second
+	job := mustEvery(t, cli, "rec.selfresume", time.Second, policy, "rec-selfresume")
+
+	waitStatus(t, cli, job.ID, types.JobStatusPaused)
+	waitFor(t, 60*time.Second, "runs after the pause", func() bool { return len(rec.seen()) >= threshold+3 })
+}
+
+// A node reports what it has executed.
+func TestNode_Totals(t *testing.T) {
+	rec := &recorder{fail: func(run int) error {
+		if run == 0 {
+			return errBoom
+		}
+		return nil
+	}}
+	_, cli := startRecorder(t, "node.totals", rec)
+	job := mustEvery(t, cli, "node.totals", time.Second, fastRetry(3), "node-totals")
+	waitFor(t, 20*time.Second, "runs", func() bool { return len(rec.seen()) >= 4 })
+	if err := cli.Cancel(context.Background(), job.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	waitFor(t, 20*time.Second, "totals of the node", func() bool {
+		nodes, err := cli.Store().ListNodes(context.Background())
+		if err != nil || len(nodes) != 1 || nodes[0].PoolStats == nil {
+			return false
+		}
+		ps := nodes[0].PoolStats
+		return ps.TotalFailed == 1 && ps.TotalCompleted >= 3 && ps.TotalSubmitted == ps.TotalCompleted+ps.TotalFailed
+	})
+}
+
+// Finished runs stay until they are cleaned up by hand.
+func TestRunHistory_CleanedUpByHand(t *testing.T) {
+	rec := &recorder{}
+	_, cli := startRecorder(t, "runs.cleanup", rec)
+	ctx := context.Background()
+	job, err := cli.Enqueue(ctx, "runs.cleanup", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	waitStatus(t, cli, job.ID, types.JobStatusCompleted)
+
+	if n, err := cli.CleanupRunHistory(ctx, time.Now().Add(-time.Hour)); err != nil || n != 0 {
+		t.Fatalf("removed %d runs (%v), want none that old", n, err)
+	}
+	if n, err := cli.CleanupRunHistory(ctx, time.Now().Add(time.Second)); err != nil || n != 1 {
+		t.Fatalf("removed %d runs (%v), want 1", n, err)
+	}
+	if got := statusOf(t, cli, job.ID); got != types.JobStatusCompleted {
+		t.Fatalf("job is %s", got)
+	}
+}
+
+// Tasks of a workflow have their names, also in the state that is stored.
+func TestWorkflow_TaskNamesAreStored(t *testing.T) {
+	_, cli := startRecorder(t, "wf.named", &recorder{})
+	ctx := context.Background()
+	wf, err := cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{
+		Name: "named",
+		Tasks: []types.WorkflowTask{
+			{Name: "first", TaskType: "wf.named", Payload: json.RawMessage(`{}`)},
+			{Name: "second", TaskType: "wf.named", Payload: json.RawMessage(`{}`), DependsOn: []string{"first"}},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	for name, state := range wf.Tasks {
+		if state.Name != name {
+			t.Errorf("enqueued task %q has the name %q", name, state.Name)
+		}
+	}
+	waitFor(t, 20*time.Second, "workflow completed", func() bool {
+		got, _, err := cli.Store().GetWorkflow(ctx, wf.ID)
+		return err == nil && got.Status == types.WorkflowStatusCompleted
+	})
+}

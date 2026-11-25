@@ -14,9 +14,10 @@ import (
 	"github.com/rs/xid"
 )
 
-// Archiving an old job must not free a unique key that another job holds by
-// now. Needs the standalone Redis at REDIS_URL; skipped otherwise.
-func TestCleanup_UniqueKeyHeldByAnotherJob_IsNotReleased(t *testing.T) {
+// newTestStore connects to the standalone Redis at REDIS_URL under a unique key prefix.
+// Skips if REDIS_URL is unset or Redis is unreachable.
+func newTestStore(t *testing.T) *store.RedisStore {
+	t.Helper()
 	addr := strings.TrimPrefix(os.Getenv("REDIS_URL"), "redis://")
 	if addr == "" {
 		t.Skip("REDIS_URL not set")
@@ -34,6 +35,13 @@ func TestCleanup_UniqueKeyHeldByAnotherJob_IsNotReleased(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create store: %v", err)
 	}
+	return st
+}
+
+// Archiving an old job must not free a unique key that another job holds by
+// now.
+func TestCleanup_UniqueKeyHeldByAnotherJob_IsNotReleased(t *testing.T) {
+	st := newTestStore(t)
 	ctx := context.Background()
 
 	key := "k"

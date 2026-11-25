@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/dispatcher"
@@ -21,7 +22,6 @@ import (
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
-	"github.com/panjf2000/ants/v2"
 	"github.com/redis/rueidis"
 )
 
@@ -51,6 +51,9 @@ type streamMessage struct {
 	StreamMsgID  string
 	TierName     string
 	Redeliveries int
+
+	standalone bool // the job is not part of a workflow or batch
+	completed  bool // CompleteRun has been called
 }
 
 // maxRedeliveries is the limit before a message with no handler is sent to DLQ.
@@ -64,8 +67,10 @@ type Worker struct {
 	registry          HandlerRegistry
 	disp              *dispatcher.Dispatcher
 	locker            *lock.Locker
-	pool              *ants.Pool                    // global pool for tasks without dedicated concurrency
-	subpools          map[types.TaskType]*ants.Pool // per-TaskType pools
+	pool              *taskPool                    // global pool for tasks without dedicated concurrency
+	subpools          map[types.TaskType]*taskPool // per-TaskType pools
+	shared            bool                         // some task types have no pool of their own
+	freed             chan struct{}                // signals that a pool has room again
 	globalMiddlewares []types.MiddlewareFunc
 	dynCfg            *dynconfig.Manager
 	tiers             []store.TierConfig
@@ -74,13 +79,20 @@ type Worker struct {
 	rateLimiter     *ratelimit.Limiter
 	activeRuns      sync.Map // runID → struct{} for heartbeat/crash detection
 	cancelations    sync.Map // runID → context.CancelFunc for per-task cancellation
+	fetching        sync.WaitGroup
 	quit            chan struct{}
 	abort           chan struct{}
 	shutdownTimeout time.Duration
 	stopOnce        sync.Once
 	syncer          *SyncRetrier
-	ctx             context.Context
-	cancel          context.CancelFunc
+
+	// Executions since the worker was created.
+	submitted atomic.Uint64
+	completed atomic.Uint64
+	failed    atomic.Uint64
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // New creates a new worker.
@@ -95,19 +107,22 @@ func New(cfg Config) (*Worker, error) {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
-	pool, err := ants.NewPool(cfg.MaxConcurrency, ants.WithNonblocking(false))
+	freed := make(chan struct{}, 1)
+	pool, err := newTaskPool(cfg.MaxConcurrency, freed)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create per-TaskType subpools for handlers that specify Concurrency > 0.
-	subpools := make(map[types.TaskType]*ants.Pool)
+	shared := false
+	subpools := make(map[types.TaskType]*taskPool)
 	for _, tt := range cfg.Registry.TaskTypes() {
 		def, ok := cfg.Registry.Get(types.TaskType(tt))
 		if !ok || def.Concurrency <= 0 {
+			shared = true
 			continue
 		}
-		sp, err := ants.NewPool(def.Concurrency, ants.WithNonblocking(false))
+		sp, err := newTaskPool(def.Concurrency, freed)
 		if err != nil {
 			return nil, err
 		}
@@ -123,6 +138,8 @@ func New(cfg Config) (*Worker, error) {
 		locker:            cfg.Locker,
 		pool:              pool,
 		subpools:          subpools,
+		shared:            shared,
+		freed:             freed,
 		globalMiddlewares: cfg.GlobalMiddlewares,
 		dynCfg:            cfg.DynConfig,
 		tiers:             cfg.Store.Config().Tiers,
@@ -140,11 +157,12 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.ctx, w.cancel = context.WithCancel(ctx)
 	w.syncer = NewSyncRetrier(w.ctx, w.logger)
 
-	go w.priorityFetchLoop()
-	go w.claimStaleLoop()
+	w.fetching.Go(w.priorityFetchLoop)
+	w.fetching.Go(w.claimStaleLoop)
+	go w.refreshLoop()
 	go w.cancelSubscribeLoop()
 
-	w.logger.Info().String("node_id", w.nodeID).Int("pool_capacity", w.pool.Cap()).Int("tiers", len(w.tiers)).Msg("worker started with priority consumers")
+	w.logger.Info().String("node_id", w.nodeID).Int("pool_capacity", w.pool.pool.Cap()).Int("tiers", len(w.tiers)).Msg("worker started with priority consumers")
 	return nil
 }
 
@@ -156,6 +174,7 @@ func (w *Worker) Start(ctx context.Context) error {
 func (w *Worker) Stop() {
 	w.stopOnce.Do(func() {
 		close(w.quit)
+		w.returnHeld()
 
 		time.AfterFunc(w.shutdownTimeout, func() {
 			close(w.abort)
@@ -163,10 +182,21 @@ func (w *Worker) Stop() {
 
 		releaseTimeout := w.shutdownTimeout + 5*time.Second
 		if w.pool != nil {
-			w.pool.ReleaseTimeout(releaseTimeout)
+			w.pool.pool.ReleaseTimeout(releaseTimeout)
 		}
 		for _, sp := range w.subpools {
-			sp.ReleaseTimeout(releaseTimeout)
+			sp.pool.ReleaseTimeout(releaseTimeout)
+		}
+
+		// What was fetched too late is returned.
+		returned := make(chan struct{})
+		go func() {
+			w.fetching.Wait()
+			close(returned)
+		}()
+		select {
+		case <-returned:
+		case <-time.After(returnTimeout):
 		}
 
 		if w.cancel != nil {
@@ -181,9 +211,12 @@ func (w *Worker) Stats() *types.PoolStats {
 		return nil
 	}
 	return &types.PoolStats{
-		RunningWorkers: w.pool.Running(),
-		IdleWorkers:    w.pool.Free(),
-		MaxConcurrency: w.pool.Cap(),
+		RunningWorkers: w.pool.running(),
+		IdleWorkers:    w.pool.free(),
+		MaxConcurrency: w.pool.pool.Cap(),
+		TotalSubmitted: w.submitted.Load(),
+		TotalCompleted: w.completed.Load(),
+		TotalFailed:    w.failed.Load(),
 	}
 }
 
@@ -206,117 +239,268 @@ func (w *Worker) ActiveRunIDs() []string {
 	return ids
 }
 
-// availableCapacity returns the total number of free worker slots across
-// the global pool and all per-TaskType subpools. The value is a best-effort
-// estimate (racy) but sufficient for throttling XREADGROUP batch sizes.
+// availableCapacity returns how many messages the global pool and all per-TaskType subpools
+// take. The value is a best-effort estimate (racy) but sufficient for throttling XREADGROUP
+// batch sizes.
 func (w *Worker) availableCapacity() int {
-	avail := w.pool.Free()
+	avail := 0
+	if w.shared {
+		avail = w.pool.free()
+	}
 	for _, sp := range w.subpools {
-		avail += sp.Free()
+		avail += sp.room()
 	}
 	return avail
 }
+
+const (
+	// pollInterval is how often an idle worker looks for work without being notified of any.
+	pollInterval = 500 * time.Millisecond
+	// gateInterval is how often a busy worker checks whether it is draining and which
+	// queues are paused.
+	gateInterval = 50 * time.Millisecond
+	// A worker that is notified of work which another node has taken by the time it looks
+	// waits a little before it looks again, and the longer the more often that happens in a
+	// row: all nodes are notified of every job.
+	minMissDelay = 1 * time.Millisecond
+	maxMissDelay = 16 * time.Millisecond
+	// returnTimeout bounds how long a worker that is stopping takes to return messages.
+	returnTimeout = 5 * time.Second
+)
 
 // priorityFetchLoop polls tier streams in weight-descending order via XREADGROUP.
 // Higher-weight tiers are polled first and with larger batch sizes.
 // The batch size is dynamically capped by pool capacity to avoid dequeuing
 // more messages than can be immediately processed (backpressure).
 //
-// A Pub/Sub subscriber listens on JobNotifyChannel for push notifications
-// from DispatchWork, waking the fetch loop immediately instead of waiting
-// for the next polling interval (reduces dispatch-to-start latency from
-// ~500ms to near-zero).
+// A tier is read without waiting for messages, or an empty one would hold up the others.
+// When there is nothing to do, a Pub/Sub subscriber on JobNotifyChannel wakes the loop as
+// soon as work is dispatched (reduces dispatch-to-start latency from ~500ms to near-zero).
+// When there is no room, the end of a running message does.
 func (w *Worker) priorityFetchLoop() {
 	// Start push notification subscriber.
 	notify := make(chan struct{}, 1)
 	go w.jobNotifySubscriber(notify)
 
+	var (
+		gateAt    time.Time
+		draining  bool
+		paused    []bool // by tier
+		missDelay time.Duration
+	)
 	for {
 		select {
 		case <-w.quit:
 			return
 		default:
 		}
-		fetched := 0
 
+		if time.Since(gateAt) >= gateInterval {
+			draining, paused = w.store.FetchGate(w.ctx, w.nodeID)
+			gateAt = time.Now()
+		}
 		// Skip all tiers if this node is draining.
-		if draining, _ := w.store.IsNodeDraining(w.ctx, w.nodeID); draining {
-			select {
-			case <-time.After(1 * time.Second):
+		if draining {
+			if !w.pause(1 * time.Second) {
+				return
+			}
+			continue
+		}
+
+		fetched, full, poll := 0, false, pollInterval
+		for i, tier := range w.tiers {
+			// Skip paused queues.
+			if paused[i] {
 				continue
+			}
+			avail := w.availableCapacity()
+			if avail == 0 {
+				full = true
+				break
+			}
+			n, retryIn := w.fetchTier(tier, min(tier.FetchBatch, avail))
+			fetched += n
+			if retryIn > 0 {
+				poll = min(poll, retryIn)
+			}
+		}
+
+		switch {
+		case fetched > 0:
+			missDelay = 0
+		case full:
+			// Wait for a running message to end.
+			select {
+			case <-w.freed:
+			case <-time.After(pollInterval):
 			case <-w.quit:
 				return
 			}
-		}
-
-		for _, tier := range w.tiers {
-			// Skip paused queues.
-			if paused, _ := w.store.IsQueuePaused(w.ctx, tier.Name); paused {
-				continue
-			}
-
-			avail := w.availableCapacity()
-			if avail == 0 {
-				continue
-			}
-			batchSize := min(tier.FetchBatch, avail)
-
-			// Check rate limit if configured.
-			if tier.RateLimit > 0 {
-				burst := tier.RateBurst
-				if burst <= 0 {
-					burst = int(math.Ceil(tier.RateLimit))
-					if burst < 1 {
-						burst = 1
-					}
-				}
-				allowed, err := w.rateLimiter.Allow(w.ctx, tier.Name, batchSize, ratelimit.Config{
-					MaxTokens:  burst,
-					RefillRate: tier.RateLimit,
-				})
-				if err != nil {
-					w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: rate limit check failed")
-				}
-				if !allowed {
-					continue
-				}
-			}
-
-			streamKey := store.WorkStreamKey(w.store.Prefix(), tier.Name)
-			cmd := w.store.Client().B().Xreadgroup().Group(store.ConsumerGroup, w.nodeID).Count(int64(batchSize)).Block(200).Streams().Key(streamKey).Id(">").Build()
-			xStreams, err := w.store.Client().Do(w.ctx, cmd).AsXRead()
-			if err != nil {
-				if !rueidis.IsRedisNil(err) && w.ctx.Err() == nil {
-					w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: XREADGROUP error")
-				}
-				continue
-			}
-
-			for streamKey, entries := range xStreams {
-				_ = streamKey
-				for _, entry := range entries {
-					fetched++
-					sm := parseStreamMessage(entry, tier.Name)
-
-					pool := w.poolForTaskType(sm.Work.TaskType)
-					if err := pool.Submit(func() {
-						w.processMessage(sm)
-					}); err != nil {
-						w.logger.Error().Err(err).Msg("worker: pool submit failed")
-						// Don't ack — XAUTOCLAIM will reclaim it later.
-					}
-				}
-			}
-		}
-		if fetched == 0 {
+		default:
 			// Wait for either a push notification or a fallback poll interval.
 			select {
 			case <-notify:
-			case <-time.After(500 * time.Millisecond):
+				if missDelay > 0 && !w.pause(missDelay) {
+					return
+				}
+				missDelay = min(max(2*missDelay, minMissDelay), maxMissDelay)
+			case <-time.After(poll):
+				missDelay = 0
 			case <-w.quit:
 				return
 			}
 		}
+	}
+}
+
+// pause waits, and reports false if the worker is to quit.
+func (w *Worker) pause(d time.Duration) bool {
+	select {
+	case <-time.After(d):
+		return true
+	case <-w.quit:
+		return false
+	}
+}
+
+// fetchTier takes up to count messages off a tier, has them processed or put back, and returns
+// how many there were. If the rate limit of the tier does not allow any, it returns when to try
+// again.
+func (w *Worker) fetchTier(tier store.TierConfig, count int) (fetched int, retryIn time.Duration) {
+	used := 0 // of the rate limit
+	// Check rate limit if configured.
+	if tier.RateLimit > 0 {
+		burst := tier.RateBurst
+		if burst <= 0 {
+			burst = int(math.Ceil(tier.RateLimit))
+			if burst < 1 {
+				burst = 1
+			}
+		}
+		count = min(count, burst) // more than that is never allowed
+		limit := ratelimit.Config{
+			MaxTokens:  burst,
+			RefillRate: tier.RateLimit,
+		}
+		allowed, err := w.rateLimiter.Allow(w.ctx, tier.Name, count, limit)
+		if err != nil {
+			w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: rate limit check failed")
+		}
+		if !allowed {
+			return 0, time.Duration(float64(count) / tier.RateLimit * float64(time.Second))
+		}
+		defer func() {
+			if used < count {
+				if err := w.rateLimiter.Return(w.ctx, tier.Name, count-used, limit); err != nil && w.ctx.Err() == nil {
+					w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: rate limit return failed")
+				}
+			}
+		}()
+	}
+
+	streamKey := store.WorkStreamKey(w.store.Prefix(), tier.Name)
+	cmd := w.store.Client().B().Xreadgroup().Group(store.ConsumerGroup, w.nodeID).Count(int64(count)).Streams().Key(streamKey).Id(">").Build()
+	xStreams, err := w.store.Client().Do(w.ctx, cmd).AsXRead()
+	if err != nil {
+		if !rueidis.IsRedisNil(err) && w.ctx.Err() == nil {
+			w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: XREADGROUP error")
+		}
+		return 0, 0
+	}
+
+	var sms []*streamMessage
+	for _, entries := range xStreams {
+		for _, entry := range entries {
+			sms = append(sms, parseStreamMessage(entry, tier.Name))
+		}
+	}
+	fetched = len(sms)
+	used = fetched - w.process(tier.Name, sms)
+	return fetched, 0
+}
+
+// process has messages of a tier processed. Those of a task type with a limit that has enough
+// of them are put back, so that they do not hold up the others, and process returns how many
+// there were.
+func (w *Worker) process(tierName string, sms []*streamMessage) (putBack int) {
+	tooMany := make(map[*taskPool][]*streamMessage)
+	var rejected []*streamMessage
+	for _, sm := range sms {
+		run := func() { w.processMessage(sm) }
+		pool, limited := w.subpools[sm.Work.TaskType]
+		if !limited {
+			if err := w.pool.submit(run); err != nil {
+				rejected = append(rejected, sm) // the worker is stopping
+			}
+		} else if !pool.offer(sm, run) {
+			tooMany[pool] = append(tooMany[pool], sm)
+		}
+	}
+	w.returnMessages(tierName, rejected)
+	putBack = len(rejected)
+	for pool, sms := range tooMany {
+		if err := w.postpone(w.ctx, tierName, sms, pool.returnTimes(len(sms))); err != nil {
+			if w.ctx.Err() == nil {
+				w.logger.Error().Err(err).String("tier", tierName).Int("messages", len(sms)).Msg("worker: failed to put back messages, waiting for room")
+			}
+			for _, sm := range sms {
+				pool.submit(func() { w.processMessage(sm) })
+			}
+			continue
+		}
+		putBack += len(sms)
+	}
+	return putBack
+}
+
+// postpone moves messages to the delayed set of their tier.
+func (w *Worker) postpone(ctx context.Context, tierName string, sms []*streamMessage, until []time.Time) error {
+	msgs := make([]store.PostponedMessage, len(sms))
+	for i, sm := range sms {
+		msgs[i] = store.PostponedMessage{Work: &sm.Work, MessageID: sm.StreamMsgID, Until: until[i]}
+	}
+	return w.store.Postpone(ctx, tierName, msgs)
+}
+
+// refreshLoop keeps other nodes from taking over messages that are kept at hand.
+func (w *Worker) refreshLoop() {
+	for w.pause(claimRefreshInterval) {
+		for _, sp := range w.subpools {
+			for _, sm := range sp.held() {
+				if err := w.store.RefreshMessageClaim(w.ctx, sm.TierName, w.nodeID, sm.StreamMsgID); err != nil && w.ctx.Err() == nil {
+					w.logger.Warn().String("run_id", sm.Work.RunID).Err(err).Msg("worker: stream claim refresh failed")
+				}
+			}
+		}
+	}
+}
+
+// returnHeld gives other nodes the messages that are kept at hand.
+func (w *Worker) returnHeld() {
+	byTier := make(map[string][]*streamMessage)
+	for _, sp := range w.subpools {
+		for _, sm := range sp.close() {
+			byTier[sm.TierName] = append(byTier[sm.TierName], sm)
+		}
+	}
+	for tierName, sms := range byTier {
+		w.returnMessages(tierName, sms)
+	}
+}
+
+// returnMessages gives other nodes messages that this one does not process, as it is stopping.
+func (w *Worker) returnMessages(tierName string, sms []*streamMessage) {
+	if len(sms) == 0 {
+		return
+	}
+	now := make([]time.Time, len(sms))
+	for i := range now {
+		now[i] = time.Now()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), returnTimeout)
+	defer cancel()
+	if err := w.postpone(ctx, tierName, sms, now); err != nil {
+		w.logger.Error().Err(err).String("tier", tierName).Int("messages", len(sms)).Msg("worker: failed to return messages, leaving them for XAUTOCLAIM")
 	}
 }
 
@@ -364,30 +548,17 @@ func (w *Worker) claimStaleLoop() {
 					}
 					continue
 				}
-				for _, xmsg := range msgs {
-					sm := parseStreamMessage(xmsg, tier.Name)
-					pool := w.poolForTaskType(sm.Work.TaskType)
-					if err := pool.Submit(func() {
-						w.processMessage(sm)
-					}); err != nil {
-						w.logger.Error().Err(err).Msg("worker: pool submit for claimed message failed")
-					}
+				sms := make([]*streamMessage, len(msgs))
+				for i, xmsg := range msgs {
+					sms[i] = parseStreamMessage(xmsg, tier.Name)
 				}
+				w.process(tier.Name, sms)
 				if len(msgs) > 0 {
 					w.logger.Info().String("tier", tier.Name).Int("claimed", len(msgs)).Msg("worker: reclaimed stale messages")
 				}
 			}
 		}
 	}
-}
-
-// poolForTaskType returns the subpool for the given task type if one exists,
-// otherwise falls back to the global pool.
-func (w *Worker) poolForTaskType(tt types.TaskType) *ants.Pool {
-	if sp, ok := w.subpools[tt]; ok {
-		return sp
-	}
-	return w.pool
 }
 
 // parseStreamMessage constructs a streamMessage from a rueidis XRangeEntry.
@@ -459,10 +630,11 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	}
 
 	job, rev, jobErr := w.store.GetJob(w.ctx, work.JobID)
+	sm.standalone = jobErr == nil && job.WorkflowID == nil && job.BatchID == nil
 
 	// What is still queued of a cancelled job does not run any more. Workflow and
 	// batch jobs are left to the orchestrator, which waits for their outcome.
-	if jobErr == nil && job.Status == types.JobStatusCancelled && job.WorkflowID == nil && job.BatchID == nil {
+	if sm.standalone && job.Status == types.JobStatusCancelled {
 		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: job is cancelled, dropping message")
 		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		return
@@ -587,7 +759,7 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	// Prevents duplicate execution when XAUTOCLAIM reclaims a message
 	// while the original worker's handler is still running.
 	lockOwner := fmt.Sprintf("%s:%d", w.nodeID, time.Now().UnixNano())
-	rl, lockErr := w.locker.Lock(w.ctx, "run:"+work.RunID, lockOwner)
+	rl, cancelFlag, lockErr := w.locker.LockAndDo(w.ctx, "run:"+work.RunID, lockOwner, w.store.CancelRequestedCmd(work.RunID))
 	if lockErr != nil {
 		if errors.Is(lockErr, types.ErrLockFailed) {
 			// Don't ack: this may be the very entry the lock holder is executing,
@@ -647,14 +819,19 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	// --- Durable cancel check (before handler start) ---
 	// If a cancel was requested while this message was pending (e.g., worker was offline),
 	// skip execution immediately.
-	if cancelled, _ := w.store.IsCancelRequested(w.ctx, work.RunID); cancelled {
+	if n, _ := cancelFlag.AsInt64(); n > 0 {
 		w.logger.Info().String("run_id", work.RunID).Msg("worker: cancel flag set before handler start, skipping")
 		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		w.store.ClearCancelFlag(w.ctx, work.RunID)
 		return
 	}
-	// Clean up cancel flag when the run finishes (regardless of outcome).
-	defer w.store.ClearCancelFlag(w.ctx, work.RunID)
+	// Clean up cancel flag when the run finishes (regardless of outcome). CompleteRun has
+	// done so by then.
+	defer func() {
+		if !sm.completed {
+			w.store.ClearCancelFlag(w.ctx, work.RunID)
+		}
+	}()
 
 	now := time.Now()
 
@@ -673,7 +850,25 @@ func (w *Worker) processMessage(sm *streamMessage) {
 
 		OperationKey: work.OperationKey,
 	}
-	w.store.SaveRun(w.ctx, run)
+	w.disp.StartRun(w.ctx, run, types.JobEvent{
+		Type:      types.EventJobStarted,
+		JobID:     work.JobID,
+		RunID:     work.RunID,
+		NodeID:    w.nodeID,
+		TaskType:  work.TaskType,
+		Attempt:   work.Attempt,
+		Timestamp: now,
+	})
+
+	w.submitted.Add(1)
+	defer func() {
+		switch run.Status {
+		case types.RunStatusSucceeded:
+			w.completed.Add(1)
+		case types.RunStatusFailed:
+			w.failed.Add(1)
+		}
+	}()
 
 	// Start heartbeat goroutine for this run.
 	var runMu sync.Mutex
@@ -685,17 +880,6 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		defer hbWg.Done()
 		w.runHeartbeat(hbCtx, run, &runMu, work.OperationKey, sm)
 	}()
-
-	// Publish started event.
-	w.disp.PublishEvent(types.JobEvent{
-		Type:      types.EventJobStarted,
-		JobID:     work.JobID,
-		RunID:     work.RunID,
-		NodeID:    w.nodeID,
-		TaskType:  work.TaskType,
-		Attempt:   work.Attempt,
-		Timestamp: now,
-	})
 
 	// Set up execution context with deadline.
 	// Dynamic config overrides take precedence over static handler config.
@@ -956,17 +1140,15 @@ func (w *Worker) pauseJob(work types.WorkMessage, execErr error) {
 
 	now := time.Now()
 	errStr := execErr.Error()
-	job.Status = types.JobStatusPaused
 	job.RunCount++
 	job.LastError = &errStr
-	job.PausedAt = &now
-	job.UpdatedAt = now
 
+	var retryAfter time.Duration
 	var pauseErr *types.PauseError
-	if errors.As(execErr, &pauseErr) && pauseErr.RetryAfter > 0 {
-		resumeAt := now.Add(pauseErr.RetryAfter)
-		job.ResumeAt = &resumeAt
+	if errors.As(execErr, &pauseErr) {
+		retryAfter = pauseErr.RetryAfter
 	}
+	job.Pause(now, retryAfter)
 
 	syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("pause job %s", work.JobID))
 
@@ -986,13 +1168,14 @@ func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessag
 	batch := &store.CompletionBatch{
 		Run: run,
 		Event: types.JobEvent{
-			Type:      types.EventJobCompleted,
-			JobID:     work.JobID,
-			RunID:     work.RunID,
-			NodeID:    w.nodeID,
-			TaskType:  work.TaskType,
-			Attempt:   work.Attempt,
-			Timestamp: time.Now(),
+			Type:       types.EventJobCompleted,
+			JobID:      work.JobID,
+			RunID:      work.RunID,
+			NodeID:     w.nodeID,
+			TaskType:   work.TaskType,
+			Attempt:    work.Attempt,
+			Timestamp:  time.Now(),
+			Standalone: sm.standalone,
 		},
 		Result: types.WorkResult{
 			RunID:              work.RunID,
@@ -1007,6 +1190,7 @@ func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessag
 	}
 
 	syncRetrySave(w.syncer, func() error { return w.store.CompleteRun(w.ctx, batch) }, fmt.Sprintf("complete run %s (continue-as-new)", run.ID))
+	sm.completed = true
 
 	// Retryable GetJob + UpdateJob as a unit to prevent stuck jobs.
 	var hasWorkflow bool
@@ -1047,13 +1231,14 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 	batch := &store.CompletionBatch{
 		Run: run,
 		Event: types.JobEvent{
-			Type:      types.EventJobCompleted,
-			JobID:     work.JobID,
-			RunID:     work.RunID,
-			NodeID:    w.nodeID,
-			TaskType:  work.TaskType,
-			Attempt:   work.Attempt,
-			Timestamp: time.Now(),
+			Type:       types.EventJobCompleted,
+			JobID:      work.JobID,
+			RunID:      work.RunID,
+			NodeID:     w.nodeID,
+			TaskType:   work.TaskType,
+			Attempt:    work.Attempt,
+			Timestamp:  time.Now(),
+			Standalone: sm.standalone,
 		},
 		Result: types.WorkResult{
 			RunID:   work.RunID,
@@ -1068,13 +1253,14 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 	}
 
 	syncRetrySave(w.syncer, func() error { return w.store.CompleteRun(w.ctx, batch) }, fmt.Sprintf("complete run %s", run.ID))
+	sm.completed = true
 
 	// Update job state as a retryable unit. GetJob + UpdateJob are wrapped
 	// together so a transient GetJob failure doesn't leave the job stuck in
 	// "running" with no active run (which orphan recovery can't find).
 	var jobForPostUpdate *types.Job
 	syncRetrySave(w.syncer, func() error {
-		job, rev, err := w.store.GetJob(w.ctx, work.JobID)
+		job, rev, scheduled, err := w.store.GetJobAndIfScheduled(w.ctx, work.JobID)
 		if err != nil {
 			return fmt.Errorf("get job: %w", err)
 		}
@@ -1090,8 +1276,7 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 		job.ConsecutiveErrors = 0
 		job.UpdatedAt = now
 
-		_, _, schedErr := w.store.GetSchedule(w.ctx, work.JobID)
-		if schedErr == nil {
+		if scheduled {
 			job.Status = types.JobStatusScheduled
 		} else {
 			job.Status = types.JobStatusCompleted
@@ -1173,14 +1358,15 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).String("status", string(job.Status)).Msg("worker: job ended while this run was going, not retrying")
 		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		w.disp.PublishEvent(types.JobEvent{
-			Type:      types.EventJobFailed,
-			JobID:     work.JobID,
-			RunID:     work.RunID,
-			NodeID:    w.nodeID,
-			TaskType:  work.TaskType,
-			Attempt:   work.Attempt,
-			Error:     &errStr,
-			Timestamp: time.Now(),
+			Type:       types.EventJobFailed,
+			JobID:      work.JobID,
+			RunID:      work.RunID,
+			NodeID:     w.nodeID,
+			TaskType:   work.TaskType,
+			Attempt:    work.Attempt,
+			Error:      &errStr,
+			Timestamp:  time.Now(),
+			Standalone: sm.standalone,
 		})
 		return
 	}
@@ -1235,12 +1421,7 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 
 	case shouldPause:
 		// Auto-pause: consecutive error threshold reached.
-		job.Status = types.JobStatusPaused
-		job.PausedAt = &now
-		if retryPolicy.PauseRetryDelay > 0 {
-			resumeAt := now.Add(retryPolicy.PauseRetryDelay)
-			job.ResumeAt = &resumeAt
-		}
+		job.Pause(now, retryPolicy.PauseRetryDelay)
 		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("pause job %s", work.JobID))
 		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		w.logger.Warn().String("job_id", work.JobID).Int("consecutive_errors", job.ConsecutiveErrors).Msg("worker: auto-paused after consecutive errors")
@@ -1284,14 +1465,15 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 	}
 
 	w.disp.PublishEvent(types.JobEvent{
-		Type:      types.EventJobFailed,
-		JobID:     work.JobID,
-		RunID:     work.RunID,
-		NodeID:    w.nodeID,
-		TaskType:  work.TaskType,
-		Attempt:   work.Attempt,
-		Error:     &errStr,
-		Timestamp: now,
+		Type:       types.EventJobFailed,
+		JobID:      work.JobID,
+		RunID:      work.RunID,
+		NodeID:     w.nodeID,
+		TaskType:   work.TaskType,
+		Attempt:    work.Attempt,
+		Error:      &errStr,
+		Timestamp:  now,
+		Standalone: sm.standalone,
 	})
 }
 

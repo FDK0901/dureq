@@ -16,7 +16,7 @@ the side effect can happen more than once.
 **What dureq provides:**
 - At-least-once delivery (XAUTOCLAIM reclaims crashed messages)
 - Duplicate-suppressed handler start (per-run lock)
-- UniqueKey / RequestID for enqueue-level dedup
+- UniqueKey / RequestID for enqueue-level dedup; `EnqueueOrReplace` to change a job that is registered under a key
 - `pkg/sideeffect.Step()` — at-most-once side effect execution with cached results
 
 **What you must provide:**

@@ -116,7 +116,7 @@ Client (Go)
 - **Atomic Dispatch** — Lua script performs dedup check + XADD + dedup mark in a single atomic operation; eliminates crash window between dedup and stream write
 - **Transactional Completion** — `pkg/integration/postgres` adapter commits business write + dureq completion marker in the same SQL transaction for exactly-once business outcomes
 - **Durable Cancellation** — Persisted cancel flag (`SET EX 24h`) + Pub/Sub fast path + 10s polling fallback; survives Pub/Sub disconnections
-- **Unique Keys** — Deduplication via unique keys with lookup and manual deletion; released when the job goes dead or is cancelled, kept when it completes
+- **Unique Keys** — Deduplication via unique keys with lookup and manual deletion; released when the job goes dead or is cancelled, kept when it completes. `EnqueueOrReplace` cancels the job that holds the key and puts a new one in its place
 - **Worker Versioning** — BuildID-style safe deployments; version-mismatched work is re-enqueued for matching workers
 - **ScheduleToStart Timeout** — Fail jobs that wait too long in the queue before starting
 - **Workflow Signals** — Send asynchronous external data to running workflows. `ReadSignals` + `AckSignals` provides at-least-once delivery; see [guarantees](docs/guarantees.md) and [signals](docs/signals.md) docs

@@ -160,6 +160,9 @@ GET /api/unique-keys/{key}         -- check if key exists
 DELETE /api/unique-keys/{key}      -- remove orphaned key
 ```
 
+`CancelByUniqueKey` of the client frees an orphaned key as well. If a job does hold the key,
+it cancels that job.
+
 A dead or cancelled job has released its key already. Retrying it takes the key back; if
 another job holds the key by then, the retry is refused (409, `ErrDuplicateJob` from the
 client) and the job stays as it is. Jobs that went dead before v0.2.5 still hold their key:

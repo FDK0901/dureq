@@ -878,8 +878,15 @@ func (s *RedisStore) ClaimJobUniqueKey(ctx context.Context, job *types.Job) erro
 	if job.UniqueKey == nil || *job.UniqueKey == "" {
 		return nil
 	}
+	return s.TransferUniqueKey(ctx, *job.UniqueKey, job.ID, job.ID)
+}
+
+// TransferUniqueKey makes toJobID hold a unique key that is free or held by
+// fromJobID (atomic compare-and-set). It returns ErrDuplicateJob if another job
+// holds the key. An empty fromJobID means that the key must be free.
+func (s *RedisStore) TransferUniqueKey(ctx context.Context, uniqueKey, fromJobID, toJobID string) error {
 	ok, err := s.scriptClaimUniqueKey.Exec(ctx, s.rdb,
-		[]string{UniqueKeyKey(s.prefix, *job.UniqueKey)}, []string{job.ID},
+		[]string{UniqueKeyKey(s.prefix, uniqueKey)}, []string{fromJobID, toJobID},
 	).AsInt64()
 	if err != nil {
 		return err

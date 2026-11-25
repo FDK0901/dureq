@@ -59,16 +59,18 @@ end
 return 0
 `
 
-// luaClaimUniqueKey sets a unique key to a job ID unless another job holds it.
+// luaClaimUniqueKey sets a unique key to a job ID if the key is free or held by
+// the expected job.
 // KEYS[1] = unique key
-// ARGV[1] = job ID
-// Returns 1 if the job holds the key now, 0 if another job does.
+// ARGV[1] = ID of the job that may hold the key now ("" = the key must be free)
+// ARGV[2] = ID of the job that is to hold it
+// Returns 1 if that job holds the key now, 0 if a third one does.
 const luaClaimUniqueKey = `
 local current = redis.call('GET', KEYS[1])
 if current and current ~= ARGV[1] then
   return 0
 end
-redis.call('SET', KEYS[1], ARGV[1])
+redis.call('SET', KEYS[1], ARGV[2])
 return 1
 `
 

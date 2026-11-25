@@ -121,15 +121,13 @@ func (m *Manager) sync(ctx context.Context) {
 			payload = json.RawMessage("{}")
 		}
 
-		// If updating an existing task, release the old unique key first so the
-		// NX-guarded SetUniqueKey inside EnqueueScheduled can succeed.
+		// An updated task takes the place of the existing one.
+		enqueue := m.client.EnqueueScheduled
 		if tracked {
-			if err := m.client.Store().DeleteUniqueKey(ctx, key); err != nil {
-				m.logger.Warn().String("key", key).Err(err).Msg("periodic: failed to release unique key for update")
-			}
+			enqueue = m.client.EnqueueOrReplace
 		}
 
-		_, err := m.client.EnqueueScheduled(ctx, &client.EnqueueRequest{
+		_, err := enqueue(ctx, &client.EnqueueRequest{
 			TaskType: cfg.TaskType,
 			Payload:  payload,
 			Schedule: types.Schedule{

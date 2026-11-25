@@ -9,6 +9,7 @@ Every claim is backed by the specific Redis primitives and code paths that imple
 |--------|-----------|-----------|------------|
 | **Enqueue** | At-most-once per UniqueKey | `SET NX` on unique key | Without UniqueKey, every call creates a new job |
 | **Unique key release** | Only by the holding job | Compare-and-delete Lua when the job goes `dead` or is cancelled | Kept on `completed`; retrying a dead/cancelled job needs the key back and is refused if another job holds it |
+| **Replace** | At most one live job per UniqueKey | `EnqueueOrReplace`: cancel the holder, compare-and-set the key, create the job; a job that lost its key meanwhile is not started | Between the cancel and the new job there is none; of concurrent calls the last one wins |
 | **Cancel** | A standalone job does not run again | Queued messages of a cancelled job are dropped, results of runs that were going do not change its status | A run that is going must respect its context to end early |
 | **Retry limit** | `MaxAttempts` per execution | Attempt carried on the work message; each firing of a recurring job starts at 0 | A firing that uses up its attempts ends the recurring job, unless `Schedule.KeepOnFailure` is set |
 | **Request ID** | At-most-once (5-min window) | `SET EX` dedup cache | TTL expiry allows duplicates after 5 minutes |
@@ -51,7 +52,8 @@ Client                  Redis
 ```
 
 Once `XADD` succeeds, the job is durable. If the client crashes between `SET NX` and `XADD`,
-the unique key is claimed but no job exists. The unique key must be manually deleted.
+the unique key is claimed but no job exists. `CancelByUniqueKey` frees such a key, and
+`EnqueueOrReplace` takes it over.
 
 ### 2. Leader Dies Before Dispatch
 

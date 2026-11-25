@@ -248,21 +248,121 @@ func (c *Client) EnqueueGroup(ctx context.Context, opt types.EnqueueGroupOption)
 	return c.store.AddToGroup(ctx, opt.Group, msg)
 }
 
+// EnqueueOrReplace submits a job under req.UniqueKey, which must be set, in place of
+// the job that holds the key. If that job is live it is cancelled first, including
+// the run it may have going (see Cancel); a job that has ended is left as it is. If
+// nobody holds the key, this is the same as EnqueueScheduled.
+//
+// The old job is cancelled before the new one starts, so the two never run side by
+// side. If the new job cannot be created after that, the error is returned and
+// there is no job under the key; call EnqueueOrReplace again.
+//
+// Of several concurrent calls for one key, the last one to take the key over wins.
+// The job of another one is cancelled, or its call fails with ErrDuplicateJob.
+func (c *Client) EnqueueOrReplace(ctx context.Context, req *EnqueueRequest) (*types.Job, error) {
+	if req.UniqueKey == nil || *req.UniqueKey == "" {
+		return nil, errors.New("enqueue or replace: unique key required")
+	}
+	if job := c.cachedRequest(ctx, req); job != nil {
+		return job, nil
+	}
+
+	job := newJob(req, time.Now())
+	// Don't cancel anything for a schedule that cannot be registered.
+	nextRun, err := firstRun(job)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.takeOverUniqueKey(ctx, *req.UniqueKey, job.ID); err != nil {
+		return nil, fmt.Errorf("unique key: %w", err)
+	}
+	return c.start(ctx, req, job, nextRun)
+}
+
+// takeOverUniqueKey makes jobID hold the unique key and cancels the job that held
+// it before, if that one is live.
+func (c *Client) takeOverUniqueKey(ctx context.Context, uniqueKey, jobID string) error {
+	const maxTries = 5
+
+	for range maxTries {
+		holder, _, err := c.store.CheckUniqueKey(ctx, uniqueKey)
+		if err != nil {
+			return err
+		}
+		if err := c.cancelReplaced(ctx, holder); err != nil {
+			return err
+		}
+		err = c.store.TransferUniqueKey(ctx, uniqueKey, holder, jobID)
+		if errors.Is(err, types.ErrDuplicateJob) {
+			continue // another job got the key in the meantime
+		}
+		if err != nil {
+			return err
+		}
+		// The holder may have been created only now; start gives up a job that has
+		// lost its key by then, so one of the two sees the other.
+		if err := c.cancelReplaced(ctx, holder); err != nil {
+			c.store.ReleaseUniqueKey(ctx, uniqueKey, jobID)
+			return err
+		}
+		return nil
+	}
+	return types.ErrDuplicateJob
+}
+
+// cancelReplaced cancels a job that another one takes the place of, if it exists and
+// has not ended.
+func (c *Client) cancelReplaced(ctx context.Context, jobID string) error {
+	if jobID == "" {
+		return nil
+	}
+	if err := c.cancelJob(ctx, jobID, true); err != nil && !errors.Is(err, types.ErrJobNotFound) {
+		return err
+	}
+	return nil
+}
+
 func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, error) {
-	// Request ID deduplication: return cached job if the same request was already processed.
-	if req.RequestID != nil && *req.RequestID != "" {
-		dedupKey := store.RequestDedupKey(c.store.Prefix(), *req.RequestID)
-		cachedJobID, err := c.rdb.Do(ctx, c.rdb.B().Get().Key(dedupKey).Build()).ToString()
-		if err == nil && cachedJobID != "" {
-			// Already processed — return the cached job.
-			job, _, err := c.store.GetJob(ctx, cachedJobID)
-			if err == nil {
-				return job, nil
-			}
+	if job := c.cachedRequest(ctx, req); job != nil {
+		return job, nil
+	}
+
+	job := newJob(req, time.Now())
+
+	// Handle unique key deduplication.
+	if job.UniqueKey != nil && *job.UniqueKey != "" {
+		if err := c.store.SetUniqueKey(ctx, *job.UniqueKey, job.ID); err != nil {
+			return nil, fmt.Errorf("unique key: %w", err)
 		}
 	}
 
-	now := time.Now()
+	nextRun, err := firstRun(job)
+	if err != nil {
+		c.store.ReleaseJobUniqueKey(ctx, job)
+		return nil, err
+	}
+	return c.start(ctx, req, job, nextRun)
+}
+
+// cachedRequest returns the job that an earlier call with the same RequestID
+// created, or nil.
+func (c *Client) cachedRequest(ctx context.Context, req *EnqueueRequest) *types.Job {
+	if req.RequestID == nil || *req.RequestID == "" {
+		return nil
+	}
+	dedupKey := store.RequestDedupKey(c.store.Prefix(), *req.RequestID)
+	cachedJobID, err := c.rdb.Do(ctx, c.rdb.B().Get().Key(dedupKey).Build()).ToString()
+	if err != nil || cachedJobID == "" {
+		return nil
+	}
+	job, _, err := c.store.GetJob(ctx, cachedJobID)
+	if err != nil {
+		return nil
+	}
+	return job
+}
+
+func newJob(req *EnqueueRequest, now time.Time) *types.Job {
 	job := &types.Job{
 		ID:               xid.New().String(),
 		TaskType:         req.TaskType,
@@ -277,19 +377,33 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
-
-	// Handle unique key deduplication.
-	if job.UniqueKey != nil && *job.UniqueKey != "" {
-		if err := c.store.SetUniqueKey(ctx, *job.UniqueKey, job.ID); err != nil {
-			return nil, fmt.Errorf("unique key: %w", err)
-		}
-	}
-
 	// Determine initial status based on schedule type.
 	if job.Schedule.Type == types.ScheduleImmediate {
 		job.Status = types.JobStatusPending
 	} else {
 		job.Status = types.JobStatusScheduled
+	}
+	return job
+}
+
+// firstRun returns when a new job is due; the zero time for an immediate one.
+func firstRun(job *types.Job) (time.Time, error) {
+	if job.Schedule.Type == types.ScheduleImmediate {
+		return time.Time{}, nil
+	}
+	nextRun, err := scheduler.NextRunTime(job.Schedule, job.CreatedAt)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("calculate next run: %w", err)
+	}
+	return nextRun, nil
+}
+
+// start stores a new job, which holds its unique key already if it has one, and
+// dispatches or schedules it.
+func (c *Client) start(ctx context.Context, req *EnqueueRequest, job *types.Job, nextRun time.Time) (*types.Job, error) {
+	discard := func() {
+		c.store.DeleteJob(ctx, job.ID)
+		c.store.ReleaseJobUniqueKey(ctx, job)
 	}
 
 	// Create the job in Redis.
@@ -299,45 +413,49 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 		return nil, fmt.Errorf("create job: %w", err)
 	}
 
+	// Until now there was no job to cancel for whoever took the key away.
+	if job.UniqueKey != nil && *job.UniqueKey != "" {
+		holder, _, err := c.store.CheckUniqueKey(ctx, *job.UniqueKey)
+		if err == nil && holder != job.ID {
+			err = types.ErrDuplicateJob
+		}
+		if err != nil {
+			discard()
+			return nil, fmt.Errorf("unique key: %w", err)
+		}
+	}
+
 	// Handle dispatch or scheduling.
 	switch job.Schedule.Type {
 	case types.ScheduleImmediate:
 		if err := c.dispatchJob(ctx, job); err != nil {
 			// Clean up orphaned job on dispatch failure.
-			c.store.DeleteJob(ctx, job.ID)
-			c.store.ReleaseJobUniqueKey(ctx, job)
+			discard()
 			return nil, fmt.Errorf("dispatch: %w", err)
 		}
 		c.publishEvent(ctx, types.JobEvent{
 			Type:      types.EventJobDispatched,
 			JobID:     job.ID,
 			TaskType:  job.TaskType,
-			Timestamp: now,
+			Timestamp: job.CreatedAt,
 		})
 
 	default:
 		// Cron, interval, one-time schedules.
-		nextRun, err := scheduler.NextRunTime(job.Schedule, now)
-		if err != nil {
-			c.store.DeleteJob(ctx, job.ID)
-			c.store.ReleaseJobUniqueKey(ctx, job)
-			return nil, fmt.Errorf("calculate next run: %w", err)
-		}
 		entry := &types.ScheduleEntry{
 			JobID:     job.ID,
 			Schedule:  job.Schedule,
 			NextRunAt: nextRun,
 		}
 		if _, err := c.store.SaveSchedule(ctx, entry); err != nil {
-			c.store.DeleteJob(ctx, job.ID)
-			c.store.ReleaseJobUniqueKey(ctx, job)
+			discard()
 			return nil, fmt.Errorf("save schedule: %w", err)
 		}
 		c.publishEvent(ctx, types.JobEvent{
 			Type:      types.EventScheduleCreated,
 			JobID:     job.ID,
 			TaskType:  job.TaskType,
-			Timestamp: now,
+			Timestamp: job.CreatedAt,
 		})
 	}
 
@@ -353,6 +471,12 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 // Cancel cancels a job by ID and frees its unique key, so the key can be used
 // to enqueue again. A key that another job holds by now is left alone.
 func (c *Client) Cancel(ctx context.Context, jobID string) error {
+	return c.cancelJob(ctx, jobID, false)
+}
+
+// cancelJob cancels a job and frees its unique key. With replaced set, the key is left
+// for the job that takes its place, and a job that has ended is left as it is.
+func (c *Client) cancelJob(ctx context.Context, jobID string, replaced bool) error {
 	const maxTries = 10 // the job may be written to by its worker or the scheduler
 
 	var job *types.Job
@@ -363,6 +487,9 @@ func (c *Client) Cancel(ctx context.Context, jobID string) error {
 		job, rev, err = c.store.GetJob(ctx, jobID)
 		if err != nil {
 			return fmt.Errorf("get job: %w", err)
+		}
+		if replaced && job.Status.IsTerminal() {
+			return nil
 		}
 		job.Status = types.JobStatusCancelled
 		job.UpdatedAt = now
@@ -377,7 +504,10 @@ func (c *Client) Cancel(ctx context.Context, jobID string) error {
 	}
 
 	// Before the event, so that a listener can enqueue under the key again.
-	releaseErr := c.store.ReleaseJobUniqueKey(ctx, job)
+	var releaseErr error
+	if !replaced {
+		releaseErr = c.store.ReleaseJobUniqueKey(ctx, job)
+	}
 
 	c.store.DeleteSchedule(ctx, jobID)
 	c.signalCancelActiveRuns(ctx, jobID)
@@ -392,7 +522,8 @@ func (c *Client) Cancel(ctx context.Context, jobID string) error {
 	return nil
 }
 
-// CancelByUniqueKey cancels a job identified by its unique key.
+// CancelByUniqueKey cancels a job identified by its unique key and frees the key,
+// also if the job does not exist (any more).
 func (c *Client) CancelByUniqueKey(ctx context.Context, uniqueKey string) error {
 	jobID, exists, err := c.store.CheckUniqueKey(ctx, uniqueKey)
 	if err != nil {
@@ -401,11 +532,10 @@ func (c *Client) CancelByUniqueKey(ctx context.Context, uniqueKey string) error 
 	if !exists {
 		return nil // no job with this key — nothing to cancel
 	}
-	if err := c.Cancel(ctx, jobID); err != nil {
+	if err := c.Cancel(ctx, jobID); err != nil && !errors.Is(err, types.ErrJobNotFound) {
 		return err
 	}
-	c.store.ReleaseUniqueKey(ctx, uniqueKey, jobID)
-	return nil
+	return c.store.ReleaseUniqueKey(ctx, uniqueKey, jobID)
 }
 
 // Retry re-enqueues a failed, dead or cancelled job for another attempt. If the

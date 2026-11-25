@@ -130,7 +130,11 @@ The monitoring API is enabled with `ModeMonitor`. Key route groups:
 
 Bulk operations: `POST /api/{jobs,workflows,batches}/bulk/{cancel,retry,delete}`
 
-Search by payload JSONPath: `GET /api/search/{jobs,workflows,batches}?path=field&value=val`
+Search by payload JSONPath: `GET /api/search/{jobs,workflows,batches}?path=field&value=val` returns the newest match.
+
+`GET /api/search/jobs/all?path=field&value=val` returns all jobs that match, newest first, as
+`{"data": [...], "has_more": false}`. Narrow it down with `task_type`, `live=true` (leaves out completed, dead
+and cancelled jobs), `status` (repeatable) and `limit` (10 by default, 100 at most).
 
 `GET /api/jobs?search=text` finds jobs by a part of their ID or task type. It reads the jobs one by one, up to
 100,000 of them, so narrow it down with `status`, `task_type` or `tag` if there are many.

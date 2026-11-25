@@ -1024,6 +1024,24 @@ func (a *APIService) SearchJobsByPayload(ctx context.Context, path, value, taskT
 	return job, nil
 }
 
+// SearchAllJobsByPayload returns the jobs whose payload matches and that q selects,
+// newest first, and whether there are more of them than q.Limit.
+func (a *APIService) SearchAllJobsByPayload(ctx context.Context, path, value string, q store.PayloadQuery) ([]*types.Job, bool, error) {
+	if path == "" || value == "" {
+		return nil, false, &ApiError{Msg: "path and value are required", StatusCode: http.StatusBadRequest}
+	}
+	limit := q.Limit
+	q.Limit++
+	jobs, err := a.store.FindJobsByPayloadPath(ctx, path, value, q)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(jobs) > limit {
+		return jobs[:limit], true, nil
+	}
+	return jobs, false, nil
+}
+
 func (a *APIService) SearchWorkflowsByPayload(ctx context.Context, path, value string) (*types.WorkflowInstance, error) {
 	if path == "" || value == "" {
 		return nil, &ApiError{Msg: "path and value are required", StatusCode: http.StatusBadRequest}

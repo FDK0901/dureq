@@ -147,6 +147,7 @@ func (a *API) registerRoutes() {
 
 	// Search (payload JSONPath)
 	a.mux.HandleFunc("GET /api/search/jobs", a.searchJobs)
+	a.mux.HandleFunc("GET /api/search/jobs/all", a.searchAllJobs)
 	a.mux.HandleFunc("GET /api/search/workflows", a.searchWorkflows)
 	a.mux.HandleFunc("GET /api/search/batches", a.searchBatches)
 
@@ -784,6 +785,27 @@ func (a *API) searchJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, job)
+}
+
+func (a *API) searchAllJobs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	query := store.PayloadQuery{TaskType: q.Get("task_type"), Limit: parsePageParams(r).Limit}
+	if live := q.Get("live"); live != "" {
+		var err error
+		if query.LiveOnly, err = strconv.ParseBool(live); err != nil {
+			writeServiceError(w, &ApiError{Msg: "live must be true or false", StatusCode: http.StatusBadRequest})
+			return
+		}
+	}
+	for _, status := range q["status"] {
+		query.Statuses = append(query.Statuses, types.JobStatus(status))
+	}
+	jobs, more, err := a.svc.SearchAllJobsByPayload(r.Context(), q.Get("path"), q.Get("value"), query)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]any{"data": jobs, "has_more": more})
 }
 
 func (a *API) searchWorkflows(w http.ResponseWriter, r *http.Request) {

@@ -492,7 +492,8 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `DELETE` | `/api/history/runs`         | Remove runs (`?older_than=720h`)   |
 | `GET`    | `/api/history/events`       | Historical events                  |
 | `GET`    | `/api/runs/{id}`            | A run, active or finished          |
-| `GET`    | `/api/search/jobs`          | Search by payload JSONPath         |
+| `GET`    | `/api/search/jobs`          | Newest job by payload JSONPath     |
+| `GET`    | `/api/search/jobs/all`      | All jobs by payload JSONPath       |
 | `GET`    | `/api/search/workflows`     | Search workflows by payload        |
 | `GET`    | `/api/search/batches`       | Search batches by payload          |
 | `GET`    | `/api/unique-keys/{key}`    | Check unique key                   |

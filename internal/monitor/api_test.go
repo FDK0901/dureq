@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -536,6 +537,58 @@ func TestListJobs_SearchOverManyJobs(t *testing.T) {
 		get(t, srv, "/api/jobs?search=t.x&limit=100&offset=1250&sort="+sort, &page)
 		if page.Total != n || len(page.Data) != 50 {
 			t.Fatalf("%s: %d of %d, want 50 of %d", sort, len(page.Data), page.Total, n)
+		}
+	}
+}
+
+func TestSearchAllJobs(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	ctx := context.Background()
+	rdb := st.Client()
+	if err := rdb.Do(ctx, rdb.B().JsonSet().Key(st.Prefix()+":probe").Path("$").Value("{}").Build()).Error(); err != nil {
+		t.Skipf("no RedisJSON: %v", err)
+	}
+	createJob(t, st, "live", "update", types.JobStatusScheduled, time.Minute)
+	createJob(t, st, "dead", "update", types.JobStatusDead, 2*time.Minute)
+	createJob(t, st, "paused", "remind", types.JobStatusPaused, 3*time.Minute)
+
+	for _, tc := range []struct {
+		query string
+		want  []string
+		more  bool
+	}{
+		{"path=eventId&value=e1", []string{"live", "dead", "paused"}, false},
+		{"path=n&value=4300000", []string{"live", "dead", "paused"}, false},
+		{"path=eventId&value=e1&live=true", []string{"live", "paused"}, false},
+		{"path=eventId&value=e1&task_type=update", []string{"live", "dead"}, false},
+		{"path=eventId&value=e1&status=dead&status=paused", []string{"dead", "paused"}, false},
+		{"path=eventId&value=e1&limit=2", []string{"live", "dead"}, true},
+		{"path=eventId&value=e1&limit=3", []string{"live", "dead", "paused"}, false},
+		{"path=eventId&value=other", nil, false},
+	} {
+		var page struct {
+			Data    []types.Job `json:"data"`
+			HasMore bool        `json:"has_more"`
+		}
+		get(t, srv, "/api/search/jobs/all?"+tc.query, &page)
+		var ids []string
+		for _, j := range page.Data {
+			ids = append(ids, j.ID)
+		}
+		if !slices.Equal(ids, tc.want) || page.HasMore != tc.more {
+			t.Errorf("%s: %v (more: %v), want %v (more: %v)", tc.query, ids, page.HasMore, tc.want, tc.more)
+		}
+	}
+
+	// The search for one job is as it was.
+	var job types.Job
+	get(t, srv, "/api/search/jobs?path=eventId&value=e1", &job)
+	if job.ID != "live" {
+		t.Errorf("found %q, want the newest", job.ID)
+	}
+	for _, query := range []string{"path=eventId", "value=e1", "path=eventId&value=e1&live=maybe"} {
+		if code := call(t, srv, http.MethodGet, "/api/search/jobs/all?"+query, nil); code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", query, code)
 		}
 	}
 }

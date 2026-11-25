@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -20,6 +21,7 @@ type Dispatcher interface {
 	Dispatch(ctx context.Context, job *types.Job, attempt int) error
 	// DispatchFiring reports false, without error, if the firing was already dispatched.
 	DispatchFiring(ctx context.Context, job *types.Job, attempt int) (bool, error)
+	DispatchToDLQ(ctx context.Context, job *types.Job, lastErr string) error
 	PublishEvent(event types.JobEvent)
 }
 
@@ -29,6 +31,9 @@ const (
 	headerBackfill    = "x-dureq-backfill"
 	headerScheduledAt = "x-dureq-scheduled-at"
 )
+
+// headerOperationKey sets the operation key of a work message.
+const headerOperationKey = "x-dureq-operation-key"
 
 // Config holds scheduler configuration.
 type Config struct {
@@ -231,6 +236,8 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 	if job.Status.IsTerminal() {
 		s.store.DeleteSchedule(ctx, entry.JobID)
 		s.cache.InvalidateSchedules()
+		// Normally done when the job ended, unless that process stopped in between.
+		s.releaseEndedJobUniqueKey(ctx, entry.JobID)
 		return
 	}
 
@@ -327,6 +334,7 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime, scheduledAt time.Time, isBackfill bool) (uint64, bool) {
 	prevStatus := job.Status
 	prevLastRunAt := job.LastRunAt
+	prevAttempt := job.Attempt
 
 	// Firing headers belong to the work message only. Older versions stored them
 	// on the job, so later non-firing dispatches (retry, resume, orphan redispatch,
@@ -339,6 +347,10 @@ func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint
 	job.Status = types.JobStatusPending
 	job.LastRunAt = &firingTime
 	job.UpdatedAt = time.Now()
+	if job.Schedule.Type.IsRecurring() {
+		// Each firing has a retry budget of its own.
+		job.Attempt = 0
+	}
 
 	newRev, err := s.store.UpdateJob(ctx, job, rev)
 	if err != nil {
@@ -365,6 +377,7 @@ func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint
 		// was already dispatched, the status must reflect that earlier run.
 		job.Status = prevStatus
 		job.LastRunAt = prevLastRunAt
+		job.Attempt = prevAttempt
 		job.UpdatedAt = time.Now()
 		rbRev, rbErr := s.store.UpdateJob(ctx, job, newRev)
 		if err != nil {
@@ -547,9 +560,26 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 				retryPolicy = types.DefaultRetryPolicy()
 			}
 
-			if job.Attempt < retryPolicy.MaxAttempts {
+			recurring := job.Schedule.Type.IsRecurring()
+			maxAttempts := retryPolicy.MaxAttempts
+			if recurring && job.DLQAfter != nil && *job.DLQAfter < maxAttempts {
+				maxAttempts = *job.DLQAfter
+			}
+			attempt := lostAttempt(job, run, maxAttempts)
+			switch {
+			case job.Status == types.JobStatusDead || job.Status == types.JobStatusCancelled:
+				// The job ended while this run was still going and gave up its unique
+				// key, so the run is dropped rather than redispatched.
+
+			case attempt < maxAttempts:
 				// Auto-recover: redispatch.
-				prevStatus := job.Status
+				prevStatus, prevAttempt := job.Status, job.Attempt
+				if recurring {
+					// The lost run has used up an attempt, or else a firing that takes
+					// its worker down would be redispatched forever.
+					attempt++
+				}
+				job.Attempt = attempt
 				job.Status = types.JobStatusPending
 				job.LastError = &errMsg
 				job.UpdatedAt = now
@@ -558,9 +588,18 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 					s.logger.Error().String("job_id", run.JobID).Err(updateErr).Msg("scheduler: failed to update orphaned job for auto-recovery")
 					continue
 				}
-				if dispErr := s.dispatcher.Dispatch(ctx, job, job.Attempt); dispErr != nil {
+				// It is the same operation as the lost run, whose message may yet be
+				// reclaimed: the ledger lets only one of them complete.
+				recovered := *job
+				if run.OperationKey != "" {
+					recovered.Headers = make(map[string]string, len(job.Headers)+1)
+					maps.Copy(recovered.Headers, job.Headers)
+					recovered.Headers[headerOperationKey] = run.OperationKey
+				}
+				if dispErr := s.dispatcher.Dispatch(ctx, &recovered, job.Attempt); dispErr != nil {
 					s.logger.Error().String("job_id", run.JobID).Err(dispErr).Msg("scheduler: dispatch failed for orphan recovery, rolling back")
 					job.Status = prevStatus
+					job.Attempt = prevAttempt
 					job.UpdatedAt = time.Now()
 					s.store.UpdateJob(ctx, job, newRev)
 					continue
@@ -577,12 +616,39 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 				})
 
 				s.logger.Info().String("job_id", run.JobID).Int("attempt", job.Attempt).Msg("scheduler: auto-recovered orphaned job")
-			} else {
+
+			case s.keepsSchedule(ctx, job):
+				// Retries exhausted, but the job goes on with its next firing.
+				failed := *job
+				failed.Attempt = attempt
+				job.Status = types.JobStatusScheduled
+				job.Attempt = 0
+				job.LastError = &errMsg
+				job.UpdatedAt = now
+				if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+					s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to put job with exhausted firing back on its schedule")
+				}
+				s.dispatcher.DispatchToDLQ(ctx, &failed, errMsg)
+
+				s.dispatcher.PublishEvent(types.JobEvent{
+					Type:      types.EventJobFailed,
+					JobID:     run.JobID,
+					RunID:     run.ID,
+					NodeID:    run.NodeID,
+					TaskType:  job.TaskType,
+					Attempt:   attempt,
+					Error:     &errMsg,
+					Timestamp: now,
+				})
+
+			default:
 				// Retries exhausted.
 				job.Status = types.JobStatusDead
 				job.LastError = &errMsg
 				job.UpdatedAt = now
-				s.store.UpdateJob(ctx, job, rev)
+				if _, err := s.store.UpdateJob(ctx, job, rev); err == nil {
+					s.releaseEndedJobUniqueKey(ctx, job.ID)
+				}
 
 				s.dispatcher.PublishEvent(types.JobEvent{
 					Type:      types.EventJobDead,
@@ -611,6 +677,39 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 	// Clean up persistent drain keys for dead nodes.
 	for nodeID := range deadNodes {
 		s.store.SetNodeDrain(ctx, nodeID, false)
+	}
+}
+
+// lostAttempt returns the attempt an orphaned run of a standalone job was on.
+//
+// A recurring job can have several firings going, so there it is the run's
+// attempt that counts. Versions before v0.2.5 counted a recurring job's attempts
+// up over its whole life. A run with more attempts than an execution can have, or
+// one that such a version started at the limit (it did not record the operation),
+// goes by the failures since the job's last success instead.
+func lostAttempt(job *types.Job, run *types.JobRun, maxAttempts int) int {
+	if !job.Schedule.Type.IsRecurring() {
+		return job.Attempt
+	}
+	if run.Attempt > maxAttempts || (run.Attempt == maxAttempts && run.OperationKey == "") {
+		return min(run.Attempt, job.ConsecutiveErrors)
+	}
+	return run.Attempt
+}
+
+// keepsSchedule reports whether a job stays on its schedule when a firing is given up.
+func (s *Scheduler) keepsSchedule(ctx context.Context, job *types.Job) bool {
+	if !job.Schedule.KeepOnFailure || !job.Schedule.Type.IsRecurring() {
+		return false
+	}
+	_, _, err := s.store.GetSchedule(ctx, job.ID)
+	return !errors.Is(err, types.ErrScheduleNotFound)
+}
+
+// releaseEndedJobUniqueKey frees the unique key of a dead or cancelled job.
+func (s *Scheduler) releaseEndedJobUniqueKey(ctx context.Context, jobID string) {
+	if err := s.store.ReleaseEndedJobUniqueKey(ctx, jobID); err != nil {
+		s.logger.Warn().String("job_id", jobID).Err(err).Msg("scheduler: failed to release unique key of ended job")
 	}
 }
 

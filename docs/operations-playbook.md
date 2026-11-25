@@ -160,6 +160,14 @@ GET /api/unique-keys/{key}         -- check if key exists
 DELETE /api/unique-keys/{key}      -- remove orphaned key
 ```
 
+`CancelByUniqueKey` of the client frees an orphaned key as well. If a job does hold the key,
+it cancels that job.
+
+A dead or cancelled job has released its key already. Retrying it takes the key back; if
+another job holds the key by then, the retry is refused (409, `ErrDuplicateJob` from the
+client) and the job stays as it is. Jobs that went dead before v0.2.5 still hold their key:
+cancel them with the client (`Cancel(id)`; the API refuses ended jobs) or delete the key.
+
 ## Dynamic Configuration
 
 dureq supports runtime configuration changes without restart. The dynamic
@@ -195,5 +203,6 @@ State transitions are recorded per job and workflow:
 
 ## Retention and Archival
 
-Completed/dead/cancelled jobs are archived after the retention period (default: 7 days).
-Configure with `WithRetentionPeriod`. Set to 0 to disable. Runs on the leader node.
+Archival is off by default: jobs are kept until they are deleted. With
+`WithRetentionPeriod(d)`, completed/failed/dead/cancelled jobs are deleted once they have
+not been updated for `d` (a negative `d` means 7 days, 0 means off). Runs on the leader node.

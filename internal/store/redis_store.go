@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/bytedance/sonic"
 	"github.com/redis/rueidis"
 )
@@ -95,6 +98,22 @@ type JobFilter struct {
 	Offset   int
 }
 
+// PayloadQuery narrows down a search for jobs by payload. The zero value matches
+// every job.
+type PayloadQuery struct {
+	TaskType string            // only jobs of this task type
+	LiveOnly bool              // leave out completed, dead and cancelled jobs
+	Statuses []types.JobStatus // only jobs in one of these statuses
+	Limit    int               // at most this many jobs; 0 = no limit
+}
+
+func (q PayloadQuery) matches(job *types.Job) bool {
+	if q.LiveOnly && job.Status.IsTerminal() {
+		return false
+	}
+	return len(q.Statuses) == 0 || slices.Contains(q.Statuses, job.Status)
+}
+
 // ScheduleFilter specifies criteria for listing active schedules.
 type ScheduleFilter struct {
 	Sort   string // "newest" or "oldest"
@@ -124,6 +143,10 @@ type RedisStore struct {
 	scriptAcquireConcSlot *rueidis.Lua
 	scriptReleaseConcSlot *rueidis.Lua
 
+	// Unique keys
+	scriptClaimUniqueKey   *rueidis.Lua
+	scriptReleaseUniqueKey *rueidis.Lua
+
 	// Exactly-once scripts (L2 operation ledger + atomic dispatch)
 	scriptAtomicDispatch  *rueidis.Lua
 	scriptClaimOperation  *rueidis.Lua
@@ -132,9 +155,18 @@ type RedisStore struct {
 	scriptCompleteOpEffect *rueidis.Lua
 }
 
+// nopLogger returns a logger that discards everything.
+func nopLogger() chainedlog.Logger {
+	return chainedslog.NewSlog(slog.New(slog.DiscardHandler))
+}
+
 // NewRedisStore creates a new Redis store and registers tier configuration.
+// A nil logger discards all log output.
 func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger chainedlog.Logger) (*RedisStore, error) {
 	cfg.defaults()
+	if logger == nil {
+		logger = nopLogger()
+	}
 
 	s := &RedisStore{
 		rdb:    rdb,
@@ -153,6 +185,9 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger chainedlog.L
 		scriptClaimSideEffect: rueidis.NewLuaScript(luaClaimSideEffect),
 		scriptAcquireConcSlot: rueidis.NewLuaScript(luaAcquireConcurrencySlot),
 		scriptReleaseConcSlot: rueidis.NewLuaScript(luaReleaseConcurrencySlot),
+
+		scriptClaimUniqueKey:   rueidis.NewLuaScript(luaClaimUniqueKey),
+		scriptReleaseUniqueKey: rueidis.NewLuaScript(luaUnlockIfOwner),
 
 		scriptAtomicDispatch: rueidis.NewLuaScript(luaAtomicDispatch),
 		scriptClaimOperation: rueidis.NewLuaScript(luaCheckAndClaimOperation),
@@ -813,9 +848,70 @@ func (s *RedisStore) SetUniqueKey(ctx context.Context, uniqueKey, jobID string) 
 	return err
 }
 
-// DeleteUniqueKey releases a unique key.
+// DeleteUniqueKey removes a unique key whichever job holds it. Use
+// ReleaseUniqueKey to free the key of a particular job.
 func (s *RedisStore) DeleteUniqueKey(ctx context.Context, uniqueKey string) error {
 	return s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, uniqueKey)).Build()).Error()
+}
+
+// ReleaseUniqueKey releases a unique key if jobID is the job holding it
+// (atomic compare-and-delete). A key held by another job is left alone.
+func (s *RedisStore) ReleaseUniqueKey(ctx context.Context, uniqueKey, jobID string) error {
+	return s.scriptReleaseUniqueKey.Exec(ctx, s.rdb,
+		[]string{UniqueKeyKey(s.prefix, uniqueKey)}, []string{jobID},
+	).Error()
+}
+
+// ReleaseJobUniqueKey releases the job's unique key, if it has one and holds it.
+func (s *RedisStore) ReleaseJobUniqueKey(ctx context.Context, job *types.Job) error {
+	if job.UniqueKey == nil || *job.UniqueKey == "" {
+		return nil
+	}
+	return s.ReleaseUniqueKey(ctx, *job.UniqueKey, job.ID)
+}
+
+// ReleaseEndedJobUniqueKey releases the unique key of a job that is dead or
+// cancelled according to the store. A job that has been revived in the meantime
+// keeps its key, and so does a completed one.
+func (s *RedisStore) ReleaseEndedJobUniqueKey(ctx context.Context, jobID string) error {
+	job, _, err := s.GetJob(ctx, jobID)
+	if errors.Is(err, types.ErrJobNotFound) {
+		return nil // deleting the job released its key
+	}
+	if err != nil {
+		return err
+	}
+	if job.Status != types.JobStatusDead && job.Status != types.JobStatusCancelled {
+		return nil
+	}
+	return s.ReleaseJobUniqueKey(ctx, job)
+}
+
+// ClaimJobUniqueKey makes the job hold its unique key, if it has one. It
+// succeeds if the job holds the key already and returns ErrDuplicateJob if
+// another job does. A dead or cancelled job must claim its key before it is
+// brought back to life, so that two jobs never live under one key.
+func (s *RedisStore) ClaimJobUniqueKey(ctx context.Context, job *types.Job) error {
+	if job.UniqueKey == nil || *job.UniqueKey == "" {
+		return nil
+	}
+	return s.TransferUniqueKey(ctx, *job.UniqueKey, job.ID, job.ID)
+}
+
+// TransferUniqueKey makes toJobID hold a unique key that is free or held by
+// fromJobID (atomic compare-and-set). It returns ErrDuplicateJob if another job
+// holds the key. An empty fromJobID means that the key must be free.
+func (s *RedisStore) TransferUniqueKey(ctx context.Context, uniqueKey, fromJobID, toJobID string) error {
+	ok, err := s.scriptClaimUniqueKey.Exec(ctx, s.rdb,
+		[]string{UniqueKeyKey(s.prefix, uniqueKey)}, []string{fromJobID, toJobID},
+	).AsInt64()
+	if err != nil {
+		return err
+	}
+	if ok == 0 {
+		return types.ErrDuplicateJob
+	}
+	return nil
 }
 
 // ============================================================
@@ -1697,7 +1793,7 @@ func (s *RedisStore) updateJobIndexes(ctx context.Context, job *types.Job, oldDa
 	// Clean old unique key if changed.
 	if old.UniqueKey != nil && *old.UniqueKey != "" {
 		if job.UniqueKey == nil || *job.UniqueKey != *old.UniqueKey {
-			s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, *old.UniqueKey)).Build())
+			s.ReleaseUniqueKey(ctx, *old.UniqueKey, job.ID)
 		}
 	}
 }
@@ -1711,7 +1807,7 @@ func (s *RedisStore) removeJobIndexes(ctx context.Context, jobID string, old *ty
 		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByTagKey(s.prefix, tag)).Member(jobID).Build())
 	}
 	if old.UniqueKey != nil && *old.UniqueKey != "" {
-		s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, *old.UniqueKey)).Build())
+		s.ReleaseUniqueKey(ctx, *old.UniqueKey, jobID)
 	}
 	if old.WorkflowID != nil && *old.WorkflowID != "" {
 		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByWorkflowKey(s.prefix, *old.WorkflowID)).Member(jobID).Build())
@@ -1876,10 +1972,77 @@ func (s *RedisStore) mirrorBatchPayloads(_ context.Context, batch *types.BatchIn
 
 const jsonPathSearchChunkSize = 100
 
-// FindJobByPayloadPath scans jobs and returns the first whose Payload matches
-// the given JSONPath + value. Uses RedisJSON's JSON.GET for native path extraction.
+// FindJobByPayloadPath scans jobs and returns the newest whose Payload matches
+// the given JSONPath + value, whatever its status. Uses RedisJSON's JSON.GET for
+// native path extraction.
 // If taskType is non-empty, only jobs of that type are scanned (via the by_task_type index).
+// Use FindJobsByPayloadPath to get all matching jobs, or only live ones.
 func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, value any, taskType string) (*types.Job, uint64, error) {
+	var found *types.Job
+	var rev uint64
+	err := s.scanJobsByPayloadPath(ctx, jsonPath, value, taskType, func(ids []string) (bool, error) {
+		for _, id := range ids {
+			job, r, err := s.GetJob(ctx, id)
+			if errors.Is(err, types.ErrJobNotFound) {
+				continue // deleted in the meantime
+			}
+			if err != nil {
+				return false, err
+			}
+			found, rev = job, r
+			return false, nil
+		}
+		return true, nil
+	})
+	if found != nil {
+		return found, rev, nil
+	}
+	if err != nil && !isUnknownCommandErr(err) { // without RedisJSON there is nothing to find
+		return nil, 0, err
+	}
+	return nil, 0, types.ErrJobNotFound
+}
+
+// FindJobsByPayloadPath returns the jobs whose Payload matches the given JSONPath
+// + value and that q selects, newest first. No match is not an error.
+func (s *RedisStore) FindJobsByPayloadPath(ctx context.Context, jsonPath string, value any, q PayloadQuery) ([]*types.Job, error) {
+	var jobs []*types.Job
+	err := s.scanJobsByPayloadPath(ctx, jsonPath, value, q.TaskType, func(ids []string) (bool, error) {
+		cmds := make(rueidis.Commands, 0, len(ids))
+		for _, id := range ids {
+			cmds = append(cmds, s.rdb.B().Hget().Key(JobKey(s.prefix, id)).Field("data").Build())
+		}
+		for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+			data, err := r.ToString()
+			if rueidis.IsRedisNil(err) {
+				continue // deleted in the meantime
+			}
+			if err != nil {
+				return false, fmt.Errorf("get job %s: %w", ids[i], err)
+			}
+			var job types.Job
+			if err := sonic.ConfigFastest.Unmarshal([]byte(data), &job); err != nil {
+				return false, fmt.Errorf("unmarshal job %s: %w", ids[i], err)
+			}
+			if !q.matches(&job) {
+				continue
+			}
+			jobs = append(jobs, &job)
+			if q.Limit > 0 && len(jobs) >= q.Limit {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+// scanJobsByPayloadPath passes the IDs of the jobs whose payload matches to visit,
+// newest first and chunk by chunk, until visit returns false or an error.
+func (s *RedisStore) scanJobsByPayloadPath(ctx context.Context, jsonPath string, value any, taskType string, visit func(ids []string) (bool, error)) error {
 	fullPath := "$." + jsonPath
 	valueStr := fmt.Sprintf("%v", value)
 
@@ -1889,32 +2052,64 @@ func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, 
 		indexKey = JobsByTaskTypeKey(s.prefix, taskType)
 	}
 
-	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64()
-	if err != nil {
-		return nil, 0, fmt.Errorf("count jobs: %w", err)
-	}
-
-	for offset := int64(0); offset < total; offset += jsonPathSearchChunkSize {
-		end := offset + jsonPathSearchChunkSize - 1
-		ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(indexKey).Start(offset).Stop(end).Build()).AsStrSlice()
-		if err != nil || len(ids) == 0 {
-			break
+	// Page by score rather than by rank: ranks shift while jobs are being created
+	// and deleted. A page starts at the last score of the previous one, past the
+	// jobs of that score that have been read.
+	seen := make(map[string]struct{})
+	upper, offset := "+inf", int64(0)
+	for {
+		page, err := s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(upper).Min("-inf").
+			Withscores().Limit(offset, jsonPathSearchChunkSize).Build()).AsZScores()
+		if err != nil {
+			return fmt.Errorf("list jobs: %w", err)
 		}
 
-		// Pipeline JSON.GET for each key.
-		cmds := make(rueidis.Commands, 0, len(ids))
-		for _, id := range ids {
-			cmds = append(cmds, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, id)).Path(fullPath).Build())
+		ids := make([]string, 0, len(page))
+		cmds := make(rueidis.Commands, 0, len(page))
+		for _, z := range page {
+			if _, ok := seen[z.Member]; ok {
+				continue
+			}
+			seen[z.Member] = struct{}{}
+			ids = append(ids, z.Member)
+			cmds = append(cmds, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, z.Member)).Path(fullPath).Build())
 		}
-		results := s.rdb.DoMulti(ctx, cmds...)
 
-		for i, r := range results {
-			if matchJSONGetResult(r, valueStr) {
-				return s.GetJob(ctx, ids[i])
+		var matches []string
+		if len(cmds) > 0 {
+			for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+				if err := r.Error(); err != nil && !rueidis.IsRedisNil(err) {
+					return fmt.Errorf("search payload of job %s: %w", ids[i], err)
+				}
+				if matchJSONGetResult(r, valueStr) {
+					matches = append(matches, ids[i])
+				}
 			}
 		}
+		if len(matches) > 0 {
+			if more, err := visit(matches); err != nil || !more {
+				return err
+			}
+		}
+
+		if len(page) < jsonPathSearchChunkSize {
+			return nil
+		}
+		last := page[len(page)-1].Score
+		if next := strconv.FormatFloat(last, 'f', -1, 64); next != upper {
+			upper, offset = next, 0
+		}
+		for i := len(page) - 1; i >= 0 && page[i].Score == last; i-- {
+			offset++
+		}
 	}
-	return nil, 0, types.ErrJobNotFound
+}
+
+// isUnknownCommandErr reports whether the server does not know the command, e.g.
+// because the module that provides it is not loaded.
+func isUnknownCommandErr(err error) bool {
+	var redisErr *rueidis.RedisError
+	return errors.As(err, &redisErr) && strings.Contains(strings.ToLower(redisErr.Error()), "unknown command")
 }
 
 // FindWorkflowByTaskPayloadPath scans all workflows and returns the first where any task's
@@ -2007,8 +2202,23 @@ func matchJSONGetResult(r rueidis.RedisResult, expected string) bool {
 			return true
 		}
 	}
+
+	// A large number does not print as it is written: %v makes 1e+06 of 1000000,
+	// and a float64 cannot hold every integer. So compare its digits, too.
+	var literals []any
+	if jsonWithNumbers.Unmarshal([]byte(raw), &literals) != nil {
+		return false
+	}
+	for _, v := range literals {
+		if n, ok := v.(json.Number); ok && n.String() == expected {
+			return true
+		}
+	}
 	return false
 }
+
+// jsonWithNumbers decodes numbers as json.Number instead of float64.
+var jsonWithNumbers = sonic.Config{UseNumber: true}.Froze()
 
 // --- Workflow Signal operations ---
 
@@ -2543,6 +2753,13 @@ func (s *RedisStore) CompleteOperationEffect(ctx context.Context, opKey, stepKey
 		return false, fmt.Errorf("complete operation effect: %w", err)
 	}
 	return res == 1, nil
+}
+
+// ForgetOperation removes an operation from the ledger, so that it can be executed
+// again. Meant for an explicit request to run a cancelled job after all: a run that
+// was cut off by the cancel may have been recorded as done.
+func (s *RedisStore) ForgetOperation(ctx context.Context, opKey string) error {
+	return s.rdb.Do(ctx, s.rdb.B().Del().Key(OperationLedgerKey(s.prefix, opKey)).Build()).Error()
 }
 
 // RefreshOperationLedger extends the TTL of the operation ledger key.

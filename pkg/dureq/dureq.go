@@ -119,6 +119,7 @@ type TierConfig = store.TierConfig
 
 // Re-export filter types for custom API handler composition.
 type JobFilter = store.JobFilter
+type PayloadQuery = store.PayloadQuery
 type RunFilter = store.RunFilter
 type EventFilter = store.EventFilter
 type ScheduleFilter = store.ScheduleFilter

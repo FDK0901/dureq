@@ -13,8 +13,8 @@ import (
 // Config configures the archival cleaner.
 type Config struct {
 	Store *store.RedisStore
-	// RetentionPeriod is how long completed/failed/dead jobs are kept.
-	// Jobs older than this are deleted. Default: 7 days.
+	// RetentionPeriod is how long completed/failed/dead/cancelled jobs are kept.
+	// Jobs older than this are deleted. 0 (the zero value) = archival off, negative = 7 days.
 	RetentionPeriod time.Duration
 	// ScanInterval is how often the cleaner runs. Default: 1 hour.
 	ScanInterval time.Duration
@@ -113,9 +113,7 @@ func (c *Cleaner) cleanup(ctx context.Context) {
 				// Clean associated schedule/unique key/audit trail.
 				c.store.DeleteSchedule(ctx, job.ID)
 				c.store.DeleteJobAuditTrail(ctx, job.ID)
-				if job.UniqueKey != nil && *job.UniqueKey != "" {
-					c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
-				}
+				c.store.ReleaseJobUniqueKey(ctx, job)
 				deleted++
 			}
 		}

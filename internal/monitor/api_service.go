@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -146,6 +147,9 @@ func (a *APIService) CancelJob(ctx context.Context, jobID string) error {
 		return err
 	}
 
+	// Before the event, so that a listener can enqueue under the key again.
+	releaseErr := a.store.ReleaseJobUniqueKey(ctx, job)
+
 	a.store.DeleteSchedule(ctx, jobID)
 	a.signalCancelActiveRuns(ctx, jobID)
 
@@ -154,6 +158,49 @@ func (a *APIService) CancelJob(ctx context.Context, jobID string) error {
 		JobID:     jobID,
 		Timestamp: now,
 	})
+	if releaseErr != nil {
+		return fmt.Errorf("job cancelled, but its unique key was not released: %w", releaseErr)
+	}
+	return nil
+}
+
+// rerunJob puts a job back to work at attempt 0. A job with a unique key takes the key
+// back first; it fails with a conflict, leaving the job as it is, if another job holds
+// the key.
+func (a *APIService) rerunJob(ctx context.Context, job *types.Job, rev uint64) error {
+	if err := a.store.ClaimJobUniqueKey(ctx, job); err != nil {
+		if errors.Is(err, types.ErrDuplicateJob) {
+			return &ApiError{Msg: "cannot retry: another job holds unique key " + *job.UniqueKey, StatusCode: http.StatusConflict}
+		}
+		return err
+	}
+
+	prevStatus := job.Status
+	job.Status = types.JobStatusPending
+	job.Attempt = 0
+	job.LastError = nil
+	job.UpdatedAt = time.Now()
+
+	newRev, err := a.store.UpdateJob(ctx, job, rev)
+	if err != nil {
+		a.store.ReleaseEndedJobUniqueKey(ctx, job.ID)
+		return err
+	}
+
+	if prevStatus == types.JobStatusCancelled {
+		err = a.store.ForgetOperation(ctx, job.ID)
+	}
+	if err == nil {
+		err = a.dispatcher.Dispatch(ctx, job, 0)
+	}
+	if err != nil {
+		// Rollback: restore previous status.
+		job.Status = prevStatus
+		job.UpdatedAt = time.Now()
+		a.store.UpdateJob(ctx, job, newRev)
+		a.store.ReleaseEndedJobUniqueKey(ctx, job.ID)
+		return fmt.Errorf("dispatch failed: %w", err)
+	}
 	return nil
 }
 
@@ -166,24 +213,8 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 	if !job.Status.IsRetryable() {
 		return &ApiError{Msg: "cannot retry: job is " + string(job.Status) + " (only failed/dead/cancelled)", StatusCode: http.StatusConflict}
 	}
-
 	now := time.Now()
-	prevStatus := job.Status
-	job.Status = types.JobStatusPending
-	job.Attempt = 0
-	job.LastError = nil
-	job.UpdatedAt = now
-
-	newRev, err := a.store.UpdateJob(ctx, job, rev)
-	if err != nil {
-		return err
-	}
-
-	if err := a.dispatcher.Dispatch(ctx, job, 0); err != nil {
-		// Rollback: restore previous status.
-		job.Status = prevStatus
-		job.UpdatedAt = time.Now()
-		a.store.UpdateJob(ctx, job, newRev)
+	if err := a.rerunJob(ctx, job, rev); err != nil {
 		return err
 	}
 
@@ -1010,7 +1041,11 @@ func (a *APIService) BulkCancelJobs(ctx context.Context, req BulkRequest) (*Bulk
 		job.Status = types.JobStatusCancelled
 		job.UpdatedAt = now
 		if _, err := a.store.UpdateJob(ctx, job, rev); err == nil {
+			if err := a.store.ReleaseJobUniqueKey(ctx, job); err != nil {
+				a.logger.Warn().String("job_id", id).Err(err).Msg("bulk cancel: failed to release unique key")
+			}
 			a.store.DeleteSchedule(ctx, id)
+			a.signalCancelActiveRuns(ctx, id)
 			a.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventJobCancelled, JobID: id, Timestamp: now,
 			})
@@ -1042,14 +1077,7 @@ func (a *APIService) BulkRetryJobs(ctx context.Context, req BulkRequest) (*BulkR
 		if err != nil || !job.Status.IsRetryable() {
 			continue
 		}
-		job.Status = types.JobStatusPending
-		job.Attempt = 0
-		job.LastError = nil
-		job.UpdatedAt = now
-		if _, err := a.store.UpdateJob(ctx, job, rev); err != nil {
-			continue
-		}
-		if err := a.dispatcher.Dispatch(ctx, job, 0); err != nil {
+		if err := a.rerunJob(ctx, job, rev); err != nil {
 			continue
 		}
 		a.dispatcher.PublishEvent(types.JobEvent{
@@ -1490,27 +1518,7 @@ func (a *APIService) RequeueRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return &ApiError{Msg: "parent job not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
-
-	now := time.Now()
-	prevStatus := job.Status
-	job.Status = types.JobStatusPending
-	job.Attempt = 0
-	job.LastError = nil
-	job.UpdatedAt = now
-
-	newRev, err := a.store.UpdateJob(ctx, job, rev)
-	if err != nil {
-		return err
-	}
-
-	if err := a.dispatcher.Dispatch(ctx, job, 0); err != nil {
-		job.Status = prevStatus
-		job.UpdatedAt = time.Now()
-		a.store.UpdateJob(ctx, job, newRev)
-		return fmt.Errorf("dispatch failed: %w", err)
-	}
-
-	return nil
+	return a.rerunJob(ctx, job, rev)
 }
 
 // LockInfo holds metadata about a distributed lock.

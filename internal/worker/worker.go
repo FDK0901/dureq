@@ -458,9 +458,18 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		return
 	}
 
+	job, rev, jobErr := w.store.GetJob(w.ctx, work.JobID)
+
+	// What is still queued of a cancelled job does not run any more. Workflow and
+	// batch jobs are left to the orchestrator, which waits for their outcome.
+	if jobErr == nil && job.Status == types.JobStatusCancelled && job.WorkflowID == nil && job.BatchID == nil {
+		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: job is cancelled, dropping message")
+		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
+		return
+	}
+
 	// ScheduleToStart timeout check.
 	if !work.DispatchedAt.IsZero() {
-		job, rev, jobErr := w.store.GetJob(w.ctx, work.JobID)
 		if jobErr == nil && job.ScheduleToStartTimeout != nil {
 			waited := time.Since(work.DispatchedAt)
 			if waited > job.ScheduleToStartTimeout.Std() {
@@ -468,11 +477,13 @@ func (w *Worker) processMessage(sm *streamMessage) {
 
 				now := time.Now()
 				errStr := types.ErrScheduleToStartTimeout.Error()
-				job.Status = types.JobStatusFailed
-				job.LastError = &errStr
-				job.UpdatedAt = now
-				if _, err := w.store.UpdateJob(w.ctx, job, rev); err != nil {
-					w.logger.Error().String("job_id", work.JobID).Err(err).Msg("worker: schedule-to-start timeout: failed to update job")
+				if !w.staysEnded(job) {
+					job.Status = types.JobStatusFailed
+					job.LastError = &errStr
+					job.UpdatedAt = now
+					if _, err := w.store.UpdateJob(w.ctx, job, rev); err != nil {
+						w.logger.Error().String("job_id", work.JobID).Err(err).Msg("worker: schedule-to-start timeout: failed to update job")
+					}
 				}
 
 				w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
@@ -563,6 +574,9 @@ func (w *Worker) processMessage(sm *streamMessage) {
 					job.CompletedAt = &now
 				}
 				job.UpdatedAt = now
+				if job.Schedule.Type.IsRecurring() {
+					job.Attempt = 0
+				}
 				w.store.UpdateJob(w.ctx, job, rev)
 			}()
 			return
@@ -656,6 +670,8 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		Status:    types.RunStatusRunning,
 		Attempt:   work.Attempt,
 		StartedAt: now,
+
+		OperationKey: work.OperationKey,
 	}
 	w.store.SaveRun(w.ctx, run)
 
@@ -934,10 +950,14 @@ func (w *Worker) pauseJob(work types.WorkMessage, execErr error) {
 		w.logger.Error().String("job_id", work.JobID).Err(err).Msg("worker: failed to get job for pause")
 		return
 	}
+	if w.staysEnded(job) {
+		return
+	}
 
 	now := time.Now()
 	errStr := execErr.Error()
 	job.Status = types.JobStatusPaused
+	job.RunCount++
 	job.LastError = &errStr
 	job.PausedAt = &now
 	job.UpdatedAt = now
@@ -995,9 +1015,13 @@ func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessag
 		if err != nil {
 			return fmt.Errorf("get job: %w", err)
 		}
+		if w.staysEnded(job) {
+			return nil
+		}
 		now := time.Now()
 		job.LastRunAt = &now
-		job.Attempt = work.Attempt + 1
+		job.Attempt = attemptAfterSuccess(job, work)
+		job.RunCount++
 		job.LastError = nil
 		job.ConsecutiveErrors = 0
 		job.Status = types.JobStatusCompleted
@@ -1054,9 +1078,14 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 		if err != nil {
 			return fmt.Errorf("get job: %w", err)
 		}
+		if w.staysEnded(job) {
+			w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).String("status", string(job.Status)).Msg("worker: job ended while this run was going, leaving its status")
+			return nil
+		}
 		now := time.Now()
 		job.LastRunAt = &now
-		job.Attempt = work.Attempt + 1
+		job.Attempt = attemptAfterSuccess(job, work)
+		job.RunCount++
 		job.LastError = nil
 		job.ConsecutiveErrors = 0
 		job.UpdatedAt = now
@@ -1082,15 +1111,24 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 	}
 
 	// Drain overlap buffer if the job has a buffer policy.
-	if jobForPostUpdate != nil && (jobForPostUpdate.Schedule.OverlapPolicy == types.OverlapBufferOne || jobForPostUpdate.Schedule.OverlapPolicy == types.OverlapBufferAll) {
+	if jobForPostUpdate != nil && hasOverlapBuffer(jobForPostUpdate) {
 		go w.drainOverlapBuffer(work.JobID, jobForPostUpdate)
 	}
+}
+
+func hasOverlapBuffer(job *types.Job) bool {
+	return job.Schedule.OverlapPolicy == types.OverlapBufferOne || job.Schedule.OverlapPolicy == types.OverlapBufferAll
 }
 
 // drainOverlapBuffer dispatches a buffered job after a run completes.
 func (w *Worker) drainOverlapBuffer(jobID string, job *types.Job) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	// If another run is active, that one drains the buffer when it is done.
+	if hasActive, _ := w.store.HasActiveRunForJob(ctx, jobID); hasActive {
+		return
+	}
 
 	var found bool
 	var err error
@@ -1105,12 +1143,6 @@ func (w *Worker) drainOverlapBuffer(jobID string, job *types.Job) {
 	}
 
 	if err != nil || !found {
-		return
-	}
-
-	// Check if another run started in the meantime.
-	hasActive, _ := w.store.HasActiveRunForJob(ctx, jobID)
-	if hasActive {
 		return
 	}
 
@@ -1135,6 +1167,24 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		return
 	}
 
+	if w.staysEnded(job) {
+		// The job was cancelled or went dead for good while this run was going. A
+		// retry would bring it back to life.
+		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).String("status", string(job.Status)).Msg("worker: job ended while this run was going, not retrying")
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		w.disp.PublishEvent(types.JobEvent{
+			Type:      types.EventJobFailed,
+			JobID:     work.JobID,
+			RunID:     work.RunID,
+			NodeID:    w.nodeID,
+			TaskType:  work.TaskType,
+			Attempt:   work.Attempt,
+			Error:     &errStr,
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
 	retryPolicy := job.RetryPolicy
 	if retryPolicy == nil {
 		// Fallback to handler-level retry policy before using defaults.
@@ -1144,13 +1194,6 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 			retryPolicy = types.DefaultRetryPolicy()
 		}
 	}
-
-	now := time.Now()
-	job.LastRunAt = &now
-	job.LastError = &errStr
-	job.Attempt = work.Attempt + 1
-	job.ConsecutiveErrors++
-	job.UpdatedAt = now
 
 	// Check NonRetryableErrors list: if the error message contains any of the
 	// configured substrings, treat it as non-retryable.
@@ -1174,16 +1217,21 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		maxAttempts = *job.DLQAfter
 	}
 
+	now := time.Now()
+	job.LastRunAt = &now
+	job.LastError = &errStr
+	job.Attempt = failedAttempts(job, work, maxAttempts) + 1
+	job.RunCount++
+	job.ConsecutiveErrors++
+	job.UpdatedAt = now
+
 	// Check if we should auto-pause instead of going to dead.
 	shouldPause := retryPolicy.PauseAfterErrCount > 0 &&
 		job.ConsecutiveErrors >= retryPolicy.PauseAfterErrCount
 
 	switch {
 	case errClass == types.ErrorClassNonRetryable:
-		job.Status = types.JobStatusDead
-		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
-		w.disp.DispatchToDLQ(w.ctx, job, errStr)
+		w.giveUp(sm, job, rev, errStr)
 
 	case shouldPause:
 		// Auto-pause: consecutive error threshold reached.
@@ -1209,10 +1257,7 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		return // skip the generic failed event below
 
 	case job.Attempt >= maxAttempts:
-		job.Status = types.JobStatusDead
-		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", work.JobID))
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
-		w.disp.DispatchToDLQ(w.ctx, job, errStr)
+		w.giveUp(sm, job, rev, errStr)
 
 	case errClass == types.ErrorClassRateLimited:
 		job.Status = types.JobStatusRetrying
@@ -1248,6 +1293,112 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		Error:     &errStr,
 		Timestamp: now,
 	})
+}
+
+// attemptAfterSuccess returns a job's Attempt once an execution has succeeded.
+// The next firing of a recurring job starts counting anew.
+func attemptAfterSuccess(job *types.Job, work types.WorkMessage) int {
+	if job.Schedule.Type.IsRecurring() {
+		return 0
+	}
+	return work.Attempt + 1
+}
+
+// failedAttempts returns how many attempts of work's execution had failed before
+// this one.
+//
+// Versions before v0.2.5 counted a recurring job's attempts up over its whole
+// life, so a message they dispatched may arrive with more attempts than an
+// execution can have: a firing is given up as soon as it has used up
+// maxAttempts, and only an execution resumed after a pause can be at the limit.
+// Such a message goes by the failures since the job's last success instead.
+func failedAttempts(job *types.Job, work types.WorkMessage, maxAttempts int) int {
+	if !job.Schedule.Type.IsRecurring() {
+		return work.Attempt
+	}
+	limit := maxAttempts
+	if _, isFiring := work.Headers["x-dureq-firing-id"]; isFiring {
+		limit = maxAttempts - 1
+	}
+	if work.Attempt > limit {
+		return min(work.Attempt, job.ConsecutiveErrors)
+	}
+	return work.Attempt
+}
+
+// giveUp ends an execution that is not retried any more: it goes to the DLQ, and its
+// job goes dead or, if its schedule is to be kept, waits for the next firing.
+func (w *Worker) giveUp(sm *streamMessage, job *types.Job, rev uint64, errStr string) {
+	if w.keepsSchedule(job) {
+		failed := *job // with the attempts it has used up
+		job.Status = types.JobStatusScheduled
+		job.Attempt = 0
+		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", job.ID))
+		w.disp.DispatchToDLQ(w.ctx, &failed, errStr)
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		if hasOverlapBuffer(job) {
+			go w.drainOverlapBuffer(job.ID, job)
+		}
+		return
+	}
+
+	w.saveDead(job, rev)
+	syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+	w.disp.DispatchToDLQ(w.ctx, job, errStr)
+}
+
+// keepsSchedule reports whether a job stays on its schedule when a firing is given up.
+func (w *Worker) keepsSchedule(job *types.Job) bool {
+	if !job.Schedule.KeepOnFailure || !job.Schedule.Type.IsRecurring() {
+		return false
+	}
+	_, _, err := w.store.GetSchedule(w.ctx, job.ID)
+	return !errors.Is(err, types.ErrScheduleNotFound)
+}
+
+// saveDead stores the job as dead and then frees its unique key.
+func (w *Worker) saveDead(job *types.Job, rev uint64) {
+	job.Status = types.JobStatusDead
+	saved := false
+	syncRetrySave(w.syncer, func() error {
+		if !saved {
+			if _, err := w.store.UpdateJob(w.ctx, job, rev); err != nil {
+				return err
+			}
+			saved = true
+		}
+		if job.UniqueKey == nil {
+			return nil
+		}
+		return w.store.ReleaseEndedJobUniqueKey(w.ctx, job.ID)
+	}, fmt.Sprintf("update job %s", job.ID))
+}
+
+// staysEnded reports whether the result of a leftover run must leave its job as it
+// ended. A cancelled job stays cancelled. A dead one, whose leftover run may put it
+// back to work, stays dead if another job holds its unique key by now or if it is
+// recurring and has no schedule to go back to; otherwise it holds its key again
+// afterwards. Workflow and batch jobs have no unique key and are left to the
+// orchestrator.
+func (w *Worker) staysEnded(job *types.Job) bool {
+	if job.WorkflowID != nil || job.BatchID != nil {
+		return false
+	}
+	switch job.Status {
+	case types.JobStatusCancelled:
+		return true
+	case types.JobStatusDead:
+		if job.Schedule.Type.IsRecurring() {
+			if _, _, err := w.store.GetSchedule(w.ctx, job.ID); errors.Is(err, types.ErrScheduleNotFound) {
+				return true
+			}
+		}
+		if err := w.store.ClaimJobUniqueKey(w.ctx, job); err != nil {
+			w.logger.Warn().String("job_id", job.ID).Err(err).Msg("worker: dead job cannot take its unique key back")
+			return true
+		}
+	}
+	return false
 }
 
 // cancelSubscribeLoop subscribes to the Redis Pub/Sub cancel channel and cancels

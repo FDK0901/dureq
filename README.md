@@ -116,7 +116,7 @@ Client (Go)
 - **Atomic Dispatch** — Lua script performs dedup check + XADD + dedup mark in a single atomic operation; eliminates crash window between dedup and stream write
 - **Transactional Completion** — `pkg/integration/postgres` adapter commits business write + dureq completion marker in the same SQL transaction for exactly-once business outcomes
 - **Durable Cancellation** — Persisted cancel flag (`SET EX 24h`) + Pub/Sub fast path + 10s polling fallback; survives Pub/Sub disconnections
-- **Unique Keys** — Deduplication via unique keys with lookup and manual deletion
+- **Unique Keys** — Deduplication via unique keys with lookup and manual deletion; released when the job goes dead or is cancelled, kept when it completes. `EnqueueOrReplace` cancels the job that holds the key and puts a new one in its place
 - **Worker Versioning** — BuildID-style safe deployments; version-mismatched work is re-enqueued for matching workers
 - **ScheduleToStart Timeout** — Fail jobs that wait too long in the queue before starting
 - **Workflow Signals** — Send asynchronous external data to running workflows. `ReadSignals` + `AckSignals` provides at-least-once delivery; see [guarantees](docs/guarantees.md) and [signals](docs/signals.md) docs
@@ -134,7 +134,7 @@ Client (Go)
 - **Web Dashboard** — React-based UI (durequi) with real-time WebSocket updates
 - **Terminal UI** — Interactive TUI (dureqctl) for cluster monitoring
 - **Monitoring APIs** — HTTP REST, gRPC, and WebSocket for full cluster observability
-- **Payload Search** — JSONPath-based search across jobs, workflows, and batches
+- **Payload Search** — JSONPath-based search across jobs, workflows, and batches; `GetJobsByParamJSONPath` returns all matching jobs, optionally only live ones
 - **Multi-Tenancy** — Key prefix isolation per tenant
 
 ### Execution Guarantees
@@ -361,6 +361,10 @@ types.DefaultRetryPolicy()
 }
 ```
 
+For recurring jobs `MaxAttempts` applies to each firing on its own: successful runs do not count, and every firing starts at attempt 0. A firing that uses up its attempts ends the whole job (`dead`), including its schedule. With `Schedule.KeepOnFailure` it goes to the DLQ instead, and the job waits for its next firing. `Job.RunCount` counts the executions over the job's whole life.
+
+A run that is lost with its worker counts as an attempt of a recurring job's firing.
+
 Error classification controls retry behavior:
 
 ```go
@@ -529,7 +533,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `dureq.WithKeyPrefix(prefix)`     | -              | Redis key prefix             |
 | `dureq.WithPriorityTiers(tiers)`  | -              | Custom priority tier mapping |
 | `dureq.WithGroupAggregation(cfg)` | disabled       | Enable group aggregation     |
-| `dureq.WithRetentionPeriod(d)`    | `7d`           | Retention for completed jobs |
+| `dureq.WithRetentionPeriod(d)`    | off            | Retention for completed jobs |
 | `dureq.WithLogger(logger)`        | -              | Custom logger                |
 
 ### Client Options

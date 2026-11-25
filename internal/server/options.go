@@ -14,8 +14,8 @@ func WithGroupAggregation(cfg types.GroupConfig) Option {
 	return func(c *Config) { c.GroupConfig = &cfg }
 }
 
-// WithRetentionPeriod sets how long completed/dead/cancelled jobs are kept before archival cleanup.
-// Default: 7 days. Set to 0 to disable archival.
+// WithRetentionPeriod sets how long completed/failed/dead/cancelled jobs are kept before archival cleanup.
+// Archival is off unless this option is given with a non-zero period; a negative period means 7 days.
 func WithRetentionPeriod(d time.Duration) Option {
 	return func(c *Config) { c.RetentionPeriod = &d }
 }
@@ -77,8 +77,8 @@ type Config struct {
 	// GroupConfig enables task group aggregation. Nil = disabled.
 	GroupConfig *types.GroupConfig
 
-	// RetentionPeriod controls how long completed/dead/cancelled jobs are kept.
-	// Nil = default (7 days). Set to pointer to 0 to disable archival.
+	// RetentionPeriod controls how long completed/failed/dead/cancelled jobs are kept.
+	// Nil or a pointer to 0 = archival off (jobs are kept forever). Negative = 7 days.
 	RetentionPeriod *time.Duration
 
 	// Logger is the structured logger. Default: slog.Default().

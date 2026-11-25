@@ -118,6 +118,15 @@ const (
 	ScheduleMonthly   ScheduleType = "MONTHLY"
 )
 
+// IsRecurring returns true if a schedule of this type fires more than once.
+func (t ScheduleType) IsRecurring() bool {
+	switch t {
+	case ScheduleDuration, ScheduleCron, ScheduleDaily, ScheduleWeekly, ScheduleMonthly:
+		return true
+	}
+	return false
+}
+
 // OverlapPolicy controls behavior when a scheduled job fires while
 // a previous execution is still running.
 type OverlapPolicy string
@@ -174,6 +183,11 @@ type Schedule struct {
 	// This prevents thundering herd when many jobs share the same schedule.
 	// E.g., Jitter of 30s means the firing time is offset by rand(0, 30s).
 	Jitter *Duration `json:"jitter,omitempty"`
+
+	// KeepOnFailure keeps a recurring job going when one of its firings is given up
+	// (retries used up, or a non-retryable error): that firing goes to the DLQ and
+	// the job waits for its next one. Default: the job goes dead and its schedule ends.
+	KeepOnFailure bool `json:"keep_on_failure,omitempty"`
 }
 
 // AtTime represents a time of day as hour, minute, second.
@@ -350,7 +364,8 @@ type Job struct {
 
 	// State
 	Status            JobStatus  `json:"status"`
-	Attempt           int        `json:"attempt"`
+	Attempt           int        `json:"attempt"` // attempts of the current execution; a recurring job starts at 0 with every firing
+	RunCount          int        `json:"run_count,omitempty"` // executions that have finished, over the job's whole life
 	ConsecutiveErrors int        `json:"consecutive_errors,omitempty"`
 	LastError         *string    `json:"last_error,omitempty"`
 	LastRunAt         *time.Time `json:"last_run_at,omitempty"`
@@ -405,6 +420,7 @@ type JobRun struct {
 	Duration        time.Duration   `json:"duration,omitempty"`
 	LastHeartbeatAt *time.Time      `json:"last_heartbeat_at,omitempty"`
 	Progress        json.RawMessage `json:"progress,omitempty"` // user-reported progress data
+	OperationKey    string          `json:"operation_key,omitempty"` // the logical operation this run executes
 }
 
 // ScheduleEntry is the KV entry the leader's scheduler scans for due jobs.

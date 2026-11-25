@@ -361,7 +361,7 @@ types.DefaultRetryPolicy()
 }
 ```
 
-For recurring jobs `MaxAttempts` applies to each firing on its own: successful runs do not count, and every firing starts at attempt 0. A firing that uses up its attempts ends the whole job (`dead`), including its schedule.
+For recurring jobs `MaxAttempts` applies to each firing on its own: successful runs do not count, and every firing starts at attempt 0. A firing that uses up its attempts ends the whole job (`dead`), including its schedule. `Job.RunCount` counts the executions over the job's whole life.
 
 A run that is lost with its worker counts as an attempt of a recurring job's firing.
 

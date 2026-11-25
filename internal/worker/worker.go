@@ -957,6 +957,7 @@ func (w *Worker) pauseJob(work types.WorkMessage, execErr error) {
 	now := time.Now()
 	errStr := execErr.Error()
 	job.Status = types.JobStatusPaused
+	job.RunCount++
 	job.LastError = &errStr
 	job.PausedAt = &now
 	job.UpdatedAt = now
@@ -1020,6 +1021,7 @@ func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessag
 		now := time.Now()
 		job.LastRunAt = &now
 		job.Attempt = attemptAfterSuccess(job, work)
+		job.RunCount++
 		job.LastError = nil
 		job.ConsecutiveErrors = 0
 		job.Status = types.JobStatusCompleted
@@ -1083,6 +1085,7 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 		now := time.Now()
 		job.LastRunAt = &now
 		job.Attempt = attemptAfterSuccess(job, work)
+		job.RunCount++
 		job.LastError = nil
 		job.ConsecutiveErrors = 0
 		job.UpdatedAt = now
@@ -1214,6 +1217,7 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 	job.LastRunAt = &now
 	job.LastError = &errStr
 	job.Attempt = failedAttempts(job, work, maxAttempts) + 1
+	job.RunCount++
 	job.ConsecutiveErrors++
 	job.UpdatedAt = now
 

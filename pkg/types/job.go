@@ -360,6 +360,7 @@ type Job struct {
 	// State
 	Status            JobStatus  `json:"status"`
 	Attempt           int        `json:"attempt"` // attempts of the current execution; a recurring job starts at 0 with every firing
+	RunCount          int        `json:"run_count,omitempty"` // executions that have finished, over the job's whole life
 	ConsecutiveErrors int        `json:"consecutive_errors,omitempty"`
 	LastError         *string    `json:"last_error,omitempty"`
 	LastRunAt         *time.Time `json:"last_run_at,omitempty"`

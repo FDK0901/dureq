@@ -4,9 +4,11 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
+	"github.com/FDK0901/dureq/internal/client"
 	"github.com/FDK0901/dureq/pkg/types"
 )
 
@@ -78,5 +80,55 @@ func TestRecurring_BackfillSchedule_EveryFiringRuns(t *testing.T) {
 		}
 		waitFor(t, 10*time.Second, "backfilled run", func() bool { return len(rec.seen()) == round })
 		waitStatus(t, cli, job.ID, types.JobStatusScheduled)
+	}
+}
+
+// RunCount goes on counting where Attempt starts anew.
+func TestRecurring_RunCount_CountsAllExecutions(t *testing.T) {
+	rec := &recorder{fail: func(run int) error {
+		if run == 1 {
+			return errBoom
+		}
+		return nil
+	}}
+	_, cli := startRecorder(t, "rec.count", rec)
+	job := mustEvery(t, cli, "rec.count", time.Hour, fastRetry(3), "rec-count")
+	for executions, want := range []int{1, 3} { // the second firing is retried once
+		dispatchFiring(t, cli, job, 0)
+		waitFor(t, 10*time.Second, "run count", func() bool {
+			j, err := cli.GetJob(context.Background(), job.ID)
+			return err == nil && j.RunCount == want && j.Status == types.JobStatusScheduled
+		})
+		if n := len(rec.seen()); n != want {
+			t.Fatalf("firing %d: %d executions, want %d", executions, n, want)
+		}
+	}
+	if j, _ := cli.GetJob(context.Background(), job.ID); j.Attempt != 0 {
+		t.Fatalf("attempt = %d, want 0", j.Attempt)
+	}
+}
+
+// A one-off job keeps the attempts it took, and is counted too.
+func TestOneOff_AttemptAndRunCount(t *testing.T) {
+	rec := &recorder{fail: func(run int) error {
+		if run == 0 {
+			return errBoom
+		}
+		return nil
+	}}
+	_, cli := startRecorder(t, "rec.one", rec)
+	job, err := cli.EnqueueScheduled(context.Background(), &client.EnqueueRequest{
+		TaskType:    "rec.one",
+		Payload:     json.RawMessage(`{}`),
+		Schedule:    types.Schedule{Type: types.ScheduleImmediate},
+		RetryPolicy: fastRetry(3),
+	})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	waitStatus(t, cli, job.ID, types.JobStatusCompleted)
+	got, err := cli.GetJob(context.Background(), job.ID)
+	if err != nil || got.Attempt != 2 || got.RunCount != 2 {
+		t.Fatalf("attempt %d, run count %d, err %v; want 2, 2", got.Attempt, got.RunCount, err)
 	}
 }

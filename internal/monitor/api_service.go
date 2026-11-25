@@ -778,7 +778,12 @@ type QueueInfo struct {
 	RateLimit  float64 `json:"rate_limit,omitempty"`
 	RateBurst  int     `json:"rate_burst,omitempty"`
 	Paused     bool    `json:"paused"`
-	Size       int64   `json:"size"`
+	Size       int64   `json:"size"` // length of the stream, including what has been processed
+
+	// Left out if the server cannot tell; Waiting takes Redis 7.0.
+	Waiting  *int64 `json:"waiting,omitempty"`   // no worker has taken it yet
+	InFlight *int64 `json:"in_flight,omitempty"` // taken by a worker and not finished yet
+	Delayed  *int64 `json:"delayed,omitempty"`   // due later, such as retries
 }
 
 func (a *APIService) ListQueues(ctx context.Context) ([]QueueInfo, error) {
@@ -792,7 +797,7 @@ func (a *APIService) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 	queues := make([]QueueInfo, 0, len(tiers))
 	for _, tier := range tiers {
 		size, _ := a.store.Client().Do(ctx, a.store.Client().B().Xlen().Key(store.WorkStreamKey(a.store.Prefix(), tier.Name)).Build()).AsInt64()
-		queues = append(queues, QueueInfo{
+		queue := QueueInfo{
 			Name:       tier.Name,
 			Weight:     tier.Weight,
 			FetchBatch: tier.FetchBatch,
@@ -800,7 +805,11 @@ func (a *APIService) ListQueues(ctx context.Context) ([]QueueInfo, error) {
 			RateBurst:  tier.RateBurst,
 			Paused:     pausedSet[tier.Name],
 			Size:       size,
-		})
+		}
+		if depth, err := a.store.GetQueueDepth(ctx, tier.Name); err == nil {
+			queue.Waiting, queue.InFlight, queue.Delayed = depth.Waiting, &depth.InFlight, &depth.Delayed
+		}
+		queues = append(queues, queue)
 	}
 	return queues, nil
 }

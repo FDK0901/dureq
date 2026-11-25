@@ -484,7 +484,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`    | `/api/stats/daily`          | Daily aggregated statistics        |
 | `GET`    | `/api/nodes`                | Worker nodes                       |
 | `GET`    | `/api/schedules`            | Active schedules                   |
-| `GET`    | `/api/queues`               | Queue tiers (size, weight, paused) |
+| `GET`    | `/api/queues`               | Queue tiers (backlog, weight, paused) |
 | `POST`   | `/api/queues/{tier}/pause`  | Pause a queue                      |
 | `POST`   | `/api/queues/{tier}/resume` | Resume a queue                     |
 | `GET`    | `/api/dlq`                  | Dead letter queue                  |

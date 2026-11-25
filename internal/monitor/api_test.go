@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -169,4 +170,57 @@ func TestResumeJob_DispatchFails_StaysPaused(t *testing.T) {
 	if got.Status != types.JobStatusPaused || got.PausedAt == nil || got.ResumeAt == nil || got.ConsecutiveErrors != 3 {
 		t.Fatalf("job after a failed resume: %+v", got)
 	}
+}
+
+func TestQueues_Depth(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	ctx := context.Background()
+	type queue struct {
+		Size     int64  `json:"size"`
+		Waiting  *int64 `json:"waiting"`
+		InFlight *int64 `json:"in_flight"`
+		Delayed  *int64 `json:"delayed"`
+	}
+	check := func(when string, size, waiting, inFlight, delayed int64) {
+		t.Helper()
+		var queues []queue
+		get(t, srv, "/api/queues", &queues)
+		q := queues[0]
+		if q.Waiting == nil || q.InFlight == nil || q.Delayed == nil {
+			t.Fatalf("%s: depth is missing: %+v", when, q)
+		}
+		if q.Size != size || *q.Waiting != waiting || *q.InFlight != inFlight || *q.Delayed != delayed {
+			t.Fatalf("%s: size %d, waiting %d, in flight %d, delayed %d; want %d, %d, %d, %d",
+				when, q.Size, *q.Waiting, *q.InFlight, *q.Delayed, size, waiting, inFlight, delayed)
+		}
+	}
+
+	check("before there is a stream", 0, 0, 0, 0)
+	if err := st.EnsureStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	check("empty", 0, 0, 0, 0)
+
+	for i := range 5 {
+		if _, err := st.DispatchWork(ctx, "normal", &types.WorkMessage{RunID: fmt.Sprint("run", i), JobID: "j", TaskType: "t"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check("dispatched", 5, 5, 0, 0)
+
+	rdb := st.Client()
+	streams, err := rdb.Do(ctx, rdb.B().Xreadgroup().Group(store.ConsumerGroup, "n").Count(3).Streams().Key(store.WorkStreamKey(st.Prefix(), "normal")).Id(">").Build()).AsXRead()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check("3 taken", 5, 2, 3, 0)
+
+	entries := streams[store.WorkStreamKey(st.Prefix(), "normal")]
+	if err := st.AckMessage(ctx, "normal", entries[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddDelayed(ctx, "normal", &types.WorkMessage{RunID: "later", JobID: "j"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	check("1 of them done, 1 to retry", 5, 2, 2, 1)
 }

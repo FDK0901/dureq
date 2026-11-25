@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -569,6 +570,51 @@ func (s *RedisStore) ClaimStaleMessages(ctx context.Context, tierName, consumerN
 // No-op if the message is no longer pending (already ACK'd).
 func (s *RedisStore) RefreshMessageClaim(ctx context.Context, tierName, consumerName, messageID string) error {
 	return s.rdb.Do(ctx, s.rdb.B().Xclaim().Key(WorkStreamKey(s.prefix, tierName)).Group(ConsumerGroup).Consumer(consumerName).MinIdleTime("0").Id(messageID).Justid().Build()).Error()
+}
+
+// QueueDepth tells how much work a tier has.
+type QueueDepth struct {
+	Waiting  *int64 // messages no worker has taken yet; nil if the server cannot tell (Redis before 7.0)
+	InFlight int64  // messages taken by a worker and not acknowledged yet
+	Delayed  int64  // messages due later, such as retries
+}
+
+// GetQueueDepth returns the depth of a tier. The length of its stream is no measure of
+// that: the stream also holds the messages that have been processed.
+func (s *RedisStore) GetQueueDepth(ctx context.Context, tierName string) (QueueDepth, error) {
+	var depth QueueDepth
+	results := s.rdb.DoMulti(ctx,
+		s.rdb.B().XinfoGroups().Key(WorkStreamKey(s.prefix, tierName)).Build(),
+		s.rdb.B().Zcard().Key(DelayedKey(s.prefix, tierName)).Build(),
+	)
+	groups, err := results[0].ToArray()
+	if err != nil && strings.Contains(err.Error(), "no such key") { // nothing was ever dispatched
+		groups, err, depth.Waiting = nil, nil, new(int64)
+	}
+	if err != nil {
+		return depth, fmt.Errorf("queue depth of %s: %w", tierName, err)
+	}
+	if depth.Delayed, err = results[1].AsInt64(); err != nil {
+		return depth, fmt.Errorf("queue depth of %s: %w", tierName, err)
+	}
+	for _, g := range groups {
+		info, err := g.AsMap()
+		if err != nil {
+			return depth, fmt.Errorf("queue depth of %s: %w", tierName, err)
+		}
+		name := info["name"]
+		if group, _ := name.ToString(); group != ConsumerGroup {
+			continue
+		}
+		pending, lag := info["pending"], info["lag"]
+		if depth.InFlight, err = pending.AsInt64(); err != nil {
+			return depth, fmt.Errorf("queue depth of %s: %w", tierName, err)
+		}
+		if n, err := lag.AsInt64(); err == nil {
+			depth.Waiting = &n
+		}
+	}
+	return depth, nil
 }
 
 // ============================================================

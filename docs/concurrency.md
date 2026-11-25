@@ -119,7 +119,7 @@ at if it should do more:
 - **`MaxConcurrency`**: for jobs that mostly wait, such as for other services, raise it.
 - **`FetchBatch`** of a tier (10 by default): how many messages a node takes at once. With many short jobs and a
   larger value, it asks Redis less often. With a smaller one, a few jobs are spread more evenly over several nodes.
-- **Redis**: a job takes about ten round trips one after the other, so the latency to Redis counts for short jobs. To
+- **Redis**: a job takes 11 round trips one after the other, so the latency to Redis counts for short jobs. To
   measure it, see `bench/`.
 
 The overall pool size is set via `WithMaxConcurrency` (default: 100).

@@ -286,9 +286,10 @@ func TestWorker_OnlyFullHandlers(t *testing.T) {
 	}
 }
 
-// Messages that a node keeps at hand go to other nodes when it stops.
+// Messages that a node has taken but not started go to other nodes when it stops, both those of
+// a handler with a limit and others.
 func TestWorker_ReturnsMessagesWhenStopped(t *testing.T) {
-	for name, limit := range map[string]int{"limited": 1} {
+	for name, limit := range map[string]int{"limited": 1, "shared": 0} {
 		t.Run(name, func(t *testing.T) {
 			flushDB(t)
 			c := &tally{}

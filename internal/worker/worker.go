@@ -79,6 +79,7 @@ type Worker struct {
 	rateLimiter     *ratelimit.Limiter
 	activeRuns      sync.Map // runID → struct{} for heartbeat/crash detection
 	cancelations    sync.Map // runID → context.CancelFunc for per-task cancellation
+	fetching        sync.WaitGroup
 	quit            chan struct{}
 	abort           chan struct{}
 	shutdownTimeout time.Duration
@@ -156,8 +157,8 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.ctx, w.cancel = context.WithCancel(ctx)
 	w.syncer = NewSyncRetrier(w.ctx, w.logger)
 
-	go w.priorityFetchLoop()
-	go w.claimStaleLoop()
+	w.fetching.Go(w.priorityFetchLoop)
+	w.fetching.Go(w.claimStaleLoop)
 	go w.refreshLoop()
 	go w.cancelSubscribeLoop()
 
@@ -185,6 +186,17 @@ func (w *Worker) Stop() {
 		}
 		for _, sp := range w.subpools {
 			sp.pool.ReleaseTimeout(releaseTimeout)
+		}
+
+		// What was fetched too late is returned.
+		returned := make(chan struct{})
+		go func() {
+			w.fetching.Wait()
+			close(returned)
+		}()
+		select {
+		case <-returned:
+		case <-time.After(returnTimeout):
 		}
 
 		if w.cancel != nil {
@@ -412,18 +424,20 @@ func (w *Worker) fetchTier(tier store.TierConfig, count int) (fetched int, retry
 // there were.
 func (w *Worker) process(tierName string, sms []*streamMessage) (putBack int) {
 	tooMany := make(map[*taskPool][]*streamMessage)
+	var rejected []*streamMessage
 	for _, sm := range sms {
 		run := func() { w.processMessage(sm) }
 		pool, limited := w.subpools[sm.Work.TaskType]
 		if !limited {
 			if err := w.pool.submit(run); err != nil {
-				w.logger.Error().Err(err).Msg("worker: pool submit failed")
-				// Don't ack — XAUTOCLAIM will reclaim it later.
+				rejected = append(rejected, sm) // the worker is stopping
 			}
 		} else if !pool.offer(sm, run) {
 			tooMany[pool] = append(tooMany[pool], sm)
 		}
 	}
+	w.returnMessages(tierName, rejected)
+	putBack = len(rejected)
 	for pool, sms := range tooMany {
 		if err := w.postpone(w.ctx, tierName, sms, pool.returnTimes(len(sms))); err != nil {
 			if w.ctx.Err() == nil {

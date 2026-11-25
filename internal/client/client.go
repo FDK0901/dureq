@@ -609,6 +609,11 @@ func (c *Client) BackfillSchedule(ctx context.Context, jobID string, startTime, 
 		return 0, fmt.Errorf("calculate firings: %w", err)
 	}
 
+	if job.Schedule.Type.IsRecurring() {
+		// Each firing has a retry budget of its own.
+		job.Attempt = 0
+	}
+
 	dispatched := 0
 	for range firings {
 		if err := c.dispatchJob(ctx, job); err != nil {

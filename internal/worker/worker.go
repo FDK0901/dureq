@@ -563,6 +563,9 @@ func (w *Worker) processMessage(sm *streamMessage) {
 					job.CompletedAt = &now
 				}
 				job.UpdatedAt = now
+				if job.Schedule.Type.IsRecurring() {
+					job.Attempt = 0
+				}
 				w.store.UpdateJob(w.ctx, job, rev)
 			}()
 			return
@@ -997,7 +1000,7 @@ func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessag
 		}
 		now := time.Now()
 		job.LastRunAt = &now
-		job.Attempt = work.Attempt + 1
+		job.Attempt = attemptAfterSuccess(job, work)
 		job.LastError = nil
 		job.ConsecutiveErrors = 0
 		job.Status = types.JobStatusCompleted
@@ -1056,7 +1059,7 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 		}
 		now := time.Now()
 		job.LastRunAt = &now
-		job.Attempt = work.Attempt + 1
+		job.Attempt = attemptAfterSuccess(job, work)
 		job.LastError = nil
 		job.ConsecutiveErrors = 0
 		job.UpdatedAt = now
@@ -1145,13 +1148,6 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		}
 	}
 
-	now := time.Now()
-	job.LastRunAt = &now
-	job.LastError = &errStr
-	job.Attempt = work.Attempt + 1
-	job.ConsecutiveErrors++
-	job.UpdatedAt = now
-
 	// Check NonRetryableErrors list: if the error message contains any of the
 	// configured substrings, treat it as non-retryable.
 	if len(retryPolicy.NonRetryableErrors) > 0 {
@@ -1173,6 +1169,13 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 	if job.DLQAfter != nil && *job.DLQAfter < maxAttempts {
 		maxAttempts = *job.DLQAfter
 	}
+
+	now := time.Now()
+	job.LastRunAt = &now
+	job.LastError = &errStr
+	job.Attempt = failedAttempts(job, work, maxAttempts) + 1
+	job.ConsecutiveErrors++
+	job.UpdatedAt = now
 
 	// Check if we should auto-pause instead of going to dead.
 	shouldPause := retryPolicy.PauseAfterErrCount > 0 &&
@@ -1248,6 +1251,37 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		Error:     &errStr,
 		Timestamp: now,
 	})
+}
+
+// attemptAfterSuccess returns a job's Attempt once an execution has succeeded.
+// The next firing of a recurring job starts counting anew.
+func attemptAfterSuccess(job *types.Job, work types.WorkMessage) int {
+	if job.Schedule.Type.IsRecurring() {
+		return 0
+	}
+	return work.Attempt + 1
+}
+
+// failedAttempts returns how many attempts of work's execution had failed before
+// this one.
+//
+// Versions before v0.2.5 counted a recurring job's attempts up over its whole
+// life, so a message they dispatched may arrive with more attempts than an
+// execution can have: a firing is given up as soon as it has used up
+// maxAttempts, and only an execution resumed after a pause can be at the limit.
+// Such a message goes by the failures since the job's last success instead.
+func failedAttempts(job *types.Job, work types.WorkMessage, maxAttempts int) int {
+	if !job.Schedule.Type.IsRecurring() {
+		return work.Attempt
+	}
+	limit := maxAttempts
+	if _, isFiring := work.Headers["x-dureq-firing-id"]; isFiring {
+		limit = maxAttempts - 1
+	}
+	if work.Attempt > limit {
+		return min(work.Attempt, job.ConsecutiveErrors)
+	}
+	return work.Attempt
 }
 
 // cancelSubscribeLoop subscribes to the Redis Pub/Sub cancel channel and cancels

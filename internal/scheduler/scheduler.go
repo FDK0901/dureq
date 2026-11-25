@@ -327,6 +327,7 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint64, entry *types.ScheduleEntry, firingTime, scheduledAt time.Time, isBackfill bool) (uint64, bool) {
 	prevStatus := job.Status
 	prevLastRunAt := job.LastRunAt
+	prevAttempt := job.Attempt
 
 	// Firing headers belong to the work message only. Older versions stored them
 	// on the job, so later non-firing dispatches (retry, resume, orphan redispatch,
@@ -339,6 +340,10 @@ func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint
 	job.Status = types.JobStatusPending
 	job.LastRunAt = &firingTime
 	job.UpdatedAt = time.Now()
+	if job.Schedule.Type.IsRecurring() {
+		// Each firing has a retry budget of its own.
+		job.Attempt = 0
+	}
 
 	newRev, err := s.store.UpdateJob(ctx, job, rev)
 	if err != nil {
@@ -365,6 +370,7 @@ func (s *Scheduler) dispatchFiring(ctx context.Context, job *types.Job, rev uint
 		// was already dispatched, the status must reflect that earlier run.
 		job.Status = prevStatus
 		job.LastRunAt = prevLastRunAt
+		job.Attempt = prevAttempt
 		job.UpdatedAt = time.Now()
 		rbRev, rbErr := s.store.UpdateJob(ctx, job, newRev)
 		if err != nil {
@@ -547,9 +553,11 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 				retryPolicy = types.DefaultRetryPolicy()
 			}
 
-			if job.Attempt < retryPolicy.MaxAttempts {
+			attempt := lostAttempt(job, run, retryPolicy.MaxAttempts)
+			if attempt < retryPolicy.MaxAttempts {
 				// Auto-recover: redispatch.
 				prevStatus := job.Status
+				job.Attempt = attempt
 				job.Status = types.JobStatusPending
 				job.LastError = &errMsg
 				job.UpdatedAt = now
@@ -612,6 +620,22 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 	for nodeID := range deadNodes {
 		s.store.SetNodeDrain(ctx, nodeID, false)
 	}
+}
+
+// lostAttempt returns the attempt an orphaned run of a standalone job was on.
+//
+// A recurring job can have several firings going, so there it is the run's
+// attempt that counts. Versions before v0.2.5 counted a recurring job's attempts
+// up over its whole life; a run that has used up maxAttempts by that count goes
+// by the failures since the job's last success instead.
+func lostAttempt(job *types.Job, run *types.JobRun, maxAttempts int) int {
+	if !job.Schedule.Type.IsRecurring() {
+		return job.Attempt
+	}
+	if run.Attempt >= maxAttempts {
+		return min(run.Attempt, job.ConsecutiveErrors)
+	}
+	return run.Attempt
 }
 
 // cancelActiveRunsForJob signals cancellation to all active runs of a job.

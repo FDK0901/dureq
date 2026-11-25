@@ -361,6 +361,8 @@ types.DefaultRetryPolicy()
 }
 ```
 
+For recurring jobs `MaxAttempts` applies to each firing on its own: successful runs do not count, and every firing starts at attempt 0. A firing that uses up its attempts ends the whole job (`dead`), including its schedule.
+
 Error classification controls retry behavior:
 
 ```go

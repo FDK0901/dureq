@@ -118,6 +118,15 @@ const (
 	ScheduleMonthly   ScheduleType = "MONTHLY"
 )
 
+// IsRecurring returns true if a schedule of this type fires more than once.
+func (t ScheduleType) IsRecurring() bool {
+	switch t {
+	case ScheduleDuration, ScheduleCron, ScheduleDaily, ScheduleWeekly, ScheduleMonthly:
+		return true
+	}
+	return false
+}
+
 // OverlapPolicy controls behavior when a scheduled job fires while
 // a previous execution is still running.
 type OverlapPolicy string
@@ -350,7 +359,7 @@ type Job struct {
 
 	// State
 	Status            JobStatus  `json:"status"`
-	Attempt           int        `json:"attempt"`
+	Attempt           int        `json:"attempt"` // attempts of the current execution; a recurring job starts at 0 with every firing
 	ConsecutiveErrors int        `json:"consecutive_errors,omitempty"`
 	LastError         *string    `json:"last_error,omitempty"`
 	LastRunAt         *time.Time `json:"last_run_at,omitempty"`

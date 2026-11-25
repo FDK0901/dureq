@@ -95,6 +95,21 @@ func createJob(t *testing.T, st *store.RedisStore, id string, taskType types.Tas
 	return job
 }
 
+func TestStats_CountPausedJobs(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	createJob(t, st, "a", "t", types.JobStatusPaused, 0)
+	createJob(t, st, "b", "t", types.JobStatusPaused, 0)
+	createJob(t, st, "c", "t", types.JobStatusDead, 0)
+
+	var stats struct {
+		JobCounts map[string]int `json:"job_counts"`
+	}
+	get(t, srv, "/api/stats", &stats)
+	if stats.JobCounts["paused"] != 2 || stats.JobCounts["dead"] != 1 {
+		t.Fatalf("job counts %v, want 2 paused and 1 dead", stats.JobCounts)
+	}
+}
+
 // failingDispatcher cannot dispatch.
 type failingDispatcher struct{}
 

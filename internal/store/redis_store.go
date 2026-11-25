@@ -405,7 +405,7 @@ func (s *RedisStore) JobStatusCounts(ctx context.Context) (map[types.JobStatus]i
 	statuses := []types.JobStatus{
 		types.JobStatusPending, types.JobStatusScheduled, types.JobStatusRunning,
 		types.JobStatusCompleted, types.JobStatusFailed, types.JobStatusRetrying,
-		types.JobStatusDead, types.JobStatusCancelled,
+		types.JobStatusPaused, types.JobStatusDead, types.JobStatusCancelled,
 	}
 
 	cmds := make(rueidis.Commands, 0, len(statuses))
@@ -433,23 +433,13 @@ func (s *RedisStore) GetJobStats(ctx context.Context, _ StatsFilter) (*JobStats,
 	totalJobs, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(JobsByCreatedKey(s.prefix)).Build()).AsInt64()
 	totalRuns, _ := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(HistoryRunsKey(s.prefix)).Build()).AsInt64()
 
-	statuses := []types.JobStatus{
-		types.JobStatusPending, types.JobStatusScheduled, types.JobStatusRunning,
-		types.JobStatusCompleted, types.JobStatusFailed, types.JobStatusRetrying,
-		types.JobStatusDead, types.JobStatusCancelled,
+	counts, err := s.JobStatusCounts(ctx)
+	if err != nil {
+		return nil, err
 	}
-
-	cmds := make(rueidis.Commands, 0, len(statuses))
-	for _, st := range statuses {
-		cmds = append(cmds, s.rdb.B().Zcard().Key(JobsByStatusKey(s.prefix, string(st))).Build())
-	}
-	results := s.rdb.DoMulti(ctx, cmds...)
-
-	byStatus := make(map[types.JobStatus]int64)
-	for i, st := range statuses {
-		if n, err := results[i].AsInt64(); err == nil && n > 0 {
-			byStatus[st] = n
-		}
+	byStatus := make(map[types.JobStatus]int64, len(counts))
+	for st, n := range counts {
+		byStatus[st] = int64(n)
 	}
 
 	return &JobStats{

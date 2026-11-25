@@ -294,9 +294,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 	// Create the job in Redis.
 	if _, err := c.store.CreateJob(ctx, job); err != nil {
 		// Clean up unique key on failure.
-		if job.UniqueKey != nil && *job.UniqueKey != "" {
-			c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
-		}
+		c.store.ReleaseJobUniqueKey(ctx, job)
 		return nil, fmt.Errorf("create job: %w", err)
 	}
 
@@ -306,9 +304,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 		if err := c.dispatchJob(ctx, job); err != nil {
 			// Clean up orphaned job on dispatch failure.
 			c.store.DeleteJob(ctx, job.ID)
-			if job.UniqueKey != nil && *job.UniqueKey != "" {
-				c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
-			}
+			c.store.ReleaseJobUniqueKey(ctx, job)
 			return nil, fmt.Errorf("dispatch: %w", err)
 		}
 		c.publishEvent(ctx, types.JobEvent{
@@ -323,9 +319,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 		nextRun, err := scheduler.NextRunTime(job.Schedule, now)
 		if err != nil {
 			c.store.DeleteJob(ctx, job.ID)
-			if job.UniqueKey != nil && *job.UniqueKey != "" {
-				c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
-			}
+			c.store.ReleaseJobUniqueKey(ctx, job)
 			return nil, fmt.Errorf("calculate next run: %w", err)
 		}
 		entry := &types.ScheduleEntry{
@@ -335,9 +329,7 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 		}
 		if _, err := c.store.SaveSchedule(ctx, entry); err != nil {
 			c.store.DeleteJob(ctx, job.ID)
-			if job.UniqueKey != nil && *job.UniqueKey != "" {
-				c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
-			}
+			c.store.ReleaseJobUniqueKey(ctx, job)
 			return nil, fmt.Errorf("save schedule: %w", err)
 		}
 		c.publishEvent(ctx, types.JobEvent{
@@ -357,7 +349,8 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 	return job, nil
 }
 
-// Cancel cancels a job by ID.
+// Cancel cancels a job by ID and frees its unique key, so the key can be used
+// to enqueue again. A key that another job holds by now is left alone.
 func (c *Client) Cancel(ctx context.Context, jobID string) error {
 	job, rev, err := c.store.GetJob(ctx, jobID)
 	if err != nil {
@@ -379,6 +372,9 @@ func (c *Client) Cancel(ctx context.Context, jobID string) error {
 		JobID:     jobID,
 		Timestamp: now,
 	})
+	if err := c.store.ReleaseJobUniqueKey(ctx, job); err != nil {
+		return fmt.Errorf("job cancelled, but its unique key was not released: %w", err)
+	}
 	return nil
 }
 
@@ -394,11 +390,13 @@ func (c *Client) CancelByUniqueKey(ctx context.Context, uniqueKey string) error 
 	if err := c.Cancel(ctx, jobID); err != nil {
 		return err
 	}
-	c.store.DeleteUniqueKey(ctx, uniqueKey)
+	c.store.ReleaseUniqueKey(ctx, uniqueKey, jobID)
 	return nil
 }
 
-// Retry re-enqueues a failed or dead job for another attempt.
+// Retry re-enqueues a failed, dead or cancelled job for another attempt. If the
+// job has a unique key, it takes the key back first; Retry fails with
+// ErrDuplicateJob, leaving the job as it is, if another job holds the key.
 func (c *Client) Retry(ctx context.Context, jobID string) error {
 	job, rev, err := c.store.GetJob(ctx, jobID)
 	if err != nil {
@@ -407,6 +405,10 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 
 	if !job.Status.IsRetryable() {
 		return fmt.Errorf("job %s is %s, cannot retry (only failed/dead/cancelled)", jobID, job.Status)
+	}
+
+	if err := c.store.ClaimJobUniqueKey(ctx, job); err != nil {
+		return fmt.Errorf("unique key: %w", err)
 	}
 
 	now := time.Now()
@@ -418,6 +420,7 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 
 	newRev, err := c.store.UpdateJob(ctx, job, rev)
 	if err != nil {
+		c.store.ReleaseEndedJobUniqueKey(ctx, jobID)
 		return fmt.Errorf("update job: %w", err)
 	}
 
@@ -426,6 +429,7 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 		job.Status = prevStatus
 		job.UpdatedAt = time.Now()
 		c.store.UpdateJob(ctx, job, newRev)
+		c.store.ReleaseEndedJobUniqueKey(ctx, jobID)
 		return fmt.Errorf("dispatch: %w", err)
 	}
 

@@ -126,6 +126,10 @@ type RedisStore struct {
 	scriptAcquireConcSlot *rueidis.Lua
 	scriptReleaseConcSlot *rueidis.Lua
 
+	// Unique keys
+	scriptClaimUniqueKey   *rueidis.Lua
+	scriptReleaseUniqueKey *rueidis.Lua
+
 	// Exactly-once scripts (L2 operation ledger + atomic dispatch)
 	scriptAtomicDispatch  *rueidis.Lua
 	scriptClaimOperation  *rueidis.Lua
@@ -164,6 +168,9 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger chainedlog.L
 		scriptClaimSideEffect: rueidis.NewLuaScript(luaClaimSideEffect),
 		scriptAcquireConcSlot: rueidis.NewLuaScript(luaAcquireConcurrencySlot),
 		scriptReleaseConcSlot: rueidis.NewLuaScript(luaReleaseConcurrencySlot),
+
+		scriptClaimUniqueKey:   rueidis.NewLuaScript(luaClaimUniqueKey),
+		scriptReleaseUniqueKey: rueidis.NewLuaScript(luaUnlockIfOwner),
 
 		scriptAtomicDispatch: rueidis.NewLuaScript(luaAtomicDispatch),
 		scriptClaimOperation: rueidis.NewLuaScript(luaCheckAndClaimOperation),
@@ -824,9 +831,63 @@ func (s *RedisStore) SetUniqueKey(ctx context.Context, uniqueKey, jobID string) 
 	return err
 }
 
-// DeleteUniqueKey releases a unique key.
+// DeleteUniqueKey removes a unique key whichever job holds it. Use
+// ReleaseUniqueKey to free the key of a particular job.
 func (s *RedisStore) DeleteUniqueKey(ctx context.Context, uniqueKey string) error {
 	return s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, uniqueKey)).Build()).Error()
+}
+
+// ReleaseUniqueKey releases a unique key if jobID is the job holding it
+// (atomic compare-and-delete). A key held by another job is left alone.
+func (s *RedisStore) ReleaseUniqueKey(ctx context.Context, uniqueKey, jobID string) error {
+	return s.scriptReleaseUniqueKey.Exec(ctx, s.rdb,
+		[]string{UniqueKeyKey(s.prefix, uniqueKey)}, []string{jobID},
+	).Error()
+}
+
+// ReleaseJobUniqueKey releases the job's unique key, if it has one and holds it.
+func (s *RedisStore) ReleaseJobUniqueKey(ctx context.Context, job *types.Job) error {
+	if job.UniqueKey == nil || *job.UniqueKey == "" {
+		return nil
+	}
+	return s.ReleaseUniqueKey(ctx, *job.UniqueKey, job.ID)
+}
+
+// ReleaseEndedJobUniqueKey releases the unique key of a job that is dead or
+// cancelled according to the store. A job that has been revived in the meantime
+// keeps its key, and so does a completed one.
+func (s *RedisStore) ReleaseEndedJobUniqueKey(ctx context.Context, jobID string) error {
+	job, _, err := s.GetJob(ctx, jobID)
+	if errors.Is(err, types.ErrJobNotFound) {
+		return nil // deleting the job released its key
+	}
+	if err != nil {
+		return err
+	}
+	if job.Status != types.JobStatusDead && job.Status != types.JobStatusCancelled {
+		return nil
+	}
+	return s.ReleaseJobUniqueKey(ctx, job)
+}
+
+// ClaimJobUniqueKey makes the job hold its unique key, if it has one. It
+// succeeds if the job holds the key already and returns ErrDuplicateJob if
+// another job does. A dead or cancelled job must claim its key before it is
+// brought back to life, so that two jobs never live under one key.
+func (s *RedisStore) ClaimJobUniqueKey(ctx context.Context, job *types.Job) error {
+	if job.UniqueKey == nil || *job.UniqueKey == "" {
+		return nil
+	}
+	ok, err := s.scriptClaimUniqueKey.Exec(ctx, s.rdb,
+		[]string{UniqueKeyKey(s.prefix, *job.UniqueKey)}, []string{job.ID},
+	).AsInt64()
+	if err != nil {
+		return err
+	}
+	if ok == 0 {
+		return types.ErrDuplicateJob
+	}
+	return nil
 }
 
 // ============================================================
@@ -1708,7 +1769,7 @@ func (s *RedisStore) updateJobIndexes(ctx context.Context, job *types.Job, oldDa
 	// Clean old unique key if changed.
 	if old.UniqueKey != nil && *old.UniqueKey != "" {
 		if job.UniqueKey == nil || *job.UniqueKey != *old.UniqueKey {
-			s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, *old.UniqueKey)).Build())
+			s.ReleaseUniqueKey(ctx, *old.UniqueKey, job.ID)
 		}
 	}
 }
@@ -1722,7 +1783,7 @@ func (s *RedisStore) removeJobIndexes(ctx context.Context, jobID string, old *ty
 		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByTagKey(s.prefix, tag)).Member(jobID).Build())
 	}
 	if old.UniqueKey != nil && *old.UniqueKey != "" {
-		s.rdb.Do(ctx, s.rdb.B().Del().Key(UniqueKeyKey(s.prefix, *old.UniqueKey)).Build())
+		s.ReleaseUniqueKey(ctx, *old.UniqueKey, jobID)
 	}
 	if old.WorkflowID != nil && *old.WorkflowID != "" {
 		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByWorkflowKey(s.prefix, *old.WorkflowID)).Member(jobID).Build())

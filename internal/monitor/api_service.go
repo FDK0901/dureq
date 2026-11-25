@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -154,7 +155,20 @@ func (a *APIService) CancelJob(ctx context.Context, jobID string) error {
 		JobID:     jobID,
 		Timestamp: now,
 	})
+	if err := a.store.ReleaseJobUniqueKey(ctx, job); err != nil {
+		return fmt.Errorf("job cancelled, but its unique key was not released: %w", err)
+	}
 	return nil
+}
+
+// claimUniqueKey makes a job that is about to be run again hold its unique key.
+// It fails with a conflict if another job holds the key.
+func (a *APIService) claimUniqueKey(ctx context.Context, job *types.Job) error {
+	err := a.store.ClaimJobUniqueKey(ctx, job)
+	if errors.Is(err, types.ErrDuplicateJob) {
+		return &ApiError{Msg: "cannot retry: another job holds unique key " + *job.UniqueKey, StatusCode: http.StatusConflict}
+	}
+	return err
 }
 
 func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
@@ -166,6 +180,9 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 	if !job.Status.IsRetryable() {
 		return &ApiError{Msg: "cannot retry: job is " + string(job.Status) + " (only failed/dead/cancelled)", StatusCode: http.StatusConflict}
 	}
+	if err := a.claimUniqueKey(ctx, job); err != nil {
+		return err
+	}
 
 	now := time.Now()
 	prevStatus := job.Status
@@ -176,6 +193,7 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 
 	newRev, err := a.store.UpdateJob(ctx, job, rev)
 	if err != nil {
+		a.store.ReleaseEndedJobUniqueKey(ctx, jobID)
 		return err
 	}
 
@@ -184,6 +202,7 @@ func (a *APIService) RetryJob(ctx context.Context, jobID string) error {
 		job.Status = prevStatus
 		job.UpdatedAt = time.Now()
 		a.store.UpdateJob(ctx, job, newRev)
+		a.store.ReleaseEndedJobUniqueKey(ctx, jobID)
 		return err
 	}
 
@@ -1011,6 +1030,9 @@ func (a *APIService) BulkCancelJobs(ctx context.Context, req BulkRequest) (*Bulk
 		job.UpdatedAt = now
 		if _, err := a.store.UpdateJob(ctx, job, rev); err == nil {
 			a.store.DeleteSchedule(ctx, id)
+			if err := a.store.ReleaseJobUniqueKey(ctx, job); err != nil {
+				a.logger.Warn().String("job_id", id).Err(err).Msg("bulk cancel: failed to release unique key")
+			}
 			a.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventJobCancelled, JobID: id, Timestamp: now,
 			})
@@ -1042,11 +1064,15 @@ func (a *APIService) BulkRetryJobs(ctx context.Context, req BulkRequest) (*BulkR
 		if err != nil || !job.Status.IsRetryable() {
 			continue
 		}
+		if err := a.claimUniqueKey(ctx, job); err != nil {
+			continue
+		}
 		job.Status = types.JobStatusPending
 		job.Attempt = 0
 		job.LastError = nil
 		job.UpdatedAt = now
 		if _, err := a.store.UpdateJob(ctx, job, rev); err != nil {
+			a.store.ReleaseEndedJobUniqueKey(ctx, id)
 			continue
 		}
 		if err := a.dispatcher.Dispatch(ctx, job, 0); err != nil {
@@ -1490,6 +1516,9 @@ func (a *APIService) RequeueRun(ctx context.Context, runID string) error {
 	if err != nil {
 		return &ApiError{Msg: "parent job not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
+	if err := a.claimUniqueKey(ctx, job); err != nil {
+		return err
+	}
 
 	now := time.Now()
 	prevStatus := job.Status
@@ -1500,6 +1529,7 @@ func (a *APIService) RequeueRun(ctx context.Context, runID string) error {
 
 	newRev, err := a.store.UpdateJob(ctx, job, rev)
 	if err != nil {
+		a.store.ReleaseEndedJobUniqueKey(ctx, job.ID)
 		return err
 	}
 
@@ -1507,6 +1537,7 @@ func (a *APIService) RequeueRun(ctx context.Context, runID string) error {
 		job.Status = prevStatus
 		job.UpdatedAt = time.Now()
 		a.store.UpdateJob(ctx, job, newRev)
+		a.store.ReleaseEndedJobUniqueKey(ctx, job.ID)
 		return fmt.Errorf("dispatch failed: %w", err)
 	}
 

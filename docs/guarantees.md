@@ -8,6 +8,7 @@ Every claim is backed by the specific Redis primitives and code paths that imple
 | Aspect | Guarantee | Mechanism | Limitation |
 |--------|-----------|-----------|------------|
 | **Enqueue** | At-most-once per UniqueKey | `SET NX` on unique key | Without UniqueKey, every call creates a new job |
+| **Unique key release** | Only by the holding job | Compare-and-delete Lua when the job goes `dead` or is cancelled | Kept on `completed`; retrying a dead/cancelled job needs the key back and is refused if another job holds it |
 | **Retry limit** | `MaxAttempts` per execution | Attempt carried on the work message; each firing of a recurring job starts at 0 | A firing that uses up its attempts ends the recurring job |
 | **Request ID** | At-most-once (5-min window) | `SET EX` dedup cache | TTL expiry allows duplicates after 5 minutes |
 | **Dispatch** | At-most-once per FiringID | FiringID + RunID dedup check, `XADD`, and dedup marks in one Lua script | FiringID TTL expiry (1h) allows duplicate after long failover |

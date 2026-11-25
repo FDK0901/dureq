@@ -46,7 +46,7 @@ end
 return 0
 `
 
-// luaUnlockIfOwner deletes a lock key only if the value matches the owner.
+// luaUnlockIfOwner deletes a key (a lock or a job's unique key) only if the value matches the owner.
 // KEYS[1] = lock key
 // ARGV[1] = expected owner value
 // Returns 1 if deleted, 0 if not owner.
@@ -57,6 +57,19 @@ if current == ARGV[1] then
   return 1
 end
 return 0
+`
+
+// luaClaimUniqueKey sets a unique key to a job ID unless another job holds it.
+// KEYS[1] = unique key
+// ARGV[1] = job ID
+// Returns 1 if the job holds the key now, 0 if another job does.
+const luaClaimUniqueKey = `
+local current = redis.call('GET', KEYS[1])
+if current and current ~= ARGV[1] then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
 `
 
 // luaExtendLock extends a lock's TTL only if the caller owns it.

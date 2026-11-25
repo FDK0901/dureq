@@ -231,6 +231,8 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 	if job.Status.IsTerminal() {
 		s.store.DeleteSchedule(ctx, entry.JobID)
 		s.cache.InvalidateSchedules()
+		// Normally done when the job ended, unless that process stopped in between.
+		s.releaseEndedJobUniqueKey(ctx, entry.JobID)
 		return
 	}
 
@@ -554,7 +556,12 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 			}
 
 			attempt := lostAttempt(job, run, retryPolicy.MaxAttempts)
-			if attempt < retryPolicy.MaxAttempts {
+			switch {
+			case job.Status == types.JobStatusDead || job.Status == types.JobStatusCancelled:
+				// The job ended while this run was still going and gave up its unique
+				// key, so the run is dropped rather than redispatched.
+
+			case attempt < retryPolicy.MaxAttempts:
 				// Auto-recover: redispatch.
 				prevStatus := job.Status
 				job.Attempt = attempt
@@ -585,12 +592,14 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 				})
 
 				s.logger.Info().String("job_id", run.JobID).Int("attempt", job.Attempt).Msg("scheduler: auto-recovered orphaned job")
-			} else {
+			default:
 				// Retries exhausted.
 				job.Status = types.JobStatusDead
 				job.LastError = &errMsg
 				job.UpdatedAt = now
-				s.store.UpdateJob(ctx, job, rev)
+				if _, err := s.store.UpdateJob(ctx, job, rev); err == nil {
+					s.releaseEndedJobUniqueKey(ctx, job.ID)
+				}
 
 				s.dispatcher.PublishEvent(types.JobEvent{
 					Type:      types.EventJobDead,
@@ -636,6 +645,13 @@ func lostAttempt(job *types.Job, run *types.JobRun, maxAttempts int) int {
 		return min(run.Attempt, job.ConsecutiveErrors)
 	}
 	return run.Attempt
+}
+
+// releaseEndedJobUniqueKey frees the unique key of a dead or cancelled job.
+func (s *Scheduler) releaseEndedJobUniqueKey(ctx context.Context, jobID string) {
+	if err := s.store.ReleaseEndedJobUniqueKey(ctx, jobID); err != nil {
+		s.logger.Warn().String("job_id", jobID).Err(err).Msg("scheduler: failed to release unique key of ended job")
+	}
 }
 
 // cancelActiveRunsForJob signals cancellation to all active runs of a job.

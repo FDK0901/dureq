@@ -113,9 +113,7 @@ func (c *Cleaner) cleanup(ctx context.Context) {
 				// Clean associated schedule/unique key/audit trail.
 				c.store.DeleteSchedule(ctx, job.ID)
 				c.store.DeleteJobAuditTrail(ctx, job.ID)
-				if job.UniqueKey != nil && *job.UniqueKey != "" {
-					c.store.DeleteUniqueKey(ctx, *job.UniqueKey)
-				}
+				c.store.ReleaseJobUniqueKey(ctx, job)
 				deleted++
 			}
 		}

@@ -160,6 +160,11 @@ GET /api/unique-keys/{key}         -- check if key exists
 DELETE /api/unique-keys/{key}      -- remove orphaned key
 ```
 
+A dead or cancelled job has released its key already. Retrying it takes the key back; if
+another job holds the key by then, the retry is refused (409, `ErrDuplicateJob` from the
+client) and the job stays as it is. Jobs that went dead before v0.2.5 still hold their key:
+cancel them with the client (`Cancel(id)`; the API refuses ended jobs) or delete the key.
+
 ## Dynamic Configuration
 
 dureq supports runtime configuration changes without restart. The dynamic

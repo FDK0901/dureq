@@ -454,3 +454,30 @@ func TestWorkflowStarted_StartsChildWorkflowsOnce(t *testing.T) {
 		t.Errorf("event of a workflow that is gone: %v", err)
 	}
 }
+
+// Hooks that were reserved at the end of a workflow but not started are started.
+func TestWorkflow_HooksReservedButNotStarted_AreStarted(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	hook := &types.WorkflowHookDef{TaskType: "hook", Payload: json.RawMessage(`{}`)}
+	wf := newWorkflow(t, st, types.WorkflowDefinition{Name: "w", Tasks: []types.WorkflowTask{{Name: "a", TaskType: "t"}}, Hooks: &types.WorkflowHooks{OnSuccess: hook, OnExit: hook}})
+	task := ReserveRootTasks(wf, time.Now())[0]
+	wf.Status = types.WorkflowStatusCompleted
+	wf.Tasks["a"] = types.WorkflowTaskState{Name: "a", JobID: task.ID, Status: types.JobStatusCompleted}
+	hooks := reserveHooks(wf, time.Now(), hookInit, hookSuccess, hookExit)
+	if len(hooks) != 2 {
+		t.Fatalf("reserved %d hooks, want the 2 there are", len(hooks))
+	}
+	if _, err := st.SaveWorkflow(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	finishJob(t, st, task, types.JobStatusCompleted)
+	for range 2 {
+		if err := newTestOrchestrator(st).handleJobCompleted(ctx, completed(task)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if count := dispatched(t, st); len(count) != 2 || count[hooks[0].ID] != 1 || count[hooks[1].ID] != 1 {
+		t.Fatalf("dispatched %v, want each hook once", count)
+	}
+}

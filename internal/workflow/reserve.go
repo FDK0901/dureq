@@ -1,6 +1,7 @@
 package workflow
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/FDK0901/dureq/pkg/types"
@@ -94,6 +95,60 @@ func ReserveRootTasks(wf *types.WorkflowInstance, now time.Time) []*types.Job {
 	return ReserveTasks(wf, names, now)
 }
 
+// The hooks of a workflow.
+const (
+	hookInit    = "on_init"
+	hookSuccess = "on_success"
+	hookFailure = "on_failure"
+	hookExit    = "on_exit"
+)
+
+// ReserveInitHook reserves the hook that starts before the root tasks of a workflow, if it
+// has one.
+func ReserveInitHook(wf *types.WorkflowInstance, now time.Time) []*types.Job {
+	return reserveHooks(wf, now, hookInit)
+}
+
+// reserveHooks reserves those of the hooks that the workflow has.
+func reserveHooks(wf *types.WorkflowInstance, now time.Time, names ...string) []*types.Job {
+	var jobs []*types.Job
+	for _, name := range names {
+		if hookDef(wf, name) == nil {
+			continue
+		}
+		if wf.HookStates == nil {
+			wf.HookStates = make(map[string]types.WorkflowTaskState)
+		}
+		wf.HookStates[name] = types.WorkflowTaskState{
+			Name:      name,
+			JobID:     xid.New().String(),
+			Status:    types.JobStatusRunning,
+			StartedAt: &now,
+		}
+		jobs = append(jobs, hookJob(wf, name, now))
+	}
+	return jobs
+}
+
+// hookDef returns the definition of a hook, or nil if the workflow does not have it.
+func hookDef(wf *types.WorkflowInstance, name string) *types.WorkflowHookDef {
+	hooks := wf.Definition.Hooks
+	if hooks == nil {
+		return nil
+	}
+	switch name {
+	case hookInit:
+		return hooks.OnInit
+	case hookSuccess:
+		return hooks.OnSuccess
+	case hookFailure:
+		return hooks.OnFailure
+	case hookExit:
+		return hooks.OnExit
+	}
+	return nil
+}
+
 // batchOnetimeJob returns the job of the onetime task that is reserved.
 func batchOnetimeJob(batch *types.BatchInstance, now time.Time) *types.Job {
 	job := newJob(batch.OnetimeState.JobID, *batch.Definition.OnetimeTaskType, batch.Definition.OnetimePayload, now)
@@ -120,6 +175,20 @@ func taskJob(wf *types.WorkflowInstance, def *types.WorkflowTask, jobID string, 
 	job.Priority = wf.Definition.DefaultPriority
 	job.WorkflowID = &wf.ID
 	job.WorkflowTask = &def.Name
+	return job
+}
+
+// hookJob returns the job of a hook that is reserved.
+func hookJob(wf *types.WorkflowInstance, name string, now time.Time) *types.Job {
+	def, taskName, operation := hookDef(wf, name), hookTaskPrefix+name, wf.ID+":hook:"+name
+	if wf.Attempt > 1 { // a workflow that is retried ends once more
+		operation += fmt.Sprintf(":%d", wf.Attempt)
+	}
+	job := newJob(wf.HookStates[name].JobID, def.TaskType, def.Payload, now)
+	job.Headers = map[string]string{"x-dureq-operation-key": operation}
+	job.Priority = wf.Definition.DefaultPriority
+	job.WorkflowID = &wf.ID
+	job.WorkflowTask = &taskName
 	return job
 }
 

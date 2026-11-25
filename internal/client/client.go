@@ -732,8 +732,8 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 		wf.Deadline = &deadline
 	}
 
-	// Save workflow instance, with its root tasks (no dependencies) reserved.
-	roots := workflow.ReserveRootTasks(wf, now)
+	// Save workflow instance, with its init hook and root tasks (no dependencies) reserved.
+	hooks, roots := workflow.ReserveInitHook(wf, now), workflow.ReserveRootTasks(wf, now)
 	if _, err := c.store.SaveWorkflow(ctx, wf); err != nil {
 		return nil, fmt.Errorf("save workflow: %w", err)
 	}
@@ -744,6 +744,7 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 		JobID:     wf.ID,
 		Timestamp: now,
 	})
+	c.startReserved(ctx, hooks) // the orchestrator makes up for it if that fails
 	if len(roots) > 0 {
 		err = c.startReserved(ctx, roots)
 	}

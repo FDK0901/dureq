@@ -85,7 +85,8 @@ The `enrich` task receives that output as its payload (the static `Payload` fiel
 
 Tasks can define `Preconditions` that gate dispatch based on upstream output.
 If any precondition fails, the task is skipped. Each precondition specifies
-a `Type` ("upstream_output"), a `Task`, a JSONPath `Path`, and an `Expected` value.
+a `Type` ("upstream_output"), a `Task`, a JSONPath `Path`, and an `Expected` value. A skipped task counts as
+completed, so a workflow whose last tasks are skipped completes.
 
 ## AllowFailure
 
@@ -160,6 +161,9 @@ Lifecycle hooks fire automatically at workflow lifecycle events:
 | `OnSuccess` | Workflow completes successfully |
 | `OnFailure` | Workflow fails (all retries exhausted) |
 | `OnExit` | Always, after completion or failure |
+
+A workflow that times out has failed. One that is retried ends once more, and its hooks start again. Child workflows
+have hooks of their own.
 
 Each hook is a `WorkflowHookDef` with a `TaskType` and optional `Payload`.
 The hook job runs as a regular task.

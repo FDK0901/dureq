@@ -424,7 +424,13 @@ func (c *Client) Retry(ctx context.Context, jobID string) error {
 		return fmt.Errorf("update job: %w", err)
 	}
 
-	if err := c.dispatchJob(ctx, job); err != nil {
+	if prevStatus == types.JobStatusCancelled {
+		err = c.store.ForgetOperation(ctx, jobID)
+	}
+	if err == nil {
+		err = c.dispatchJob(ctx, job)
+	}
+	if err != nil {
 		// Rollback: restore previous status.
 		job.Status = prevStatus
 		job.UpdatedAt = time.Now()

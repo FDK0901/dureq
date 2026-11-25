@@ -2617,6 +2617,13 @@ func (s *RedisStore) CompleteOperationEffect(ctx context.Context, opKey, stepKey
 	return res == 1, nil
 }
 
+// ForgetOperation removes an operation from the ledger, so that it can be executed
+// again. Meant for an explicit request to run a cancelled job after all: a run that
+// was cut off by the cancel may have been recorded as done.
+func (s *RedisStore) ForgetOperation(ctx context.Context, opKey string) error {
+	return s.rdb.Do(ctx, s.rdb.B().Del().Key(OperationLedgerKey(s.prefix, opKey)).Build()).Error()
+}
+
 // RefreshOperationLedger extends the TTL of the operation ledger key.
 // Called during heartbeat to prevent ledger expiry during long-running jobs.
 func (s *RedisStore) RefreshOperationLedger(ctx context.Context, opKey string) {

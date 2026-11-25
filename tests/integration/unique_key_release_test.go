@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/client"
 	"github.com/FDK0901/dureq/internal/monitor"
+	"github.com/FDK0901/dureq/internal/server"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
 )
@@ -205,6 +207,60 @@ func TestCancel_RepeatingHandler_Ends(t *testing.T) {
 	time.Sleep(4 * time.Second)
 	if got := len(rec.seen()); got != n {
 		t.Fatalf("%d executions after the cancel", got-n)
+	}
+}
+
+// Retrying a cancelled job runs it again, even if the run that was cut off reported
+// success, which the operation ledger remembers.
+func TestRetry_CancelledJob_RunsAgain(t *testing.T) {
+	retries := map[string]func(srv *server.Server, cli *client.Client, jobID string) error{
+		"client": func(_ *server.Server, cli *client.Client, jobID string) error {
+			return cli.Retry(context.Background(), jobID)
+		},
+		"monitor": func(srv *server.Server, _ *client.Client, jobID string) error {
+			return monitor.NewAPIService(srv.Store(), srv.Dispatcher(), nil).RetryJob(context.Background(), jobID)
+		},
+	}
+	for name, retry := range retries {
+		t.Run(name, func(t *testing.T) {
+			flushDB(t)
+			ctx := context.Background()
+			srv := newServer(t, "retry-cancelled", 10)
+			started := make(chan struct{}, 10)
+			var runs atomic.Int32
+			srv.RegisterHandler(types.HandlerDefinition{TaskType: "rec.retry", Handler: func(ctx context.Context, _ json.RawMessage) error {
+				if runs.Add(1) == 1 {
+					started <- struct{}{}
+					<-ctx.Done()
+				}
+				return nil
+			}})
+			if err := srv.Start(ctx); err != nil {
+				t.Fatalf("start: %v", err)
+			}
+			defer srv.Stop()
+			cli := newClient(t)
+			defer cli.Close()
+
+			job, err := cli.Enqueue(ctx, "rec.retry", map[string]string{})
+			if err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			<-started
+			if err := cli.Cancel(ctx, job.ID); err != nil {
+				t.Fatalf("cancel: %v", err)
+			}
+			waitFor(t, 10*time.Second, "cut off run", func() bool { return pendingAndUnread(t, cli) == 0 })
+			time.Sleep(time.Second) // it is acknowledged before it looks at the job
+
+			if err := retry(srv, cli, job.ID); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			waitStatus(t, cli, job.ID, types.JobStatusCompleted)
+			if n := runs.Load(); n != 2 {
+				t.Fatalf("%d executions, want 2", n)
+			}
+		})
 	}
 }
 

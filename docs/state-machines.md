@@ -48,7 +48,7 @@ are logged as warnings via `UpdateJob`.
 - `paused` can be entered from `running` (via `PauseError`) or `failed` (auto-pause on consecutive errors)
 - `dead` → `retrying` is only allowed via explicit `RetryJob` / `BulkRetryJobs` API calls
 - Entering `dead` or `cancelled` releases the job's unique key (only if the job holds it); entering `completed` does not
-- What is still queued of a cancelled standalone job is dropped
+- What is still queued of a cancelled standalone job is dropped, and a retry of it runs the job again
 - A job leaves `dead` or `cancelled` only while holding its unique key again. `Retry` is refused if another job holds it,
   and the result of a run that was still going when a standalone job was cancelled does not change its status
 

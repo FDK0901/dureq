@@ -1955,10 +1955,39 @@ func (s *RedisStore) mirrorBatchPayloads(_ context.Context, batch *types.BatchIn
 
 const jsonPathSearchChunkSize = 100
 
-// FindJobByPayloadPath scans jobs and returns the first whose Payload matches
-// the given JSONPath + value. Uses RedisJSON's JSON.GET for native path extraction.
+// FindJobByPayloadPath scans jobs and returns the newest whose Payload matches
+// the given JSONPath + value, whatever its status. Uses RedisJSON's JSON.GET for
+// native path extraction.
 // If taskType is non-empty, only jobs of that type are scanned (via the by_task_type index).
 func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, value any, taskType string) (*types.Job, uint64, error) {
+	var found *types.Job
+	var rev uint64
+	err := s.scanJobsByPayloadPath(ctx, jsonPath, value, taskType, func(ids []string) (bool, error) {
+		for _, id := range ids {
+			job, r, err := s.GetJob(ctx, id)
+			if errors.Is(err, types.ErrJobNotFound) {
+				continue // deleted in the meantime
+			}
+			if err != nil {
+				return false, err
+			}
+			found, rev = job, r
+			return false, nil
+		}
+		return true, nil
+	})
+	if found != nil {
+		return found, rev, nil
+	}
+	if err != nil && !isUnknownCommandErr(err) { // without RedisJSON there is nothing to find
+		return nil, 0, err
+	}
+	return nil, 0, types.ErrJobNotFound
+}
+
+// scanJobsByPayloadPath passes the IDs of the jobs whose payload matches to visit,
+// newest first and chunk by chunk, until visit returns false or an error.
+func (s *RedisStore) scanJobsByPayloadPath(ctx context.Context, jsonPath string, value any, taskType string, visit func(ids []string) (bool, error)) error {
 	fullPath := "$." + jsonPath
 	valueStr := fmt.Sprintf("%v", value)
 
@@ -1968,32 +1997,64 @@ func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, 
 		indexKey = JobsByTaskTypeKey(s.prefix, taskType)
 	}
 
-	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64()
-	if err != nil {
-		return nil, 0, fmt.Errorf("count jobs: %w", err)
-	}
-
-	for offset := int64(0); offset < total; offset += jsonPathSearchChunkSize {
-		end := offset + jsonPathSearchChunkSize - 1
-		ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(indexKey).Start(offset).Stop(end).Build()).AsStrSlice()
-		if err != nil || len(ids) == 0 {
-			break
+	// Page by score rather than by rank: ranks shift while jobs are being created
+	// and deleted. A page starts at the last score of the previous one, past the
+	// jobs of that score that have been read.
+	seen := make(map[string]struct{})
+	upper, offset := "+inf", int64(0)
+	for {
+		page, err := s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(upper).Min("-inf").
+			Withscores().Limit(offset, jsonPathSearchChunkSize).Build()).AsZScores()
+		if err != nil {
+			return fmt.Errorf("list jobs: %w", err)
 		}
 
-		// Pipeline JSON.GET for each key.
-		cmds := make(rueidis.Commands, 0, len(ids))
-		for _, id := range ids {
-			cmds = append(cmds, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, id)).Path(fullPath).Build())
+		ids := make([]string, 0, len(page))
+		cmds := make(rueidis.Commands, 0, len(page))
+		for _, z := range page {
+			if _, ok := seen[z.Member]; ok {
+				continue
+			}
+			seen[z.Member] = struct{}{}
+			ids = append(ids, z.Member)
+			cmds = append(cmds, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, z.Member)).Path(fullPath).Build())
 		}
-		results := s.rdb.DoMulti(ctx, cmds...)
 
-		for i, r := range results {
-			if matchJSONGetResult(r, valueStr) {
-				return s.GetJob(ctx, ids[i])
+		var matches []string
+		if len(cmds) > 0 {
+			for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+				if err := r.Error(); err != nil && !rueidis.IsRedisNil(err) {
+					return fmt.Errorf("search payload of job %s: %w", ids[i], err)
+				}
+				if matchJSONGetResult(r, valueStr) {
+					matches = append(matches, ids[i])
+				}
 			}
 		}
+		if len(matches) > 0 {
+			if more, err := visit(matches); err != nil || !more {
+				return err
+			}
+		}
+
+		if len(page) < jsonPathSearchChunkSize {
+			return nil
+		}
+		last := page[len(page)-1].Score
+		if next := strconv.FormatFloat(last, 'f', -1, 64); next != upper {
+			upper, offset = next, 0
+		}
+		for i := len(page) - 1; i >= 0 && page[i].Score == last; i-- {
+			offset++
+		}
 	}
-	return nil, 0, types.ErrJobNotFound
+}
+
+// isUnknownCommandErr reports whether the server does not know the command, e.g.
+// because the module that provides it is not loaded.
+func isUnknownCommandErr(err error) bool {
+	var redisErr *rueidis.RedisError
+	return errors.As(err, &redisErr) && strings.Contains(strings.ToLower(redisErr.Error()), "unknown command")
 }
 
 // FindWorkflowByTaskPayloadPath scans all workflows and returns the first where any task's
@@ -2086,8 +2147,23 @@ func matchJSONGetResult(r rueidis.RedisResult, expected string) bool {
 			return true
 		}
 	}
+
+	// A large number does not print as it is written: %v makes 1e+06 of 1000000,
+	// and a float64 cannot hold every integer. So compare its digits, too.
+	var literals []any
+	if jsonWithNumbers.Unmarshal([]byte(raw), &literals) != nil {
+		return false
+	}
+	for _, v := range literals {
+		if n, ok := v.(json.Number); ok && n.String() == expected {
+			return true
+		}
+	}
 	return false
 }
+
+// jsonWithNumbers decodes numbers as json.Number instead of float64.
+var jsonWithNumbers = sonic.Config{UseNumber: true}.Froze()
 
 // --- Workflow Signal operations ---
 

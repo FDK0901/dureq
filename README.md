@@ -490,6 +490,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`    | `/api/dlq`                  | Dead letter queue                  |
 | `GET`    | `/api/history/runs`         | Historical runs (filterable)       |
 | `GET`    | `/api/history/events`       | Historical events                  |
+| `GET`    | `/api/runs/{id}`            | A run, active or finished          |
 | `GET`    | `/api/search/jobs`          | Search by payload JSONPath         |
 | `GET`    | `/api/search/workflows`     | Search workflows by payload        |
 | `GET`    | `/api/search/batches`       | Search batches by payload          |

@@ -298,3 +298,25 @@ func TestHistoryRuns_OldIndexIsCorrected(t *testing.T) {
 		t.Fatalf("succeeded runs: %q of %d, want r01 of 27", ids, total)
 	}
 }
+
+func TestGetRun_FinishedRun(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	saveRun(t, st, "done", types.RunStatusFailed, time.Minute)
+	var run types.JobRun
+	get(t, srv, "/api/runs/done", &run)
+	if run.ID != "done" || run.Status != types.RunStatusFailed {
+		t.Fatalf("run %+v", run)
+	}
+
+	// Retried: it is the active one that counts.
+	if _, err := st.SaveRun(context.Background(), &types.JobRun{ID: "done", JobID: "j", Status: types.RunStatusRunning, Attempt: 1, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	get(t, srv, "/api/runs/done", &run)
+	if run.Status != types.RunStatusRunning || run.Attempt != 1 {
+		t.Fatalf("run %+v, want the active one", run)
+	}
+	if code := call(t, srv, http.MethodGet, "/api/runs/none", nil); code != http.StatusNotFound {
+		t.Fatalf("no such run: status %d", code)
+	}
+}

@@ -344,11 +344,15 @@ func (a *APIService) ListActiveRuns(ctx context.Context) ([]*types.JobRun, error
 }
 
 func (a *APIService) GetRun(ctx context.Context, runID string) (*types.JobRun, error) {
+	// An active run first: one that is retried is also in the history, as it was before.
 	run, _, err := a.store.GetRun(ctx, runID)
-	if err != nil {
-		return nil, &ApiError{Msg: "run not found: " + err.Error(), StatusCode: http.StatusNotFound}
+	if errors.Is(err, types.ErrRunNotFound) {
+		run, _, err = a.store.GetHistoryRun(ctx, runID)
 	}
-	return run, nil
+	if errors.Is(err, types.ErrRunNotFound) {
+		return nil, &ApiError{Msg: "run not found", StatusCode: http.StatusNotFound}
+	}
+	return run, err
 }
 
 func (a *APIService) GetJobActiveRuns(ctx context.Context, jobID string) ([]*types.JobRun, error) {
@@ -1541,15 +1545,9 @@ func (a *APIService) IsNodeDraining(ctx context.Context, nodeID string) (bool, e
 
 // RequeueRun re-dispatches a failed or dead run's parent job.
 func (a *APIService) RequeueRun(ctx context.Context, runID string) error {
-	// Try active runs first, then history.
-	run, _, err := a.store.GetRun(ctx, runID)
+	run, err := a.GetRun(ctx, runID)
 	if err != nil {
-		// Look up from history hash directly.
-		histRun, _, hErr := a.store.GetHistoryRun(ctx, runID)
-		if hErr != nil {
-			return &ApiError{Msg: "run not found", StatusCode: http.StatusNotFound}
-		}
-		run = histRun
+		return err
 	}
 
 	if !run.Status.IsTerminal() {

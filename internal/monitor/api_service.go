@@ -798,7 +798,7 @@ type QueueInfo struct {
 	RateLimit  float64 `json:"rate_limit,omitempty"`
 	RateBurst  int     `json:"rate_burst,omitempty"`
 	Paused     bool    `json:"paused"`
-	Size       int64   `json:"size"` // length of the stream, including what has been processed
+	Size       int64   `json:"size"` // length of the stream, including what has been processed but not trimmed yet
 
 	// Left out if the server cannot tell; Waiting takes Redis 7.0.
 	Waiting  *int64 `json:"waiting,omitempty"`   // no worker has taken it yet

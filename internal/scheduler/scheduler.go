@@ -149,7 +149,8 @@ func (s *Scheduler) tickLoop(ctx context.Context) {
 	}
 }
 
-// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs and paused jobs.
+// tick scans for due schedules, dispatches them, and periodically checks for orphaned runs and paused jobs
+// and trims the work streams.
 func (s *Scheduler) tick(ctx context.Context) {
 	now := time.Now()
 
@@ -168,6 +169,23 @@ func (s *Scheduler) tick(ctx context.Context) {
 		s.lastOrphanCheck = now
 		s.checkOrphanedRuns(ctx)
 		s.resumePausedJobs(ctx, now)
+		s.trimWorkStreams(ctx)
+	}
+}
+
+// trimWorkStreams removes what has been processed from the work streams.
+func (s *Scheduler) trimWorkStreams(ctx context.Context) {
+	for _, tier := range s.store.Config().Tiers {
+		n, err := s.store.TrimWorkStream(ctx, tier.Name)
+		if err != nil {
+			if ctx.Err() == nil {
+				s.logger.Warn().String("tier", tier.Name).Err(err).Msg("scheduler: failed to trim work stream")
+			}
+			continue
+		}
+		if n > 0 {
+			s.logger.Debug().String("tier", tier.Name).Int64("messages", n).Msg("scheduler: trimmed work stream")
+		}
 	}
 }
 

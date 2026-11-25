@@ -613,6 +613,107 @@ func (s *RedisStore) GetQueueDepth(ctx context.Context, tierName string) (QueueD
 	return depth, nil
 }
 
+// trimRounds bounds how much TrimWorkStream does at once: Redis removes up to about
+// 10,000 messages a round.
+const trimRounds = 50
+
+// TrimWorkStream removes messages from a tier's stream that every consumer group has
+// taken and acknowledged, and returns how many. Acknowledging a message leaves it in the
+// stream. It removes whole blocks of messages only, so that about a hundred stay.
+func (s *RedisStore) TrimWorkStream(ctx context.Context, tierName string) (int64, error) {
+	key := WorkStreamKey(s.prefix, tierName)
+	groups, err := s.rdb.Do(ctx, s.rdb.B().XinfoGroups().Key(key).Build()).ToArray()
+	if err != nil {
+		if strings.Contains(err.Error(), "no such key") {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+	}
+
+	// Up to what a group has taken, all messages but its pending ones are done. One that
+	// is taken from here on comes after that.
+	var oldest streamID
+	for i, g := range groups {
+		info, err := g.AsMap()
+		if err != nil {
+			return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		nameMsg, deliveredMsg := info["name"], info["last-delivered-id"]
+		name, err := nameMsg.ToString()
+		if err != nil {
+			return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		delivered, err := deliveredMsg.ToString()
+		if err != nil {
+			return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		needed, err := parseStreamID(delivered)
+		if err != nil {
+			return 0, err
+		}
+
+		// [count, smallest ID, largest ID, consumers]; the IDs are nil if there are none.
+		pending, err := s.rdb.Do(ctx, s.rdb.B().Xpending().Key(key).Group(name).Build()).ToArray()
+		if err != nil {
+			return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		if len(pending) > 1 && !pending[1].IsNil() {
+			smallest, err := pending[1].ToString()
+			if err != nil {
+				return 0, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+			}
+			id, err := parseStreamID(smallest)
+			if err != nil {
+				return 0, err
+			}
+			if id.before(needed) {
+				needed = id
+			}
+		}
+		if i == 0 || needed.before(oldest) {
+			oldest = needed
+		}
+	}
+	if len(groups) == 0 || oldest == (streamID{}) {
+		return 0, nil
+	}
+
+	var trimmed int64
+	for range trimRounds {
+		n, err := s.rdb.Do(ctx, s.rdb.B().Xtrim().Key(key).Minid().Almost().Threshold(oldest.String()).Build()).AsInt64()
+		if err != nil {
+			return trimmed, fmt.Errorf("trim work stream of %s: %w", tierName, err)
+		}
+		if n == 0 {
+			break
+		}
+		trimmed += n
+	}
+	return trimmed, nil
+}
+
+// streamID is the ID of a stream entry.
+type streamID struct{ ms, seq uint64 }
+
+func parseStreamID(id string) (streamID, error) {
+	ms, seq, _ := strings.Cut(id, "-")
+	var parsed streamID
+	var err error
+	if parsed.ms, err = strconv.ParseUint(ms, 10, 64); err != nil {
+		return streamID{}, fmt.Errorf("stream ID %q: %w", id, err)
+	}
+	if parsed.seq, err = strconv.ParseUint(seq, 10, 64); err != nil {
+		return streamID{}, fmt.Errorf("stream ID %q: %w", id, err)
+	}
+	return parsed, nil
+}
+
+func (id streamID) before(other streamID) bool {
+	return id.ms < other.ms || id.ms == other.ms && id.seq < other.seq
+}
+
+func (id streamID) String() string { return fmt.Sprintf("%d-%d", id.ms, id.seq) }
+
 // ============================================================
 // Helpers
 // ============================================================

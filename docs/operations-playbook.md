@@ -121,7 +121,7 @@ The monitoring API is enabled with `ModeMonitor`. Key route groups:
 | `GET` | `/api/stats/daily` | Daily aggregated statistics |
 | `GET` | `/api/nodes` | Worker nodes and pool stats |
 | `GET` | `/api/schedules` | Active schedules |
-| `GET` | `/api/queues` | Queue tiers: weight, paused, `waiting` (no worker has it yet), `in_flight`, `delayed` (due later, such as retries). `size` is the length of the stream, which includes what has been processed |
+| `GET` | `/api/queues` | Queue tiers: weight, paused, `waiting` (no worker has it yet), `in_flight`, `delayed` (due later, such as retries). `size` is the length of the stream, which includes what has been processed but not trimmed yet |
 | `GET` | `/api/dlq` | Dead letter queue entries |
 | `GET` | `/api/redis/info` | Redis server info |
 | `GET` | `/api/ws` | WebSocket real-time event stream |
@@ -226,3 +226,5 @@ The run history is separate from that and is kept, too, until you clean it up:
   default.
 
 Either removes finished runs only. Jobs, their audit trails and their active runs are left alone.
+
+Work streams need no retention: the leader removes messages from them that have been processed.

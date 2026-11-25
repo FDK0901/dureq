@@ -531,7 +531,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `dureq.WithKeyPrefix(prefix)`     | -              | Redis key prefix             |
 | `dureq.WithPriorityTiers(tiers)`  | -              | Custom priority tier mapping |
 | `dureq.WithGroupAggregation(cfg)` | disabled       | Enable group aggregation     |
-| `dureq.WithRetentionPeriod(d)`    | `7d`           | Retention for completed jobs |
+| `dureq.WithRetentionPeriod(d)`    | off            | Retention for completed jobs |
 | `dureq.WithLogger(logger)`        | -              | Custom logger                |
 
 ### Client Options

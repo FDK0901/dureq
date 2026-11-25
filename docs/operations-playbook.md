@@ -200,5 +200,6 @@ State transitions are recorded per job and workflow:
 
 ## Retention and Archival
 
-Completed/dead/cancelled jobs are archived after the retention period (default: 7 days).
-Configure with `WithRetentionPeriod`. Set to 0 to disable. Runs on the leader node.
+Archival is off by default: jobs are kept until they are deleted. With
+`WithRetentionPeriod(d)`, completed/failed/dead/cancelled jobs are deleted once they have
+not been updated for `d` (a negative `d` means 7 days, 0 means off). Runs on the leader node.

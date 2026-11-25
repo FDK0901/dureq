@@ -13,8 +13,8 @@ import (
 // Config configures the archival cleaner.
 type Config struct {
 	Store *store.RedisStore
-	// RetentionPeriod is how long completed/failed/dead jobs are kept.
-	// Jobs older than this are deleted. Default: 7 days.
+	// RetentionPeriod is how long completed/failed/dead/cancelled jobs are kept.
+	// Jobs older than this are deleted. 0 (the zero value) = archival off, negative = 7 days.
 	RetentionPeriod time.Duration
 	// ScanInterval is how often the cleaner runs. Default: 1 hour.
 	ScanInterval time.Duration

@@ -321,7 +321,7 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 		return fmt.Errorf("marshal event: %w", err)
 	}
 
-	cmds := make(rueidis.Commands, 0, 24)
+	cmds := make(rueidis.Commands, 0, 28)
 
 	// 1. SaveRun (terminal status)
 	cmds = append(cmds, s.rdb.B().Hset().Key(RunKey(s.prefix, batch.Run.ID)).FieldValue().FieldValue("data", string(runData)).Build())
@@ -331,11 +331,7 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 	cmds = append(cmds, s.rdb.B().Zadd().Key(RunsByJobKey(s.prefix, batch.Run.JobID)).ScoreMember().ScoreMember(float64(batch.Run.StartedAt.UnixNano()), batch.Run.ID).Build())
 
 	// 2. SaveJobRun (history) — uses same marshaled data
-	score := float64(batch.Run.StartedAt.UnixNano())
-	cmds = append(cmds, s.rdb.B().Hset().Key(HistoryRunKey(s.prefix, batch.Run.ID)).FieldValue().FieldValue("data", string(runData)).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsKey(s.prefix)).ScoreMember().ScoreMember(score, batch.Run.ID).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByJobKey(s.prefix, batch.Run.JobID)).ScoreMember().ScoreMember(score, batch.Run.ID).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByStatusKey(s.prefix, string(batch.Run.Status))).ScoreMember().ScoreMember(score, batch.Run.ID).Build())
+	cmds = append(cmds, s.historyRunCmds(batch.Run, runData)...)
 
 	// 3. DeleteRun — data already in history, clean active tracking
 	cmds = append(cmds, s.rdb.B().Del().Key(RunKey(s.prefix, batch.Run.ID)).Build())

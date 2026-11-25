@@ -1440,20 +1440,34 @@ func (s *RedisStore) SaveJobRun(ctx context.Context, run *types.JobRun) error {
 		return fmt.Errorf("marshal job run: %w", err)
 	}
 
-	score := float64(run.StartedAt.UnixNano())
-	cmds := make(rueidis.Commands, 0, 4)
-	cmds = append(cmds, s.rdb.B().Hset().Key(HistoryRunKey(s.prefix, run.ID)).FieldValue().FieldValue("data", string(data)).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsKey(s.prefix)).ScoreMember().ScoreMember(score, run.ID).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByJobKey(s.prefix, run.JobID)).ScoreMember().ScoreMember(score, run.ID).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByStatusKey(s.prefix, string(run.Status))).ScoreMember().ScoreMember(score, run.ID).Build())
-
-	results := s.rdb.DoMulti(ctx, cmds...)
-	for _, r := range results {
+	for _, r := range s.rdb.DoMulti(ctx, s.historyRunCmds(run, data)...) {
 		if err := r.Error(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// historyRunStatuses are the statuses a run can have in the history.
+var historyRunStatuses = []types.RunStatus{
+	types.RunStatusSucceeded, types.RunStatusFailed, types.RunStatusTimedOut, types.RunStatusCancelled,
+}
+
+// historyRunCmds returns the commands that write a run to the history. A run that is
+// retried goes on under its ID, so it may be in the index of another status by now.
+func (s *RedisStore) historyRunCmds(run *types.JobRun, data []byte) rueidis.Commands {
+	score := float64(run.StartedAt.UnixNano())
+	cmds := make(rueidis.Commands, 0, 4+len(historyRunStatuses))
+	cmds = append(cmds, s.rdb.B().Hset().Key(HistoryRunKey(s.prefix, run.ID)).FieldValue().FieldValue("data", string(data)).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsKey(s.prefix)).ScoreMember().ScoreMember(score, run.ID).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByJobKey(s.prefix, run.JobID)).ScoreMember().ScoreMember(score, run.ID).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryRunsByStatusKey(s.prefix, string(run.Status))).ScoreMember().ScoreMember(score, run.ID).Build())
+	for _, status := range historyRunStatuses {
+		if status != run.Status {
+			cmds = append(cmds, s.rdb.B().Zrem().Key(HistoryRunsByStatusKey(s.prefix, string(status))).Member(run.ID).Build())
+		}
+	}
+	return cmds
 }
 
 // GetHistoryRun retrieves a run from the history store by run ID.

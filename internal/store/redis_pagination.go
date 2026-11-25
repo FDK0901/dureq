@@ -152,32 +152,62 @@ func (s *RedisStore) ListJobRuns(ctx context.Context, filter RunFilter) ([]types
 		max = strconv.FormatFloat(float64(filter.Until.UnixNano()), 'f', 0, 64)
 	}
 
-	total, err := s.rdb.Do(ctx, s.rdb.B().Zcount().Key(indexKey).Min(min).Max(max).Build()).AsInt64()
-	if err != nil {
-		return nil, 0, fmt.Errorf("count runs: %w", err)
-	}
-	if total == 0 {
-		return nil, 0, nil
-	}
+	for {
+		total, err := s.rdb.Do(ctx, s.rdb.B().Zcount().Key(indexKey).Min(min).Max(max).Build()).AsInt64()
+		if err != nil {
+			return nil, 0, fmt.Errorf("count runs: %w", err)
+		}
+		if total == 0 {
+			return nil, 0, nil
+		}
 
-	var ids []string
-	if filter.Sort == "oldest" {
-		ids, err = s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(indexKey).Min(min).Max(max).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
-	} else {
-		ids, err = s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(max).Min(min).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
-	}
-	if err != nil {
-		return nil, 0, fmt.Errorf("paginate runs: %w", err)
-	}
-	if len(ids) == 0 {
-		return nil, int(total), nil
-	}
+		var ids []string
+		if filter.Sort == "oldest" {
+			ids, err = s.rdb.Do(ctx, s.rdb.B().Zrangebyscore().Key(indexKey).Min(min).Max(max).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
+		} else {
+			ids, err = s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(max).Min(min).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
+		}
+		if err != nil {
+			return nil, 0, fmt.Errorf("paginate runs: %w", err)
+		}
+		if len(ids) == 0 {
+			return nil, int(total), nil
+		}
 
-	runs, err := s.hydrateRunValues(ctx, ids)
-	if err != nil {
-		return nil, 0, err
+		runs, err := s.hydrateRunValues(ctx, ids)
+		if err != nil {
+			return nil, 0, err
+		}
+		if filter.JobID == nil && filter.Status != nil {
+			removed, err := s.removeStaleRuns(ctx, indexKey, *filter.Status, runs)
+			if err != nil {
+				return nil, 0, err
+			}
+			if removed {
+				continue
+			}
+		}
+		return runs, int(total), nil
 	}
-	return runs, int(total), nil
+}
+
+// removeStaleRuns removes the runs that have a different status by now from the index of
+// a status, and reports whether there were any. Versions before v0.2.6 left a run that
+// was retried in the index of every status it has had.
+func (s *RedisStore) removeStaleRuns(ctx context.Context, indexKey string, status types.RunStatus, runs []types.JobRun) (bool, error) {
+	var stale []string
+	for _, run := range runs {
+		if run.Status != status {
+			stale = append(stale, run.ID)
+		}
+	}
+	if len(stale) == 0 {
+		return false, nil
+	}
+	if err := s.rdb.Do(ctx, s.rdb.B().Zrem().Key(indexKey).Member(stale...).Build()).Error(); err != nil {
+		return false, fmt.Errorf("remove stale runs: %w", err)
+	}
+	return true, nil
 }
 
 // ============================================================

@@ -224,3 +224,77 @@ func TestQueues_Depth(t *testing.T) {
 	}
 	check("1 of them done, 1 to retry", 5, 2, 2, 1)
 }
+
+type runPage struct {
+	Data  []types.JobRun `json:"data"`
+	Total int            `json:"total"`
+}
+
+func saveRun(t *testing.T, st *store.RedisStore, id string, status types.RunStatus, age time.Duration) {
+	t.Helper()
+	if err := st.SaveJobRun(context.Background(), &types.JobRun{ID: id, JobID: "j", Status: status, StartedAt: time.Now().Add(-age)}); err != nil {
+		t.Fatalf("save run: %v", err)
+	}
+}
+
+// listRuns returns the IDs of a page of the history.
+func listRuns(t *testing.T, srv *httptest.Server, query string) (string, int) {
+	t.Helper()
+	var page runPage
+	get(t, srv, "/api/history/runs?"+query, &page)
+	var ids []string
+	for _, r := range page.Data {
+		ids = append(ids, r.ID)
+	}
+	return strings.Join(ids, " "), page.Total
+}
+
+// A run that failed and succeeded when retried, under the same ID, is a success.
+func TestHistoryRuns_RecoveredRunIsNotFailed(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	saveRun(t, st, "failed", types.RunStatusFailed, time.Minute)
+	saveRun(t, st, "recovered", types.RunStatusFailed, time.Second)
+	saveRun(t, st, "recovered", types.RunStatusSucceeded, 0)
+	completed := &types.JobRun{ID: "completed", JobID: "j", Status: types.RunStatusFailed, StartedAt: time.Now()}
+	if err := st.SaveJobRun(context.Background(), completed); err != nil {
+		t.Fatal(err)
+	}
+	completed.Status = types.RunStatusSucceeded
+	if err := st.CompleteRun(context.Background(), &store.CompletionBatch{Run: completed, Result: types.WorkResult{JobID: "j"}, DailyStatField: "processed"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if ids, total := listRuns(t, srv, "status=failed"); ids != "failed" || total != 1 {
+		t.Fatalf("failed runs: %q of %d", ids, total)
+	}
+	if ids, total := listRuns(t, srv, "status=succeeded"); ids != "completed recovered" || total != 2 {
+		t.Fatalf("succeeded runs: %q of %d", ids, total)
+	}
+	if ids, total := listRuns(t, srv, "job_id=j"); ids != "completed recovered failed" || total != 3 {
+		t.Fatalf("runs of the job: %q of %d", ids, total)
+	}
+}
+
+// The index of versions before v0.2.6 has recovered runs among the failed ones.
+func TestHistoryRuns_OldIndexIsCorrected(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	ctx := context.Background()
+	for i := range 30 {
+		id := fmt.Sprintf("r%02d", i)
+		status := types.RunStatusSucceeded
+		if i%10 == 0 {
+			status = types.RunStatusFailed
+		}
+		saveRun(t, st, id, status, time.Duration(i)*time.Minute)
+		score := float64(time.Now().Add(-time.Duration(i) * time.Minute).UnixNano())
+		if err := st.Client().Do(ctx, st.Client().B().Zadd().Key(store.HistoryRunsByStatusKey(st.Prefix(), "failed")).ScoreMember().ScoreMember(score, id).Build()).Error(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ids, total := listRuns(t, srv, "status=failed&limit=5"); ids != "r00 r10 r20" || total != 3 {
+		t.Fatalf("failed runs: %q of %d, want r00 r10 r20 of 3", ids, total)
+	}
+	if ids, total := listRuns(t, srv, "status=succeeded&limit=1"); ids != "r01" || total != 27 {
+		t.Fatalf("succeeded runs: %q of %d, want r01 of 27", ids, total)
+	}
+}

@@ -540,6 +540,7 @@ func (s *RedisStore) hydrateWorkflowValues(ctx context.Context, ids []string) ([
 		}
 		var wf types.WorkflowInstance
 		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &wf) == nil {
+			nameWorkflowTasks(&wf)
 			wfs = append(wfs, wf)
 		}
 	}

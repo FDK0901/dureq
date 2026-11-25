@@ -707,6 +707,7 @@ func (c *Client) EnqueueWorkflow(ctx context.Context, def types.WorkflowDefiniti
 	tasks := make(map[string]types.WorkflowTaskState, len(def.Tasks))
 	for _, t := range def.Tasks {
 		tasks[t.Name] = types.WorkflowTaskState{
+			Name:   t.Name,
 			Status: types.JobStatusPending,
 		}
 	}

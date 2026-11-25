@@ -108,3 +108,28 @@ func TestRunHistory_CleanedUpByHand(t *testing.T) {
 		t.Fatalf("job is %s", got)
 	}
 }
+
+// Tasks of a workflow have their names, also in the state that is stored.
+func TestWorkflow_TaskNamesAreStored(t *testing.T) {
+	_, cli := startRecorder(t, "wf.named", &recorder{})
+	ctx := context.Background()
+	wf, err := cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{
+		Name: "named",
+		Tasks: []types.WorkflowTask{
+			{Name: "first", TaskType: "wf.named", Payload: json.RawMessage(`{}`)},
+			{Name: "second", TaskType: "wf.named", Payload: json.RawMessage(`{}`), DependsOn: []string{"first"}},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	for name, state := range wf.Tasks {
+		if state.Name != name {
+			t.Errorf("enqueued task %q has the name %q", name, state.Name)
+		}
+	}
+	waitFor(t, 20*time.Second, "workflow completed", func() bool {
+		got, _, err := cli.Store().GetWorkflow(ctx, wf.ID)
+		return err == nil && got.Status == types.WorkflowStatusCompleted
+	})
+}

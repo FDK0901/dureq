@@ -962,6 +962,7 @@ func (o *Orchestrator) dispatchChildWorkflow(ctx context.Context, parentWf *type
 	childTasks := make(map[string]types.WorkflowTaskState, len(childDef.Tasks))
 	for _, t := range childDef.Tasks {
 		childTasks[t.Name] = types.WorkflowTaskState{
+			Name:   t.Name,
 			Status: types.JobStatusPending,
 		}
 	}
@@ -2324,6 +2325,7 @@ func (o *Orchestrator) continueWorkflowAsNew(ctx context.Context, wf *types.Work
 	tasks := make(map[string]types.WorkflowTaskState, len(wf.Definition.Tasks))
 	for _, t := range wf.Definition.Tasks {
 		tasks[t.Name] = types.WorkflowTaskState{
+			Name:   t.Name,
 			Status: types.JobStatusPending,
 		}
 	}

@@ -961,7 +961,19 @@ func (s *RedisStore) GetWorkflow(ctx context.Context, id string) (*types.Workflo
 	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &wf); err != nil {
 		return nil, 0, fmt.Errorf("unmarshal workflow: %w", err)
 	}
+	nameWorkflowTasks(&wf)
 	return &wf, parseVersion(result["_version"]), nil
+}
+
+// nameWorkflowTasks fills in the names of the task states of workflows that versions
+// before v0.2.6 created: there, they were the keys only.
+func nameWorkflowTasks(wf *types.WorkflowInstance) {
+	for name, state := range wf.Tasks {
+		if state.Name == "" {
+			state.Name = name
+			wf.Tasks[name] = state
+		}
+	}
 }
 
 // UpdateWorkflow performs a CAS update on a workflow instance.
@@ -1642,6 +1654,7 @@ func (s *RedisStore) hydrateWorkflows(ctx context.Context, ids []string) ([]*typ
 		}
 		var wf types.WorkflowInstance
 		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &wf) == nil {
+			nameWorkflowTasks(&wf)
 			wfs = append(wfs, &wf)
 		}
 	}

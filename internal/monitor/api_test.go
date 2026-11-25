@@ -592,3 +592,39 @@ func TestSearchAllJobs(t *testing.T) {
 		}
 	}
 }
+
+// Workflows of versions before v0.2.6 have their task names as keys only.
+func TestWorkflow_TaskNames(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	_, err := st.SaveWorkflow(context.Background(), &types.WorkflowInstance{
+		ID: "wf", WorkflowName: "w", Status: types.WorkflowStatusRunning, CreatedAt: time.Now(),
+		Tasks: map[string]types.WorkflowTaskState{"validate": {Status: types.JobStatusCompleted}, "ship": {Name: "ship", Status: types.JobStatusPending}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(wf types.WorkflowInstance) {
+		t.Helper()
+		for name, state := range wf.Tasks {
+			if state.Name != name {
+				t.Errorf("task %q has the name %q", name, state.Name)
+			}
+		}
+		if len(wf.Tasks) != 2 || wf.Tasks["validate"].Status != types.JobStatusCompleted {
+			t.Errorf("tasks %+v", wf.Tasks)
+		}
+	}
+	var wf types.WorkflowInstance
+	get(t, srv, "/api/workflows/wf", &wf)
+	check(wf)
+	var page struct {
+		Data []types.WorkflowInstance `json:"data"`
+	}
+	get(t, srv, "/api/workflows", &page)
+	check(page.Data[0])
+	all, err := st.ListWorkflows(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(*all[0])
+}

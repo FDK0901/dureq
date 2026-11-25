@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/FDK0901/go-chainedlog"
+	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
 	"github.com/bytedance/sonic"
 	"github.com/redis/rueidis"
 )
@@ -132,9 +134,18 @@ type RedisStore struct {
 	scriptCompleteOpEffect *rueidis.Lua
 }
 
+// nopLogger returns a logger that discards everything.
+func nopLogger() chainedlog.Logger {
+	return chainedslog.NewSlog(slog.New(slog.DiscardHandler))
+}
+
 // NewRedisStore creates a new Redis store and registers tier configuration.
+// A nil logger discards all log output.
 func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger chainedlog.Logger) (*RedisStore, error) {
 	cfg.defaults()
+	if logger == nil {
+		logger = nopLogger()
+	}
 
 	s := &RedisStore{
 		rdb:    rdb,

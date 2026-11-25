@@ -16,7 +16,11 @@ type DelayedPoller struct {
 }
 
 // NewDelayedPoller creates a delayed retry poller.
+// A nil logger discards all log output.
 func NewDelayedPoller(store *RedisStore, logger chainedlog.Logger) *DelayedPoller {
+	if logger == nil {
+		logger = nopLogger()
+	}
 	return &DelayedPoller{
 		store:    store,
 		logger:   logger,

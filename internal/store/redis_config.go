@@ -16,7 +16,8 @@ type RedisStoreConfig struct {
 	// LockTTL is the default TTL for distributed lock entries. Default: 30s.
 	LockTTL time.Duration
 
-	// EventStreamMaxLen is the max length of the events stream. Default: 50000.
+	// EventStreamMaxLen is the max length of the events stream, which is a history only: what
+	// the orchestrator has to see is kept apart until it has. Default: 50000.
 	EventStreamMaxLen int64
 
 	// DLQStreamMaxLen is the max length of the DLQ stream. Default: 10000.

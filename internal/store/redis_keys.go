@@ -71,6 +71,7 @@ func DLQStreamKey(prefix string) string                     { return prefix + ":
 // Events
 func EventsPubSubChannel(prefix string) string              { return prefix + ":events" }
 func EventsStreamKey(prefix string) string                  { return prefix + ":events:stream" }
+func OrchestratorStreamKey(prefix string) string            { return prefix + ":events:orchestrator" }
 func EventsBatchChannel(prefix, batchID string) string      { return fmt.Sprintf("%s:events:batch:%s", prefix, batchID) }
 
 // Results

@@ -292,6 +292,31 @@ func (s *RedisStore) JobsExist(ctx context.Context, ids []string) ([]bool, error
 	return exist, nil
 }
 
+// JobsInWorkflowOrBatch reports for each ID whether the job is part of a workflow or batch.
+// One that cannot be read counts as such, but not one that does not exist.
+func (s *RedisStore) JobsInWorkflowOrBatch(ctx context.Context, ids []string) []bool {
+	if len(ids) == 0 {
+		return nil
+	}
+	cmds := make(rueidis.Commands, 0, len(ids))
+	for _, id := range ids {
+		cmds = append(cmds, s.rdb.B().Hget().Key(JobKey(s.prefix, id)).Field("data").Build())
+	}
+	part := make([]bool, len(ids))
+	for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+		data, err := r.ToString()
+		if rueidis.IsRedisNil(err) {
+			continue
+		}
+		var job struct {
+			WorkflowID *string `json:"workflow_id"`
+			BatchID    *string `json:"batch_id"`
+		}
+		part[i] = err != nil || sonic.ConfigFastest.UnmarshalFromString(data, &job) != nil || job.WorkflowID != nil || job.BatchID != nil
+	}
+	return part
+}
+
 // GetJob retrieves a job by ID.
 func (s *RedisStore) GetJob(ctx context.Context, jobID string) (*types.Job, uint64, error) {
 	return parseJob(s.rdb.Do(ctx, s.getJobCmd(jobID)))

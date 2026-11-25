@@ -351,6 +351,86 @@ func TestCompleteRun_EventForEveryJob(t *testing.T) {
 	}
 }
 
+// failingRedis fails the pipeline that is the failAt'th one, counted from 1.
+type failingRedis struct {
+	rueidis.Client
+	failAt, n int
+}
+
+func (f *failingRedis) DoMulti(ctx context.Context, multi ...rueidis.Completed) []rueidis.RedisResult {
+	if f.n++; f.n == f.failAt {
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		ctx = cancelled
+	}
+	return f.Client.DoMulti(ctx, multi...)
+}
+
+// A completion that is cut short by an error is finished when it is tried again: the message
+// is acknowledged last, and the orchestrator learns of it.
+func TestCompleteRun_TriedAgain(t *testing.T) {
+	for failAt, name := range []string{1: "bookkeeping fails", 2: "acknowledgement fails"} {
+		if name == "" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			base, srv := newTestAPI(t, nil)
+			ctx := context.Background()
+			rdb := &failingRedis{Client: base.Client()}
+			st, err := store.NewRedisStore(rdb, base.Config(), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := base.EnsureStreams(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := base.ReenqueueWork(ctx, "normal", &types.WorkMessage{RunID: "r", JobID: "j"}, 0); err != nil {
+				t.Fatal(err)
+			}
+			work := store.WorkStreamKey(base.Prefix(), "normal")
+			taken, err := base.Client().Do(ctx, base.Client().B().Xreadgroup().Group(store.ConsumerGroup, "n").Streams().Key(work).Id(">").Build()).AsXRead()
+			if err != nil {
+				t.Fatal(err)
+			}
+			pending := func() int64 {
+				t.Helper()
+				p, err := base.Client().Do(ctx, base.Client().B().Xpending().Key(work).Group(store.ConsumerGroup).Build()).ToArray()
+				if err != nil {
+					t.Fatal(err)
+				}
+				n, _ := p[0].AsInt64()
+				return n
+			}
+
+			batch := &store.CompletionBatch{
+				Run:          &types.JobRun{ID: "r", JobID: "j", Status: types.RunStatusSucceeded, StartedAt: time.Now()},
+				OperationKey: "op", DailyStatField: "processed", AckTierName: "normal", AckMessageID: taken[work][0].ID,
+				Event:  types.JobEvent{Type: types.EventJobCompleted, JobID: "j", RunID: "r", Timestamp: time.Now()},
+				Result: types.WorkResult{RunID: "r", JobID: "j", Success: true},
+			}
+			rdb.n, rdb.failAt = 0, failAt
+			if err := st.CompleteRun(ctx, batch); err == nil {
+				t.Fatal("the failure is not reported")
+			}
+			if n := pending(); n != 1 {
+				t.Errorf("%d messages pending after the failure, want 1", n)
+			}
+			if err := st.CompleteRun(ctx, batch); err != nil {
+				t.Fatal(err)
+			}
+			if n := pending(); n != 0 {
+				t.Errorf("%d messages pending, want none", n)
+			}
+			var page eventPage
+			get(t, srv, "/api/history/events?job_id=j", &page)
+			given, _ := base.Client().Do(ctx, base.Client().B().Xlen().Key(store.OrchestratorStreamKey(base.Prefix())).Build()).AsInt64()
+			if page.Total != 1 || given != 1 {
+				t.Errorf("%d events, %d for the orchestrator, want 1 each", page.Total, given)
+			}
+		})
+	}
+}
+
 // A scan goes over more than one chunk of the stream, and over the time span asked for.
 func TestListJobEvents_LongStream(t *testing.T) {
 	st, _ := newTestAPI(t, nil)

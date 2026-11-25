@@ -70,6 +70,7 @@ func (o *Orchestrator) Start(ctx context.Context) {
 	o.active = true
 
 	go o.eventLoop(orchCtx)
+	go o.forwardLoop(orchCtx)
 	go o.timeoutCheckLoop(orchCtx)
 	o.logger.Info().Msg("workflow orchestrator started")
 }
@@ -89,75 +90,148 @@ func (o *Orchestrator) Stop() {
 	o.logger.Info().Msg("workflow orchestrator stopped")
 }
 
+const (
+	// consumerName is the same on all nodes, so that a new leader goes on with what the one
+	// before has not finished.
+	consumerName = "orchestrator"
+	// eventsPerRead is how many events are read at once. The jobs they are about are looked
+	// up together.
+	eventsPerRead = 500
+	// retryInterval is how often events that could not be processed are tried again.
+	retryInterval = 10 * time.Second
+	// forwardInterval is how often events of nodes before v0.2.6 are looked for.
+	forwardInterval = 500 * time.Millisecond
+)
+
 // eventLoop reads events from the durable Redis Stream via XREADGROUP.
 // Unlike Pub/Sub, stream-based consumption guarantees no events are lost
-// even when the orchestrator restarts or leadership changes.
+// even when the orchestrator restarts or leadership changes: an event stays in the
+// stream until it has been processed.
 func (o *Orchestrator) eventLoop(ctx context.Context) {
 	defer close(o.done)
 	clear(o.checked)
 
-	streamKey := store.EventsStreamKey(o.store.Prefix())
-	consumerName := "orchestrator"
+	streamKey := store.OrchestratorStreamKey(o.store.Prefix())
 
-	// Phase 1: drain any pending (unacknowledged) messages from a previous run.
-	o.drainPending(ctx, streamKey, consumerName)
-
-	// Phase 2: read new messages.
+	// Drain any pending (unacknowledged) messages from a previous run, and read new ones.
+	var drainedAt time.Time
+	failed := true
 	for ctx.Err() == nil {
-		cmd := o.store.Client().B().Xreadgroup().Group(store.OrchestratorConsumerGroup, consumerName).Count(100).Block(1000).Streams().Key(streamKey).Id(">").Build()
+		if failed && time.Since(drainedAt) >= retryInterval {
+			failed = o.drainPending(ctx, streamKey)
+			drainedAt = time.Now()
+		}
+
+		cmd := o.store.Client().B().Xreadgroup().Group(store.OrchestratorConsumerGroup, consumerName).Count(eventsPerRead).Block(1000).Streams().Key(streamKey).Id(">").Build()
 		xStreams, err := o.store.Client().Do(ctx, cmd).AsXRead()
 		if err != nil {
 			if !rueidis.IsRedisNil(err) && ctx.Err() == nil {
 				o.logger.Warn().Err(err).Msg("orchestrator: XREADGROUP error")
+				sleep(ctx, time.Second)
 			}
 			continue
 		}
-
-		for _, entries := range xStreams {
-			for _, entry := range entries {
-				if err := o.processStreamEvent(ctx, entry); err != nil {
-					o.logger.Warn().Err(err).String("stream_id", entry.ID).Msg("orchestrator: event processing failed, leaving for retry")
-					continue
-				}
-				if ctx.Err() == nil {
-					o.store.Client().Do(ctx, o.store.Client().B().Xack().Key(streamKey).Group(store.OrchestratorConsumerGroup).Id(entry.ID).Build())
-				}
-			}
+		if !o.processEvents(ctx, xStreams[streamKey]) {
+			failed = true
 		}
 	}
 }
 
-// drainPending processes any unacknowledged messages left from a previous orchestrator run.
-func (o *Orchestrator) drainPending(ctx context.Context, streamKey, consumerName string) {
+// drainPending processes any unacknowledged messages, and reports whether some failed.
+func (o *Orchestrator) drainPending(ctx context.Context, streamKey string) (failed bool) {
+	after := "0"
 	for ctx.Err() == nil {
-		cmd := o.store.Client().B().Xreadgroup().Group(store.OrchestratorConsumerGroup, consumerName).Count(100).Streams().Key(streamKey).Id("0").Build()
+		cmd := o.store.Client().B().Xreadgroup().Group(store.OrchestratorConsumerGroup, consumerName).Count(eventsPerRead).Streams().Key(streamKey).Id(after).Build()
 		xStreams, err := o.store.Client().Do(ctx, cmd).AsXRead()
 		if err != nil {
-			return
+			return !rueidis.IsRedisNil(err)
 		}
+		entries := xStreams[streamKey]
+		if len(entries) == 0 {
+			return failed
+		}
+		after = entries[len(entries)-1].ID
+		if !o.processEvents(ctx, entries) {
+			failed = true
+		}
+	}
+	return true
+}
 
-		empty := true
-		for _, entries := range xStreams {
-			if len(entries) > 0 {
-				empty = false
-				for _, entry := range entries {
-					if err := o.processStreamEvent(ctx, entry); err != nil {
-						o.logger.Warn().Err(err).String("stream_id", entry.ID).Msg("orchestrator: pending event processing failed, leaving for retry")
-						continue
-					}
-					if ctx.Err() == nil {
-						o.store.Client().Do(ctx, o.store.Client().B().Xack().Key(streamKey).Group(store.OrchestratorConsumerGroup).Id(entry.ID).Build())
-					}
-				}
+// processEvents processes events in their order and removes them, except those that fail, which
+// it reports. Those of jobs that are not part of a workflow or batch are removed at once.
+func (o *Orchestrator) processEvents(ctx context.Context, entries []rueidis.XRangeEntry) (ok bool) {
+	var jobIDs []string
+	for _, entry := range entries {
+		if isJobEvent(entry) {
+			jobIDs = append(jobIDs, entry.FieldValues["job_id"])
+		}
+	}
+	concerned := o.store.JobsInWorkflowOrBatch(ctx, jobIDs)
+
+	todo := make([]rueidis.XRangeEntry, 0, len(entries))
+	var done []string
+	for _, entry := range entries {
+		if isJobEvent(entry) {
+			c := concerned[0]
+			concerned = concerned[1:]
+			if !c {
+				done = append(done, entry.ID)
+				continue
 			}
 		}
-		if empty {
-			return
+		todo = append(todo, entry)
+	}
+	o.store.DoneOrchestratorEvents(ctx, done...)
+
+	ok = true
+	for _, entry := range todo {
+		if ctx.Err() != nil {
+			return false
+		}
+		err := o.processStreamEvent(ctx, entry)
+		if gone := errors.Is(err, types.ErrJobNotFound) || errors.Is(err, types.ErrWorkflowNotFound) || errors.Is(err, types.ErrBatchNotFound); err != nil && !gone {
+			o.logger.Warn().Err(err).String("stream_id", entry.ID).Msg("orchestrator: event processing failed, leaving for retry")
+			ok = false
+			continue
+		}
+		if ctx.Err() == nil {
+			o.store.DoneOrchestratorEvents(ctx, entry.ID)
+		}
+	}
+	return ok
+}
+
+func isJobEvent(entry rueidis.XRangeEntry) bool {
+	switch types.EventType(entry.FieldValues["type"]) {
+	case types.EventJobCompleted, types.EventJobFailed, types.EventJobDead:
+		return true
+	}
+	return false
+}
+
+// forwardLoop has the events of nodes before v0.2.6 processed, too.
+func (o *Orchestrator) forwardLoop(ctx context.Context) {
+	for ctx.Err() == nil {
+		n, err := o.store.ForwardEvents(ctx, consumerName, eventsPerRead)
+		if err != nil && ctx.Err() == nil {
+			o.logger.Warn().Err(err).Msg("orchestrator: failed to forward events")
+		}
+		if n < eventsPerRead {
+			sleep(ctx, forwardInterval)
 		}
 	}
 }
 
-// processStreamEvent extracts the event JSON from a stream message and routes it.
+func sleep(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
+	}
+}
+
+// processStreamEvent extracts the event JSON from a stream message and routes it. The types
+// are those of store.OrchestratorHandles.
 // Returns an error if the event could not be processed and should be retried.
 func (o *Orchestrator) processStreamEvent(ctx context.Context, entry rueidis.XRangeEntry) error {
 	dataStr, ok := entry.FieldValues["data"]

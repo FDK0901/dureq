@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/store"
@@ -12,7 +13,7 @@ import (
 
 // maxBatchCASRetries is how often a change of a batch is applied anew because something
 // else changed the batch meanwhile.
-const maxBatchCASRetries = 10
+const maxBatchCASRetries = 30
 
 // batchStep is what follows from a change of a batch, once the change is stored.
 type batchStep struct {
@@ -25,7 +26,7 @@ type batchStep struct {
 // follows from it. If the batch is changed meanwhile, change is applied to the new state.
 // It returns nil if there is nothing to store.
 func (o *Orchestrator) changeBatch(ctx context.Context, batchID string, change func(batch *types.BatchInstance, now time.Time) *batchStep) error {
-	for range maxBatchCASRetries {
+	for attempt := range maxBatchCASRetries {
 		batch, rev, err := o.store.GetBatch(ctx, batchID)
 		if err != nil {
 			o.logger.Error().String("batch_id", batchID).Err(err).Msg("batch orchestrator: failed to get batch")
@@ -43,6 +44,8 @@ func (o *Orchestrator) changeBatch(ctx context.Context, batchID string, change f
 		batch.UpdatedAt = now
 		if _, err := o.store.UpdateBatch(ctx, batch, rev); err != nil {
 			if errors.Is(err, store.ErrCASConflict) {
+				// Whoever else changes the batch should not come in between every time.
+				sleep(ctx, rand.N(time.Duration(attempt+1)*time.Millisecond))
 				continue
 			}
 			o.logger.Error().String("batch_id", batchID).Err(err).Msg("batch orchestrator: failed to save batch")

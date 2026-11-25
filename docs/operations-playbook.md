@@ -227,4 +227,8 @@ The run history is separate from that and is kept, too, until you clean it up:
 
 Either removes finished runs only. Jobs, their audit trails and their active runs are left alone.
 
-Work streams need no retention: the leader removes messages from them that have been processed.
+Nothing that is yet to be done is ever trimmed:
+
+- Work streams: the leader removes messages that have been processed, and only those.
+- Events that the orchestrator has to see (`events:orchestrator`): each is removed once it has been processed.
+- The event stream is limited to about `EventStreamMaxLen` events, as it is a history only.

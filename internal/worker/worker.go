@@ -52,7 +52,8 @@ type streamMessage struct {
 	TierName     string
 	Redeliveries int
 
-	completed bool // CompleteRun has been called
+	standalone bool // the job is not part of a workflow or batch
+	completed  bool // CompleteRun has been called
 }
 
 // maxRedeliveries is the limit before a message with no handler is sent to DLQ.
@@ -538,10 +539,11 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	}
 
 	job, rev, jobErr := w.store.GetJob(w.ctx, work.JobID)
+	sm.standalone = jobErr == nil && job.WorkflowID == nil && job.BatchID == nil
 
 	// What is still queued of a cancelled job does not run any more. Workflow and
 	// batch jobs are left to the orchestrator, which waits for their outcome.
-	if jobErr == nil && job.Status == types.JobStatusCancelled && job.WorkflowID == nil && job.BatchID == nil {
+	if sm.standalone && job.Status == types.JobStatusCancelled {
 		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).Msg("worker: job is cancelled, dropping message")
 		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		return
@@ -1075,13 +1077,14 @@ func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessag
 	batch := &store.CompletionBatch{
 		Run: run,
 		Event: types.JobEvent{
-			Type:      types.EventJobCompleted,
-			JobID:     work.JobID,
-			RunID:     work.RunID,
-			NodeID:    w.nodeID,
-			TaskType:  work.TaskType,
-			Attempt:   work.Attempt,
-			Timestamp: time.Now(),
+			Type:       types.EventJobCompleted,
+			JobID:      work.JobID,
+			RunID:      work.RunID,
+			NodeID:     w.nodeID,
+			TaskType:   work.TaskType,
+			Attempt:    work.Attempt,
+			Timestamp:  time.Now(),
+			Standalone: sm.standalone,
 		},
 		Result: types.WorkResult{
 			RunID:              work.RunID,
@@ -1137,13 +1140,14 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 	batch := &store.CompletionBatch{
 		Run: run,
 		Event: types.JobEvent{
-			Type:      types.EventJobCompleted,
-			JobID:     work.JobID,
-			RunID:     work.RunID,
-			NodeID:    w.nodeID,
-			TaskType:  work.TaskType,
-			Attempt:   work.Attempt,
-			Timestamp: time.Now(),
+			Type:       types.EventJobCompleted,
+			JobID:      work.JobID,
+			RunID:      work.RunID,
+			NodeID:     w.nodeID,
+			TaskType:   work.TaskType,
+			Attempt:    work.Attempt,
+			Timestamp:  time.Now(),
+			Standalone: sm.standalone,
 		},
 		Result: types.WorkResult{
 			RunID:   work.RunID,
@@ -1263,14 +1267,15 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		w.logger.Info().String("job_id", work.JobID).String("run_id", work.RunID).String("status", string(job.Status)).Msg("worker: job ended while this run was going, not retrying")
 		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		w.disp.PublishEvent(types.JobEvent{
-			Type:      types.EventJobFailed,
-			JobID:     work.JobID,
-			RunID:     work.RunID,
-			NodeID:    w.nodeID,
-			TaskType:  work.TaskType,
-			Attempt:   work.Attempt,
-			Error:     &errStr,
-			Timestamp: time.Now(),
+			Type:       types.EventJobFailed,
+			JobID:      work.JobID,
+			RunID:      work.RunID,
+			NodeID:     w.nodeID,
+			TaskType:   work.TaskType,
+			Attempt:    work.Attempt,
+			Error:      &errStr,
+			Timestamp:  time.Now(),
+			Standalone: sm.standalone,
 		})
 		return
 	}
@@ -1369,14 +1374,15 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 	}
 
 	w.disp.PublishEvent(types.JobEvent{
-		Type:      types.EventJobFailed,
-		JobID:     work.JobID,
-		RunID:     work.RunID,
-		NodeID:    w.nodeID,
-		TaskType:  work.TaskType,
-		Attempt:   work.Attempt,
-		Error:     &errStr,
-		Timestamp: now,
+		Type:       types.EventJobFailed,
+		JobID:      work.JobID,
+		RunID:      work.RunID,
+		NodeID:     w.nodeID,
+		TaskType:   work.TaskType,
+		Attempt:    work.Attempt,
+		Error:      &errStr,
+		Timestamp:  now,
+		Standalone: sm.standalone,
 	})
 }
 

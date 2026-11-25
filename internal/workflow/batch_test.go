@@ -20,7 +20,10 @@ import (
 
 // newTestStore connects to the standalone Redis at REDIS_URL under a unique key prefix.
 // Skips if REDIS_URL is unset or Redis is unreachable.
-func newTestStore(t *testing.T) *store.RedisStore {
+func newTestStore(t *testing.T) *store.RedisStore { return newTestStoreWith(t, 0) }
+
+// newTestStoreWith is newTestStore with a limit to the event stream.
+func newTestStoreWith(t *testing.T, maxEvents int64) *store.RedisStore {
 	t.Helper()
 	addr := strings.TrimPrefix(os.Getenv("REDIS_URL"), "redis://")
 	if addr == "" {
@@ -36,8 +39,9 @@ func newTestStore(t *testing.T) *store.RedisStore {
 	}
 	t.Cleanup(rdb.Close)
 	st, err := store.NewRedisStore(rdb, store.RedisStoreConfig{
-		KeyPrefix: "test_" + xid.New().String(),
-		Tiers:     []store.TierConfig{{Name: "normal", Weight: 1, FetchBatch: 10}},
+		KeyPrefix:         "test_" + xid.New().String(),
+		Tiers:             []store.TierConfig{{Name: "normal", Weight: 1, FetchBatch: 10}},
+		EventStreamMaxLen: maxEvents,
 	}, nil)
 	if err != nil {
 		t.Fatalf("create store: %v", err)

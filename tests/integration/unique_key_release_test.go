@@ -264,6 +264,41 @@ func TestRetry_CancelledJob_RunsAgain(t *testing.T) {
 	}
 }
 
+// BulkCancelJobs cuts off runs that are going, like CancelJob.
+func TestBulkCancelJobs_SignalsActiveRuns(t *testing.T) {
+	flushDB(t)
+	ctx := context.Background()
+	srv := newServer(t, "bulk-cancel", 10)
+	started, ended := make(chan struct{}, 1), make(chan struct{}, 1)
+	srv.RegisterHandler(types.HandlerDefinition{TaskType: "rec.bulk", Handler: func(ctx context.Context, _ json.RawMessage) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		ended <- struct{}{}
+		return ctx.Err()
+	}})
+	if err := srv.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer srv.Stop()
+	cli := newClient(t)
+	defer cli.Close()
+
+	job, err := cli.Enqueue(ctx, "rec.bulk", map[string]string{})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	<-started
+	svc := monitor.NewAPIService(srv.Store(), srv.Dispatcher(), nil)
+	if res, err := svc.BulkCancelJobs(ctx, monitor.BulkRequest{IDs: []string{job.ID}}); err != nil || res.Affected != 1 {
+		t.Fatalf("bulk cancel: %+v, %v", res, err)
+	}
+	select {
+	case <-ended:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the run was not cut off")
+	}
+}
+
 // pendingAndUnread returns how many messages of the work stream are unread or have not
 // been acknowledged.
 func pendingAndUnread(t *testing.T, cli *client.Client) int {

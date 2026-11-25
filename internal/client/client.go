@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"time"
@@ -352,18 +353,31 @@ func (c *Client) enqueue(ctx context.Context, req *EnqueueRequest) (*types.Job, 
 // Cancel cancels a job by ID and frees its unique key, so the key can be used
 // to enqueue again. A key that another job holds by now is left alone.
 func (c *Client) Cancel(ctx context.Context, jobID string) error {
-	job, rev, err := c.store.GetJob(ctx, jobID)
-	if err != nil {
-		return fmt.Errorf("get job: %w", err)
-	}
+	const maxTries = 10 // the job may be written to by its worker or the scheduler
 
+	var job *types.Job
 	now := time.Now()
-	job.Status = types.JobStatusCancelled
-	job.UpdatedAt = now
+	for try := 1; ; try++ {
+		var rev uint64
+		var err error
+		job, rev, err = c.store.GetJob(ctx, jobID)
+		if err != nil {
+			return fmt.Errorf("get job: %w", err)
+		}
+		job.Status = types.JobStatusCancelled
+		job.UpdatedAt = now
 
-	if _, err := c.store.UpdateJob(ctx, job, rev); err != nil {
-		return fmt.Errorf("update job: %w", err)
+		_, err = c.store.UpdateJob(ctx, job, rev)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, store.ErrCASConflict) || try == maxTries {
+			return fmt.Errorf("update job: %w", err)
+		}
 	}
+
+	// Before the event, so that a listener can enqueue under the key again.
+	releaseErr := c.store.ReleaseJobUniqueKey(ctx, job)
 
 	c.store.DeleteSchedule(ctx, jobID)
 	c.signalCancelActiveRuns(ctx, jobID)
@@ -372,8 +386,8 @@ func (c *Client) Cancel(ctx context.Context, jobID string) error {
 		JobID:     jobID,
 		Timestamp: now,
 	})
-	if err := c.store.ReleaseJobUniqueKey(ctx, job); err != nil {
-		return fmt.Errorf("job cancelled, but its unique key was not released: %w", err)
+	if releaseErr != nil {
+		return fmt.Errorf("job cancelled, but its unique key was not released: %w", releaseErr)
 	}
 	return nil
 }

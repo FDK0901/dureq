@@ -147,6 +147,9 @@ func (a *APIService) CancelJob(ctx context.Context, jobID string) error {
 		return err
 	}
 
+	// Before the event, so that a listener can enqueue under the key again.
+	releaseErr := a.store.ReleaseJobUniqueKey(ctx, job)
+
 	a.store.DeleteSchedule(ctx, jobID)
 	a.signalCancelActiveRuns(ctx, jobID)
 
@@ -155,8 +158,8 @@ func (a *APIService) CancelJob(ctx context.Context, jobID string) error {
 		JobID:     jobID,
 		Timestamp: now,
 	})
-	if err := a.store.ReleaseJobUniqueKey(ctx, job); err != nil {
-		return fmt.Errorf("job cancelled, but its unique key was not released: %w", err)
+	if releaseErr != nil {
+		return fmt.Errorf("job cancelled, but its unique key was not released: %w", releaseErr)
 	}
 	return nil
 }
@@ -1038,10 +1041,11 @@ func (a *APIService) BulkCancelJobs(ctx context.Context, req BulkRequest) (*Bulk
 		job.Status = types.JobStatusCancelled
 		job.UpdatedAt = now
 		if _, err := a.store.UpdateJob(ctx, job, rev); err == nil {
-			a.store.DeleteSchedule(ctx, id)
 			if err := a.store.ReleaseJobUniqueKey(ctx, job); err != nil {
 				a.logger.Warn().String("job_id", id).Err(err).Msg("bulk cancel: failed to release unique key")
 			}
+			a.store.DeleteSchedule(ctx, id)
+			a.signalCancelActiveRuns(ctx, id)
 			a.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventJobCancelled, JobID: id, Timestamp: now,
 			})

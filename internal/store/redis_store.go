@@ -1033,6 +1033,8 @@ func (s *RedisStore) UpdateWorkflow(ctx context.Context, wf *types.WorkflowInsta
 	// Remove from deadline index when terminal (no longer needs timeout checks).
 	if wf.Status.IsTerminal() {
 		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(WorkflowDeadlinesKey(s.prefix)).Member(wf.ID).Build())
+	} else if wf.Deadline != nil { // a retry has one of its own
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(WorkflowDeadlinesKey(s.prefix)).ScoreMember().ScoreMember(float64(wf.Deadline.Unix()), wf.ID).Build())
 	}
 
 	s.mirrorWorkflowPayloads(ctx, wf) // best-effort JSON mirror for JSONPath search
@@ -1300,6 +1302,8 @@ func (s *RedisStore) UpdateBatch(ctx context.Context, batch *types.BatchInstance
 	// Remove from deadline index when terminal (no longer needs timeout checks).
 	if batch.Status.IsTerminal() {
 		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(BatchDeadlinesKey(s.prefix)).Member(batch.ID).Build())
+	} else if batch.Deadline != nil { // a retry has one of its own
+		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(BatchDeadlinesKey(s.prefix)).ScoreMember().ScoreMember(float64(batch.Deadline.Unix()), batch.ID).Build())
 	}
 
 	s.mirrorBatchPayloads(ctx, batch) // best-effort JSON mirror for JSONPath search

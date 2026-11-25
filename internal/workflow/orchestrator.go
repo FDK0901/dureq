@@ -1282,15 +1282,10 @@ func (o *Orchestrator) retryWorkflow(ctx context.Context, wf *types.WorkflowInst
 	wf.Attempt++
 	wf.UpdatedAt = *now
 	wf.CompletedAt = nil
+	wf.Deadline = deadline(wf.Definition.ExecutionTimeout, *now)
 	suspended := wf.Status == types.WorkflowStatusSuspended
 	if !suspended {
 		wf.Status = types.WorkflowStatusRunning
-	}
-
-	// Recalculate deadline if ExecutionTimeout is set.
-	if wf.Definition.ExecutionTimeout != nil {
-		deadline := now.Add(wf.Definition.ExecutionTimeout.Std())
-		wf.Deadline = &deadline
 	}
 
 	// Build task def lookup for ResultReusePolicy checks.
@@ -1527,7 +1522,7 @@ func (o *Orchestrator) timeoutWorkflow(ctx context.Context, wf *types.WorkflowIn
 	}
 	wf = freshWf
 	now := time.Now()
-	if wf.Status.IsTerminal() {
+	if wf.Status.IsTerminal() || wf.Deadline != nil && now.Before(*wf.Deadline) {
 		return
 	}
 
@@ -1594,11 +1589,11 @@ func (o *Orchestrator) timeoutBatch(ctx context.Context, batch *types.BatchInsta
 		return
 	}
 	batch = freshBatch
-	if batch.Status.IsTerminal() {
+	now := time.Now()
+	if batch.Status.IsTerminal() || batch.Deadline != nil && now.Before(*batch.Deadline) {
 		return
 	}
 
-	now := time.Now()
 	batch.Status = types.WorkflowStatusFailed
 	batch.CompletedAt = &now
 	batch.UpdatedAt = now
@@ -1920,6 +1915,7 @@ func (o *Orchestrator) continueWorkflowAsNew(ctx context.Context, wf *types.Work
 		Input:         input,
 		Attempt:       1,
 		ContinuedFrom: &wf.ID,
+		Deadline:      deadline(wf.Definition.ExecutionTimeout, *now),
 		CreatedAt:     *now,
 		UpdatedAt:     *now,
 
@@ -1928,11 +1924,6 @@ func (o *Orchestrator) continueWorkflowAsNew(ctx context.Context, wf *types.Work
 	}
 
 	InitPendingDeps(newWf)
-
-	if wf.Definition.ExecutionTimeout != nil {
-		deadline := now.Add(wf.Definition.ExecutionTimeout.Std())
-		newWf.Deadline = &deadline
-	}
 
 	hooks := ReserveInitHook(newWf, *now)
 	newRev, err := o.store.SaveWorkflow(ctx, newWf)

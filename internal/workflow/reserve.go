@@ -147,6 +147,7 @@ func ResetWorkflow(wf *types.WorkflowInstance, now time.Time) {
 	wf.Status = types.WorkflowStatusRunning
 	wf.UpdatedAt = now
 	wf.CompletedAt = nil
+	wf.Deadline = deadline(wf.Definition.ExecutionTimeout, now)
 	for name, state := range wf.Tasks {
 		switch state.Status {
 		case types.JobStatusFailed, types.JobStatusDead, types.JobStatusCancelled:
@@ -154,6 +155,15 @@ func ResetWorkflow(wf *types.WorkflowInstance, now time.Time) {
 			wf.Tasks[name] = state
 		}
 	}
+}
+
+// deadline returns the deadline of an attempt that starts now. Each has the timeout to itself.
+func deadline(timeout *types.Duration, now time.Time) *time.Time {
+	if timeout == nil {
+		return nil
+	}
+	at := now.Add(timeout.Std())
+	return &at
 }
 
 func resetTask(state *types.WorkflowTaskState) {
@@ -174,6 +184,7 @@ func ResetBatch(batch *types.BatchInstance, failedOnly bool, now time.Time) {
 	batch.Status = types.WorkflowStatusRunning
 	batch.UpdatedAt = now
 	batch.CompletedAt = nil
+	batch.Deadline = deadline(batch.Definition.ExecutionTimeout, now)
 	batch.NextChunkIndex = 0
 
 	for id, state := range batch.ItemStates {

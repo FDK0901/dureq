@@ -427,11 +427,6 @@ func (o *Orchestrator) finalizeBatch(batch *types.BatchInstance, now time.Time) 
 	step := &batchStep{progress: true}
 	if batch.FailedItems > 0 && batch.Definition.RetryPolicy != nil && batch.Attempt < batch.Definition.RetryPolicy.MaxAttempts {
 		ResetBatch(batch, true, now)
-		// Recalculate deadline if ExecutionTimeout is set.
-		if batch.Definition.ExecutionTimeout != nil {
-			deadline := now.Add(batch.Definition.ExecutionTimeout.Std())
-			batch.Deadline = &deadline
-		}
 		step.jobs = ReserveBatch(batch, now)
 		o.logger.Info().String("batch_id", batch.ID).Int("attempt", batch.Attempt).Msg("batch retrying")
 		return step

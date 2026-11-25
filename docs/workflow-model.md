@@ -185,5 +185,5 @@ workflow is resumed. It can still fail, time out, or complete if nothing is left
 ## Execution Timeout and Priority
 
 Set `ExecutionTimeout` on the definition to enforce a deadline for the entire
-workflow. Set `DefaultPriority` to control dispatch priority of all tasks
+workflow. Each retry has it to itself. Set `DefaultPriority` to control dispatch priority of all tasks
 (individual tasks can override via their own `Priority` field).

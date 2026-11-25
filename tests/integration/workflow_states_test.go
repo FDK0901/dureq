@@ -296,3 +296,136 @@ func TestWorkflow_EndOfParentEndsChild(t *testing.T) {
 		})
 	}
 }
+
+// The execution timeout holds for a retry by hand, too.
+func TestRetry_HasDeadline(t *testing.T) {
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(string) error { time.Sleep(40 * time.Second); return nil })
+	api := newAPI(t, cli)
+	ctx := context.Background()
+	timeout := types.Duration(2 * time.Second)
+	workflow := func(id string) types.WorkflowStatus {
+		wf, _, err := cli.Store().GetWorkflow(ctx, id)
+		if err != nil {
+			return ""
+		}
+		return wf.Status
+	}
+	batch := func(id string) types.WorkflowStatus {
+		b, err := cli.GetBatch(ctx, id)
+		if err != nil {
+			return ""
+		}
+		return b.Status
+	}
+	for name, tc := range map[string]struct {
+		status func(id string) types.WorkflowStatus
+		retry  func(id string) error
+	}{
+		"workflow-client": {workflow, func(id string) error { _, err := cli.RetryWorkflow(ctx, id); return err }},
+		"workflow-api":    {workflow, func(id string) error { return api.RetryWorkflow(ctx, id) }},
+		"workflow-bulk": {workflow, func(id string) error {
+			_, err := api.BulkRetryWorkflows(ctx, monitor.BulkRequest{IDs: []string{id}})
+			return err
+		}},
+		"batch-client": {batch, func(id string) error { _, err := cli.RetryBatch(ctx, id, true); return err }},
+		"batch-api":    {batch, func(id string) error { return api.RetryBatch(ctx, id, true) }},
+		"batch-bulk": {batch, func(id string) error {
+			_, err := api.BulkRetryBatches(ctx, monitor.BulkRequest{IDs: []string{id}})
+			return err
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var id string
+			if strings.HasPrefix(name, "batch") {
+				b, err := cli.EnqueueBatch(ctx, types.BatchDefinition{Name: name, ItemTaskType: "tally.wf", Items: []types.BatchItem{{ID: "i", Payload: json.RawMessage(`{}`)}}, ExecutionTimeout: &timeout})
+				if err != nil {
+					t.Fatal(err)
+				}
+				id = b.ID
+			} else {
+				wf, err := cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{Name: name, ExecutionTimeout: &timeout, Tasks: []types.WorkflowTask{tallyTask(name)}}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				id = wf.ID
+			}
+			waitFor(t, 14*time.Second, "timeout", func() bool { return tc.status(id) == types.WorkflowStatusFailed })
+			since := time.Now()
+			if err := tc.retry(id); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, 14*time.Second, "retry to time out", func() bool { return tc.status(id) == types.WorkflowStatusFailed })
+			if d := time.Since(since); d < timeout.Std() {
+				t.Errorf("timed out after %v, before the timeout", d)
+			}
+		})
+	}
+}
+
+// Each attempt by a retry policy has the execution timeout to itself.
+func TestRetryPolicy_HasDeadlinePerAttempt(t *testing.T) {
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		first := len(c.not(1, []string{id})) == 0
+		if !first && kindOf(id) == "hangs" {
+			time.Sleep(60 * time.Second)
+		}
+		time.Sleep(6 * time.Second)
+		if first {
+			return &types.NonRetryableError{Err: errBoom}
+		}
+		return nil
+	})
+	ctx := context.Background()
+	timeout := types.Duration(8 * time.Second)
+	policy := &types.RetryPolicy{MaxAttempts: 2}
+	for _, name := range []string{"workflow-completes", "workflow-hangs", "batch-completes", "batch-hangs"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			since := time.Now()
+			var status func() types.WorkflowStatus
+			if strings.HasPrefix(name, "batch") {
+				b, err := cli.EnqueueBatch(ctx, types.BatchDefinition{
+					Name: name, ItemTaskType: "tally.wf", Items: []types.BatchItem{{ID: name, Payload: json.RawMessage(fmt.Sprintf(`{"id":%q}`, name))}},
+					ExecutionTimeout: &timeout, RetryPolicy: policy, FailurePolicy: types.BatchContinueOnError,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				status = func() types.WorkflowStatus {
+					got, err := cli.GetBatch(ctx, b.ID)
+					if err != nil {
+						return ""
+					}
+					return got.Status
+				}
+			} else {
+				wf, err := cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{Name: name, ExecutionTimeout: &timeout, RetryPolicy: policy, Tasks: []types.WorkflowTask{tallyTask(name)}}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				status = func() types.WorkflowStatus {
+					got, _, err := cli.Store().GetWorkflow(ctx, wf.ID)
+					if err != nil {
+						return ""
+					}
+					return got.Status
+				}
+			}
+			want := types.WorkflowStatusCompleted // after 12s, past the deadline of the first attempt
+			if kindOf(name) == "hangs" {
+				want = types.WorkflowStatusFailed // after 6s + 8s
+			}
+			waitFor(t, 25*time.Second, "the end", func() bool { return status().IsTerminal() })
+			d := time.Since(since)
+			if got := status(); got != want {
+				t.Errorf("%s after %v, want %s", got, d, want)
+			}
+			if want == types.WorkflowStatusFailed && d < 6*time.Second+timeout.Std() {
+				t.Errorf("timed out after %v, before the second attempt had its time", d)
+			}
+		})
+	}
+}

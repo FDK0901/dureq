@@ -99,4 +99,4 @@ All non-terminal item jobs and the onetime job (if running) are cancelled.
 
 ## Execution Timeout
 
-Set `ExecutionTimeout` on the definition to enforce a deadline for the entire batch.
+Set `ExecutionTimeout` on the definition to enforce a deadline for the entire batch. Each retry has it to itself.

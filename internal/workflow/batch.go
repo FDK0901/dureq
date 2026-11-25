@@ -206,13 +206,7 @@ func (o *Orchestrator) handleBatchJobCompleted(ctx context.Context, event types.
 			if !ok || staleJob(state.Status, state.JobID, event) {
 				return o.finishIfDone(batch, now)
 			}
-			state.Status = types.JobStatusCompleted
-			state.FinishedAt = &now
-			batch.ItemStates[itemID] = state
-			batch.CompletedItems++
-			if batch.RunningItems > 0 {
-				batch.RunningItems--
-			}
+			endItem(batch, itemID, types.JobStatusCompleted, nil, now)
 
 			// The results are complete by the time the batch is done.
 			itemResult := &types.BatchItemResult{BatchID: batchID, ItemID: itemID, Success: true}
@@ -259,18 +253,14 @@ func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.Job
 		itemID := *job.BatchItem
 		return o.changeBatch(ctx, batchID, func(batch *types.BatchInstance, now time.Time) *batchStep {
 			state, ok := batch.ItemStates[itemID]
-			if !ok || staleJob(state.Status, state.JobID, event) {
+			// An item that a retry has put back to pending is to run again. (Clients of versions
+			// before v0.2.6 store what they start later, so in a first attempt it may be running.)
+			retried := state.Status == types.JobStatusPending && batch.Attempt > 1
+			if !ok || retried || staleJob(state.Status, state.JobID, event) {
 				return o.finishIfDone(batch, now)
 			}
 			o.logger.Warn().String("batch_id", batchID).String("item_id", itemID).Msg("batch item failed")
-			state.Status = types.JobStatusFailed
-			state.FinishedAt = &now
-			state.Error = &errStr
-			batch.ItemStates[itemID] = state
-			batch.FailedItems++
-			if batch.RunningItems > 0 {
-				batch.RunningItems--
-			}
+			endItem(batch, itemID, types.JobStatusFailed, &errStr, now)
 			o.store.SaveBatchItemResult(ctx, &types.BatchItemResult{BatchID: batchID, ItemID: itemID, Error: &errStr})
 
 			if batch.Definition.FailurePolicy == types.BatchFailFast {
@@ -287,6 +277,26 @@ func (o *Orchestrator) handleBatchJobFailed(ctx context.Context, event types.Job
 		})
 	}
 	return nil
+}
+
+// endItem moves an item of a batch to the status it ended with.
+func endItem(batch *types.BatchInstance, itemID string, status types.JobStatus, errStr *string, now time.Time) {
+	state := batch.ItemStates[itemID]
+	switch {
+	case state.Status == types.JobStatusPending: // an execution from before it was reset
+		batch.PendingItems--
+	case batch.RunningItems > 0:
+		batch.RunningItems--
+	}
+	if status == types.JobStatusCompleted {
+		batch.CompletedItems++
+	} else {
+		batch.FailedItems++
+	}
+	state.Status = status
+	state.FinishedAt = &now
+	state.Error = errStr
+	batch.ItemStates[itemID] = state
 }
 
 // updateBatchItemRetrying updates a batch item's status to retrying so the UI

@@ -6,12 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
-	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/client"
-	"github.com/FDK0901/dureq/internal/dispatcher"
 	"github.com/FDK0901/dureq/internal/monitor"
 	"github.com/FDK0901/dureq/pkg/types"
 )
@@ -81,15 +81,12 @@ func TestWorkflow_LastTaskSkipped_Completes(t *testing.T) {
 func TestWorkflow_InitHook(t *testing.T) {
 	var c tally
 	cli := startTally(t, "tally.wf", &c, nil)
-	hook := func(id string) *types.WorkflowHookDef {
-		return &types.WorkflowHookDef{TaskType: "tally.wf", Payload: json.RawMessage(fmt.Sprintf(`{"id":%q}`, id))}
-	}
 	child := types.WorkflowTask{Name: "child", DependsOn: []string{"a"}, ChildWorkflowDef: &types.WorkflowDefinition{
-		Name: "inner", Tasks: []types.WorkflowTask{tallyTask("c1")}, Hooks: &types.WorkflowHooks{OnInit: hook("child-init"), OnExit: hook("child-exit")},
+		Name: "inner", Tasks: []types.WorkflowTask{tallyTask("c1")}, Hooks: &types.WorkflowHooks{OnInit: tallyHook("child-init"), OnExit: tallyHook("child-exit")},
 	}}
 	wf, err := cli.EnqueueWorkflow(context.Background(), types.WorkflowDefinition{
 		Name: "w", Tasks: []types.WorkflowTask{tallyTask("a"), child},
-		Hooks: &types.WorkflowHooks{OnInit: hook("init"), OnSuccess: hook("success"), OnExit: hook("exit")},
+		Hooks: &types.WorkflowHooks{OnInit: tallyHook("init"), OnSuccess: tallyHook("success"), OnExit: tallyHook("exit")},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -104,78 +101,80 @@ func TestWorkflow_InitHook(t *testing.T) {
 // A batch that was stopped with items pending and under way completes when it is retried,
 // and no item that succeeded runs again.
 func TestBatch_RetryOfStoppedBatch(t *testing.T) {
-	timeout := types.Duration(3 * time.Second)
-	for name, tc := range map[string]struct {
-		policy  types.BatchFailurePolicy
-		timeout *types.Duration
-		cancel  bool
-	}{
-		"fail fast": {policy: types.BatchFailFast},
-		"cancelled": {policy: types.BatchContinueOnError, cancel: true},
-		"timed out": {policy: types.BatchContinueOnError, timeout: &timeout},
-	} {
-		for how, retry := range map[string]func(cli *client.Client, api *monitor.APIService, id string) error{
-			"client": func(cli *client.Client, _ *monitor.APIService, id string) error {
-				_, err := cli.RetryBatch(context.Background(), id, true)
-				return err
-			},
-			"api": func(_ *client.Client, api *monitor.APIService, id string) error {
-				return api.RetryBatch(context.Background(), id, true)
-			},
-			"bulk": func(_ *client.Client, api *monitor.APIService, id string) error {
-				_, err := api.BulkRetryBatches(context.Background(), monitor.BulkRequest{IDs: []string{id}})
+	var c tally
+	var mu sync.Mutex
+	release := make(map[string]chan struct{})
+	cli := startTally(t, "tally.stop", &c, func(id string) error {
+		first := len(c.not(1, []string{id})) == 0
+		switch {
+		case strings.HasPrefix(id, "failfast") && kindOf(id) == "i002" && first:
+			return &types.NonRetryableError{Err: errBoom}
+		case kindOf(id) == "i004" && first: // is under way when the batch is stopped
+			mu.Lock()
+			ch := release[strings.TrimSuffix(id, "i004")]
+			mu.Unlock()
+			select {
+			case <-ch:
+			case <-time.After(20 * time.Second):
+			}
+		}
+		return nil
+	})
+	api := newAPI(t, cli)
+	ctx := context.Background()
+	for _, name := range []string{"failfast", "cancelled", "timeout"} {
+		for how, retry := range map[string]func(id string) error{
+			"client": func(id string) error { _, err := cli.RetryBatch(ctx, id, true); return err },
+			"api":    func(id string) error { return api.RetryBatch(ctx, id, true) },
+			"bulk": func(id string) error {
+				_, err := api.BulkRetryBatches(ctx, monitor.BulkRequest{IDs: []string{id}})
 				return err
 			},
 		} {
-			t.Run(name+" by "+how, func(t *testing.T) {
-				var c tally
-				release := make(chan struct{})
-				cli := startTally(t, "tally.stop", &c, func(id string) error {
-					first := len(c.not(1, []string{id})) == 0
-					switch {
-					case id == "i002" && first && name == "fail fast":
-						return &types.NonRetryableError{Err: errBoom}
-					case id == "i004" && first: // is under way when the batch is stopped
-						select {
-						case <-release:
-						case <-time.After(20 * time.Second):
-						}
-					}
-					return nil
-				})
+			p := name + "-" + how + "-"
+			ch := make(chan struct{})
+			mu.Lock()
+			release[p] = ch
+			mu.Unlock()
+			t.Run(p, func(t *testing.T) {
+				t.Parallel()
 				items, ids := batchItems(12)
-				batch, err := cli.EnqueueBatch(context.Background(), types.BatchDefinition{
-					Name: "stop", ItemTaskType: "tally.stop", Items: items, ChunkSize: 5, FailurePolicy: tc.policy, ExecutionTimeout: tc.timeout,
-				})
+				for i := range items {
+					ids[i] = p + items[i].ID
+					items[i].Payload = json.RawMessage(fmt.Sprintf(`{"id":%q}`, ids[i]))
+				}
+				def := types.BatchDefinition{Name: "stop", ItemTaskType: "tally.stop", Items: items, ChunkSize: 5, FailurePolicy: types.BatchContinueOnError}
+				switch name {
+				case "failfast":
+					def.FailurePolicy = types.BatchFailFast
+				case "timeout":
+					timeout := types.Duration(3 * time.Second)
+					def.ExecutionTimeout = &timeout
+				}
+				batch, err := cli.EnqueueBatch(ctx, def)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if tc.cancel {
-					waitFor(t, 10*time.Second, "i004 to run", func() bool { return len(c.not(1, []string{"i004"})) == 0 })
-					if err := cli.CancelBatch(context.Background(), batch.ID); err != nil {
+				if name == "cancelled" {
+					waitFor(t, 10*time.Second, "i004 to run", func() bool { return len(c.not(1, []string{p + "i004"})) == 0 })
+					if err := cli.CancelBatch(ctx, batch.ID); err != nil {
 						t.Fatal(err)
 					}
 				}
 				stopped := waitBatch(t, cli, batch.ID)
-				close(release)
+				close(ch)
 				time.Sleep(time.Second)
 				if stopped.Status == types.WorkflowStatusCompleted {
 					t.Fatalf("batch completed, want it stopped: %+v", stopped)
 				}
-
-				api := monitor.NewAPIService(cli.Store(), dispatcher.New(cli.Store(), nil), nil)
-				defer api.Shutdown()
-				if err := retry(cli, api, batch.ID); err != nil {
+				if err := retry(batch.ID); err != nil {
 					t.Fatalf("retry: %v", err)
 				}
 				var got *types.BatchInstance
-				deadline := time.Now().Add(12 * time.Second)
-				for time.Now().Before(deadline) {
-					got, _ = cli.GetBatch(context.Background(), batch.ID)
-					if got.Status.IsTerminal() {
+				for deadline := time.Now().Add(12 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+					if got, err = cli.GetBatch(ctx, batch.ID); err == nil && got.Status.IsTerminal() {
 						break
 					}
-					time.Sleep(50 * time.Millisecond)
 				}
 				if got.Status != types.WorkflowStatusCompleted || got.CompletedItems != 12 || got.RunningItems != 0 || got.PendingItems != 0 {
 					states := map[types.JobStatus]int{}
@@ -185,8 +184,8 @@ func TestBatch_RetryOfStoppedBatch(t *testing.T) {
 					t.Errorf("batch %s: %d completed, %d failed, %d running, %d pending; items %v", got.Status, got.CompletedItems, got.FailedItems, got.RunningItems, got.PendingItems, states)
 				}
 				want := map[string]int{}
-				if name == "fail fast" {
-					want["i002"] = 2 // failed, and retried
+				if name == "failfast" {
+					want[p+"i002"] = 2 // failed, and retried
 				}
 				if off := c.not(1, ids); !maps.Equal(off, want) {
 					t.Errorf("not run once: %v, want %v", off, want)
@@ -222,44 +221,41 @@ func TestWorkflow_TasksNextToSkippedOneRunOnce(t *testing.T) {
 
 // A task that is under way when the workflow fails, and done by the time it is retried.
 func TestWorkflow_RetryWithTaskUnderWay(t *testing.T) {
-	for how, retry := range map[string]func(cli *client.Client, api *monitor.APIService, id string) error{
-		"client": func(cli *client.Client, _ *monitor.APIService, id string) error {
-			_, err := cli.RetryWorkflow(context.Background(), id)
-			return err
-		},
-		"api": func(_ *client.Client, api *monitor.APIService, id string) error {
-			return api.RetryWorkflow(context.Background(), id)
-		},
-		"bulk": func(_ *client.Client, api *monitor.APIService, id string) error {
-			_, err := api.BulkRetryWorkflows(context.Background(), monitor.BulkRequest{IDs: []string{id}})
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		first := len(c.not(1, []string{id})) == 0
+		if kindOf(id) == "slow" {
+			time.Sleep(1500 * time.Millisecond)
+		}
+		if kindOf(id) == "bad" && first {
+			return &types.NonRetryableError{Err: errBoom}
+		}
+		return nil
+	})
+	api := newAPI(t, cli)
+	ctx := context.Background()
+	for how, retry := range map[string]func(id string) error{
+		"client": func(id string) error { _, err := cli.RetryWorkflow(ctx, id); return err },
+		"api":    func(id string) error { return api.RetryWorkflow(ctx, id) },
+		"bulk": func(id string) error {
+			_, err := api.BulkRetryWorkflows(ctx, monitor.BulkRequest{IDs: []string{id}})
 			return err
 		},
 	} {
 		t.Run(how, func(t *testing.T) {
-			var c tally
-			cli := startTally(t, "tally.wf", &c, func(id string) error {
-				first := len(c.not(1, []string{id})) == 0
-				if id == "slow" {
-					time.Sleep(1500 * time.Millisecond)
-				}
-				if id == "bad" && first {
-					return &types.NonRetryableError{Err: errBoom}
-				}
-				return nil
-			})
-			wf, err := cli.EnqueueWorkflow(context.Background(), types.WorkflowDefinition{Name: "w", Tasks: []types.WorkflowTask{tallyTask("slow"), tallyTask("bad"), tallyTask("join", "slow", "bad")}}, nil)
+			t.Parallel()
+			slow, bad, join := how+"-slow", how+"-bad", how+"-join"
+			wf, err := cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{Name: "w", Tasks: []types.WorkflowTask{tallyTask(slow), tallyTask(bad), tallyTask(join, slow, bad)}}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			waitWorkflow(t, cli, wf.ID, types.WorkflowStatusFailed)
 			time.Sleep(2500 * time.Millisecond)
-			api := monitor.NewAPIService(cli.Store(), dispatcher.New(cli.Store(), nil), nil)
-			defer api.Shutdown()
-			if err := retry(cli, api, wf.ID); err != nil {
+			if err := retry(wf.ID); err != nil {
 				t.Fatal(err)
 			}
 			waitWorkflow(t, cli, wf.ID, types.WorkflowStatusCompleted)
-			if off := c.not(1, []string{"slow", "join"}); len(off) > 0 {
+			if off := c.not(1, []string{slow, join}); len(off) > 0 {
 				t.Errorf("did not run once: %v", off)
 			}
 		})
@@ -293,61 +289,70 @@ func TestBatch_RetryAllItems(t *testing.T) {
 
 // The hooks start however a workflow ends.
 func TestWorkflow_HooksOfEveryEnd(t *testing.T) {
-	hook := func(id string) *types.WorkflowHookDef {
-		return &types.WorkflowHookDef{TaskType: "tally.wf", Payload: json.RawMessage(fmt.Sprintf(`{"id":%q}`, id))}
-	}
-	hooks := func() *types.WorkflowHooks {
-		return &types.WorkflowHooks{OnSuccess: hook("success"), OnFailure: hook("failure"), OnExit: hook("exit")}
-	}
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		switch kindOf(id) {
+		case "bad":
+			return &types.NonRetryableError{Err: errBoom}
+		case "slow":
+			time.Sleep(9 * time.Second)
+		}
+		return nil
+	})
 	timeout := types.Duration(2 * time.Second)
-	lenient := tallyTask("bad", "a")
-	lenient.AllowFailure = true
-	gated := tallyTask("gated", "a")
-	gated.Preconditions = []types.Precondition{{Type: "upstream_output", Task: "a", Path: "ok", Expected: "yes"}}
-	child := func(inner ...types.WorkflowTask) types.WorkflowTask {
-		return types.WorkflowTask{Name: "child", DependsOn: []string{"a"}, ChildWorkflowDef: &types.WorkflowDefinition{Name: "inner", Tasks: inner}}
+	completed, failed := types.WorkflowStatusCompleted, types.WorkflowStatusFailed
+	child := func(p string, kind string) types.WorkflowTask {
+		return childTask("child", types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + kind)}}, p+"a")
 	}
 	for name, tc := range map[string]struct {
-		def    types.WorkflowDefinition
+		def    func(p string) types.WorkflowDefinition
 		status types.WorkflowStatus
-		hooks  []string
 	}{
-		"last task":            {types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("a")}}, types.WorkflowStatusCompleted, []string{"success", "exit"}},
-		"failed task":          {types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("bad")}}, types.WorkflowStatusFailed, []string{"failure", "exit"}},
-		"allowed failure last": {types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("a"), lenient}}, types.WorkflowStatusCompleted, []string{"success", "exit"}},
-		"skipped last":         {types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("a"), gated}}, types.WorkflowStatusCompleted, []string{"success", "exit"}},
-		"child last":           {types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("a"), child(tallyTask("c"))}}, types.WorkflowStatusCompleted, []string{"success", "exit"}},
-		"child failed":         {types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("a"), child(tallyTask("bad"))}}, types.WorkflowStatusFailed, []string{"failure", "exit"}},
-		"timed out":            {types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask("slow")}, ExecutionTimeout: &timeout}, types.WorkflowStatusFailed, []string{"failure", "exit"}},
+		"last": {func(p string) types.WorkflowDefinition {
+			return types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "a")}}
+		}, completed},
+		"failed": {func(p string) types.WorkflowDefinition {
+			return types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "bad")}}
+		}, failed},
+		"allowed": {func(p string) types.WorkflowDefinition {
+			lenient := tallyTask(p+"bad", p+"a")
+			lenient.AllowFailure = true
+			return types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "a"), lenient}}
+		}, completed},
+		"skipped": {func(p string) types.WorkflowDefinition {
+			gated := tallyTask(p+"gated", p+"a")
+			gated.Preconditions = []types.Precondition{{Type: "upstream_output", Task: p + "a", Path: "ok", Expected: "yes"}}
+			return types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "a"), gated}}
+		}, completed},
+		"child": {func(p string) types.WorkflowDefinition {
+			return types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "a"), child(p, "c")}}
+		}, completed},
+		"childfailed": {func(p string) types.WorkflowDefinition {
+			return types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "a"), child(p, "bad")}}
+		}, failed},
+		"timeout": {func(p string) types.WorkflowDefinition {
+			return types.WorkflowDefinition{Tasks: []types.WorkflowTask{tallyTask(p + "slow")}, ExecutionTimeout: &timeout}
+		}, failed},
 	} {
 		t.Run(name, func(t *testing.T) {
-			var c tally
-			cli := startTally(t, "tally.wf", &c, func(id string) error {
-				switch id {
-				case "bad":
-					return &types.NonRetryableError{Err: errBoom}
-				case "slow":
-					time.Sleep(9 * time.Second)
-				}
-				return nil
-			})
-			tc.def.Name, tc.def.Hooks = "w", hooks()
-			wf, err := cli.EnqueueWorkflow(context.Background(), tc.def, nil)
+			t.Parallel()
+			p := name + "-"
+			def := tc.def(p)
+			def.Name, def.Hooks = "w", &types.WorkflowHooks{OnSuccess: tallyHook(p + "success"), OnFailure: tallyHook(p + "failure"), OnExit: tallyHook(p + "exit")}
+			wf, err := cli.EnqueueWorkflow(context.Background(), def, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			waitWorkflow(t, cli, wf.ID, tc.status)
 			time.Sleep(1500 * time.Millisecond)
-			var never []string
-			for _, h := range []string{"success", "failure", "exit"} {
-				if !slices.Contains(tc.hooks, h) {
-					never = append(never, h)
-				}
+			hook, other := p+"success", p+"failure"
+			if tc.status == failed {
+				hook, other = other, hook
 			}
-			if off := c.not(1, tc.hooks); len(off) > 0 {
+			if off := c.not(1, []string{hook, p + "exit"}); len(off) > 0 {
 				t.Errorf("hooks that did not run once: %v", off)
 			}
-			if off := c.not(0, never); len(off) > 0 {
+			if off := c.not(0, []string{other}); len(off) > 0 {
 				t.Errorf("hooks that ran: %v", off)
 			}
 		})
@@ -363,12 +368,9 @@ func TestWorkflow_HooksAfterRetry(t *testing.T) {
 		}
 		return nil
 	})
-	hook := func(id string) *types.WorkflowHookDef {
-		return &types.WorkflowHookDef{TaskType: "tally.wf", Payload: json.RawMessage(fmt.Sprintf(`{"id":%q}`, id))}
-	}
 	wf, err := cli.EnqueueWorkflow(context.Background(), types.WorkflowDefinition{
 		Name: "w", Tasks: []types.WorkflowTask{tallyTask("bad")},
-		Hooks: &types.WorkflowHooks{OnInit: hook("init"), OnSuccess: hook("success"), OnFailure: hook("failure"), OnExit: hook("exit")},
+		Hooks: &types.WorkflowHooks{OnInit: tallyHook("init"), OnSuccess: tallyHook("success"), OnFailure: tallyHook("failure"), OnExit: tallyHook("exit")},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -442,4 +444,120 @@ func TestWorkflow_RetryRunsTaskWithoutReuse(t *testing.T) {
 	if off := c.not(1, []string{"kept"}); len(off) > 0 {
 		t.Errorf("did not run once: %v", off)
 	}
+}
+
+// What is retried while it is still under way from before counts once it is done, whichever
+// of the two executions is done first.
+func TestRetry_WhileStillUnderWay(t *testing.T) {
+	var c tally
+	var mu sync.Mutex
+	gates := make(map[string][2]chan struct{}) // of the first and second execution
+	gate := func(id string) [2]chan struct{} {
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := gates[id]; !ok {
+			gates[id] = [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+		}
+		return gates[id]
+	}
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		n := 1
+		if len(c.not(1, []string{id})) == 0 {
+			n = 0
+		}
+		select { // not stopped by the cancellation
+		case <-gate(id)[n]:
+		case <-time.After(20 * time.Second):
+		}
+		return nil
+	})
+	ctx := context.Background()
+	for _, what := range []string{"batch", "workflow"} {
+		for _, stop := range []string{"cancelled", "timeout"} {
+			for _, first := range []string{"old", "new"} {
+				id := what + "-" + stop + "-" + first
+				t.Run(id, func(t *testing.T) {
+					t.Parallel()
+					var timeout *types.Duration
+					if stop == "timeout" {
+						d := types.Duration(15 * time.Second)
+						timeout = &d
+					}
+					var status func() types.WorkflowStatus
+					var cancel, retry func() error
+					if what == "batch" {
+						b, err := cli.EnqueueBatch(ctx, types.BatchDefinition{Name: id, ItemTaskType: "tally.wf", ExecutionTimeout: timeout,
+							Items: []types.BatchItem{{ID: "i", Payload: json.RawMessage(fmt.Sprintf(`{"id":%q}`, id))}}})
+						if err != nil {
+							t.Fatal(err)
+						}
+						status = func() types.WorkflowStatus { got, _ := cli.GetBatch(ctx, b.ID); return got.Status }
+						cancel = func() error {
+							if stop == "timeout" {
+								return expireBatch(cli, b.ID)
+							}
+							return cli.CancelBatch(ctx, b.ID)
+						}
+						retry = func() error { _, err := cli.RetryBatch(ctx, b.ID, true); return err }
+					} else {
+						wf, err := cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{Name: id, ExecutionTimeout: timeout, Tasks: []types.WorkflowTask{tallyTask(id)}}, nil)
+						if err != nil {
+							t.Fatal(err)
+						}
+						status = func() types.WorkflowStatus { got, _, _ := cli.Store().GetWorkflow(ctx, wf.ID); return got.Status }
+						cancel = func() error {
+							if stop == "timeout" {
+								return expireWorkflow(cli, wf.ID)
+							}
+							return cli.CancelWorkflow(ctx, wf.ID)
+						}
+						retry = func() error { _, err := cli.RetryWorkflow(ctx, wf.ID); return err }
+					}
+					waitFor(t, 10*time.Second, "first execution", func() bool { return len(c.not(1, []string{id})) == 0 })
+					if err := cancel(); err != nil {
+						t.Fatal(err)
+					}
+					waitFor(t, 14*time.Second, "stop", func() bool { return status().IsTerminal() })
+					if err := retry(); err != nil {
+						t.Fatal(err)
+					}
+					waitFor(t, 10*time.Second, "second execution", func() bool { return len(c.not(2, []string{id})) == 0 })
+					order := []int{0, 1}
+					if first == "new" {
+						order = []int{1, 0}
+					}
+					close(gate(id)[order[0]])
+					time.Sleep(700 * time.Millisecond)
+					close(gate(id)[order[1]])
+					waitFor(t, 10*time.Second, "retry to complete", func() bool { return status() == types.WorkflowStatusCompleted })
+				})
+			}
+		}
+	}
+}
+
+// expireWorkflow moves the deadline of a workflow to the past.
+func expireWorkflow(cli *client.Client, id string) error {
+	ctx := context.Background()
+	wf, _, err := cli.Store().GetWorkflow(ctx, id)
+	if err != nil {
+		return err
+	}
+	past := time.Now().Add(-time.Second)
+	wf.Deadline = &past
+	_, err = cli.Store().SaveWorkflow(ctx, wf)
+	return err
+}
+
+// expireBatch moves the deadline of a batch to the past.
+func expireBatch(cli *client.Client, id string) error {
+	ctx := context.Background()
+	batch, _, err := cli.Store().GetBatch(ctx, id)
+	if err != nil {
+		return err
+	}
+	past := time.Now().Add(-time.Second)
+	batch.Deadline = &past
+	_, err = cli.Store().SaveBatch(ctx, batch)
+	return err
 }

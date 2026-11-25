@@ -584,3 +584,66 @@ func TestWorkflow_HooksReservedButNotStarted_AreStarted(t *testing.T) {
 		t.Fatalf("dispatched %v, want each hook once", count)
 	}
 }
+
+// The end of an execution from before a retry, when the item is pending again: if it
+// succeeded, the item is done, and if it failed, it is still to be retried.
+func TestBatch_EndOfEarlierExecution(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	batch, jobs := reservedBatch(t, st, 3, 3)
+	finishJob(t, st, jobs[0], types.JobStatusCompleted)
+	finishJob(t, st, jobs[1], types.JobStatusDead)
+	finishJob(t, st, jobs[2], types.JobStatusPending)
+
+	stopped, rev, err := st.GetBatch(ctx, batch.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, state := range stopped.ItemStates {
+		state.Status = types.JobStatusCancelled
+		stopped.ItemStates[id] = state
+	}
+	ResetBatch(stopped, true, time.Now())
+	if _, err := st.UpdateBatch(ctx, stopped, rev); err != nil {
+		t.Fatal(err)
+	}
+
+	o := newTestOrchestrator(st)
+	if err := o.handleJobCompleted(ctx, completed(jobs[0])); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.handleJobFailed(ctx, types.JobEvent{Type: types.EventJobFailed, JobID: jobs[1].ID}); err != nil {
+		t.Fatal(err)
+	}
+	got := getBatch(t, st, batch.ID)
+	want := map[string]types.JobStatus{"i00": types.JobStatusCompleted, "i01": types.JobStatusRunning, "i02": types.JobStatusRunning}
+	for id, status := range want {
+		if got.ItemStates[id].Status != status {
+			t.Errorf("item %s is %s, want %s", id, got.ItemStates[id].Status, status)
+		}
+	}
+	if got.CompletedItems != 1 || got.FailedItems != 0 || got.RunningItems != 2 || got.PendingItems != 0 {
+		t.Errorf("%d completed, %d failed, %d running, %d pending", got.CompletedItems, got.FailedItems, got.RunningItems, got.PendingItems)
+	}
+}
+
+// The failure of an execution from before a retry does not fail what is retried.
+func TestWorkflow_FailureOfEarlierExecution(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	wf := newWorkflow(t, st, types.WorkflowDefinition{Name: "w", Tasks: []types.WorkflowTask{{Name: "a", TaskType: "t"}}})
+	job := ReserveRootTasks(wf, time.Now())[0]
+	finishJob(t, st, job, types.JobStatusDead)
+	wf.Status = types.WorkflowStatusCancelled
+	wf.Tasks["a"] = types.WorkflowTaskState{Name: "a", JobID: job.ID, Status: types.JobStatusCancelled}
+	ResetWorkflow(wf, time.Now())
+	if _, err := st.SaveWorkflow(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	if err := newTestOrchestrator(st).handleJobFailed(ctx, types.JobEvent{Type: types.EventJobFailed, JobID: job.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := getWorkflow(t, st, wf.ID); got.Status != types.WorkflowStatusRunning || got.Tasks["a"].Status != types.JobStatusPending {
+		t.Fatalf("workflow is %s, its task %s", got.Status, got.Tasks["a"].Status)
+	}
+}

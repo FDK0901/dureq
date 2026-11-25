@@ -315,6 +315,42 @@ func TestHistoryEvents_CompletedRun(t *testing.T) {
 	}
 }
 
+// Two jobs of one operation, like an execution and its retry: each has an event, a replay
+// of one has none, and the operation counts once.
+func TestCompleteRun_EventForEveryJob(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	complete := func(jobID, runID string) {
+		t.Helper()
+		run := &types.JobRun{ID: runID, JobID: jobID, Status: types.RunStatusSucceeded, StartedAt: time.Now()}
+		err := st.CompleteRun(context.Background(), &store.CompletionBatch{
+			Run: run, OperationKey: "op", DailyStatField: "processed",
+			Event:  types.JobEvent{Type: types.EventJobCompleted, JobID: jobID, RunID: runID, Timestamp: time.Now()},
+			Result: types.WorkResult{RunID: runID, JobID: jobID, Success: true},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	complete("old", "r1")
+	complete("old", "r1")  // again, after it was cut short
+	complete("old", "r1b") // another execution of the same job
+	complete("new", "r2")
+	for jobID, want := range map[string]int{"old": 1, "new": 1} {
+		var page eventPage
+		get(t, srv, "/api/history/events?job_id="+jobID, &page)
+		if page.Total != want {
+			t.Errorf("job %s has %d events, want %d", jobID, page.Total, want)
+		}
+	}
+	var days []struct {
+		Processed int `json:"processed"`
+	}
+	get(t, srv, "/api/stats/daily?days=1", &days)
+	if len(days) != 1 || days[0].Processed != 1 {
+		t.Errorf("daily stats %+v, want it to count once", days)
+	}
+}
+
 // A scan goes over more than one chunk of the stream, and over the time span asked for.
 func TestListJobEvents_LongStream(t *testing.T) {
 	st, _ := newTestAPI(t, nil)

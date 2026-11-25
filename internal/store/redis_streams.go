@@ -293,14 +293,17 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 	// Phase 1: Operation ledger commit (exactly-once gate).
 	// The ledger CAS is the atomic commit point. Phase 2 always runs for
 	// idempotent ops (result, history, cleanup, XACK). Non-idempotent ops
-	// (stats increment, event stream append) only run on first completion.
+	// (stats increment, event stream append) only run on first completion (of the
+	// operation, and of the job).
 	firstCompletion := true
+	firstOfJob := true
 	if batch.OperationKey != "" {
 		isNew, err := s.CompleteOperation(ctx, batch.OperationKey, batch.Run.ID, string(resultData))
 		if err != nil {
 			return fmt.Errorf("operation ledger commit: %w", err)
 		}
 		firstCompletion = isNew
+		firstOfJob = isNew || s.completedByOtherJob(ctx, batch.OperationKey, batch.Run.JobID)
 		if isNew {
 			if durErr := s.waitDurability(ctx); durErr != nil {
 				s.logger.Warn().Err(durErr).Msg("durability wait failed after ledger commit")
@@ -347,10 +350,11 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 		cmds = append(cmds, s.rdb.B().Expire().Key(statsKey).Seconds(int64((91 * 24 * time.Hour).Seconds())).Build())
 	}
 
-	// 5. Event stream — only on first completion to avoid duplicate events.
+	// 5. Event stream — only on first completion to avoid duplicate events, but for every
+	// job: whoever waits for this one does not see the event of the other.
 	// Crash recovery (different worker via XAUTOCLAIM) is handled by
 	// RepairCompletedOperation which has its own XADD.
-	if firstCompletion {
+	if firstOfJob {
 		cmds = append(cmds, s.rdb.B().Xadd().Key(EventsStreamKey(s.prefix)).
 			Maxlen().Almost().Threshold(strconv.FormatInt(s.cfg.EventStreamMaxLen, 10)).
 			Id("*").FieldValue().
@@ -384,7 +388,7 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 
 	// Pub/Sub notifications (no-slot) — only on first completion.
 	// Crash recovery notifications are handled by RepairCompletedOperation.
-	if firstCompletion {
+	if firstOfJob {
 		s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsPubSubChannel(s.prefix)).Message(string(eventData)).Build())
 		if batch.Event.BatchProgress != nil {
 			s.rdb.Do(ctx, s.rdb.B().Publish().Channel(EventsBatchChannel(s.prefix, batch.Event.BatchProgress.BatchID)).Message(string(eventData)).Build())
@@ -393,6 +397,20 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 	}
 
 	return nil
+}
+
+// completedByOtherJob reports whether an operation in the ledger was completed by a job other
+// than jobID: a retry that overlaps with the execution it retries is a job of its own.
+func (s *RedisStore) completedByOtherJob(ctx context.Context, opKey, jobID string) bool {
+	data, err := s.rdb.Do(ctx, s.rdb.B().Hget().Key(OperationLedgerKey(s.prefix, opKey)).Field("result").Build()).ToString()
+	if err != nil {
+		return false
+	}
+	var result types.WorkResult
+	if err := sonic.ConfigFastest.Unmarshal([]byte(data), &result); err != nil {
+		return false
+	}
+	return result.JobID != "" && result.JobID != jobID
 }
 
 // RepairCompletedOperation stores the result from the operation ledger, ACKs the

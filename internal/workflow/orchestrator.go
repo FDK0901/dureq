@@ -656,6 +656,11 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 			if state.Status.IsTerminal() {
 				return nil
 			}
+			// A task that a retry has put back to pending is to run again. (Clients of versions
+			// before v0.2.6 store what they start later, so in a first attempt it may be running.)
+			if state.Status == types.JobStatusPending && wf.Attempt > 1 {
+				return nil
+			}
 			if state.JobID != "" && state.JobID != event.JobID {
 				return nil
 			}

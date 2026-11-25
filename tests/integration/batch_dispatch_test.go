@@ -48,7 +48,7 @@ func (c *tally) not(n int, keys []string) map[string]int {
 func startTally(t *testing.T, taskType types.TaskType, c *tally, fail func(id string) error) *client.Client {
 	t.Helper()
 	flushDB(t)
-	srv := newServer(t, "tally-"+xid.New().String(), 20)
+	srv := newServer(t, "tally-"+xid.New().String(), 100)
 	srv.RegisterHandler(types.HandlerDefinition{TaskType: taskType, Handler: func(_ context.Context, payload json.RawMessage) error {
 		var p struct {
 			ID string `json:"id"`

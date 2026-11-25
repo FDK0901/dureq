@@ -676,6 +676,11 @@ func (s *RedisStore) ReenqueueWork(ctx context.Context, tierName string, wm *typ
 			fv = fv.FieldValue("headers", string(hdr))
 		}
 	}
+	if len(wm.ConcurrencyKeys) > 0 {
+		if ck, err := sonic.ConfigFastest.Marshal(wm.ConcurrencyKeys); err == nil {
+			fv = fv.FieldValue("concurrency_keys", string(ck))
+		}
+	}
 
 	_, err := s.rdb.Do(ctx, fv.Build()).ToString()
 

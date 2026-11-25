@@ -431,6 +431,45 @@ func TestCompleteRun_TriedAgain(t *testing.T) {
 	}
 }
 
+// A message that is queued again is the same afterwards.
+func TestWorkMessage_IsKeptAsItIs(t *testing.T) {
+	st, _ := newTestAPI(t, nil)
+	ctx := context.Background()
+	rdb := st.Client()
+	if err := st.EnsureStreams(ctx); err != nil {
+		t.Fatal(err)
+	}
+	key := store.WorkStreamKey(st.Prefix(), "normal")
+	read := func() rueidis.XRangeEntry {
+		t.Helper()
+		streams, err := rdb.Do(ctx, rdb.B().Xreadgroup().Group(store.ConsumerGroup, "n").Streams().Key(key).Id(">").Build()).AsXRead()
+		if err != nil || len(streams[key]) != 1 {
+			t.Fatalf("%d messages (%v), want 1", len(streams[key]), err)
+		}
+		return streams[key][0]
+	}
+	now := time.Now().Truncate(time.Millisecond).UTC()
+	work := types.WorkMessage{
+		RunID: "r", JobID: "j", TaskType: "t", Payload: json.RawMessage(`{"a":1}`), Attempt: 2, Deadline: now.Add(time.Hour), Priority: 7,
+		DispatchedAt: now, Version: "v", OperationKey: "op", Headers: map[string]string{"h": "x"},
+		ConcurrencyKeys: []types.ConcurrencyKey{{Key: "k", MaxConcurrency: 3}},
+	}
+	want, _ := json.Marshal(work)
+	same := func(what string, e rueidis.XRangeEntry) {
+		t.Helper()
+		wm := store.WorkMessageFromStreamValues(e.FieldValues)
+		wm.Deadline, wm.DispatchedAt = wm.Deadline.UTC(), wm.DispatchedAt.UTC()
+		if got, _ := json.Marshal(wm); string(got) != string(want) {
+			t.Errorf("%s:\n%s, want\n%s", what, got, want)
+		}
+	}
+
+	if err := st.ReenqueueWork(ctx, "normal", &work, 0); err != nil {
+		t.Fatal(err)
+	}
+	same("queued again", read())
+}
+
 // The dead letter queue keeps every job: for some it is all there is left of them.
 func TestDLQ_KeepsEveryJob(t *testing.T) {
 	st, _ := newTestAPI(t, nil)

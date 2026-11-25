@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -95,6 +96,22 @@ type JobFilter struct {
 	Sort     string  // "newest" or "oldest"
 	Limit    int
 	Offset   int
+}
+
+// PayloadQuery narrows down a search for jobs by payload. The zero value matches
+// every job.
+type PayloadQuery struct {
+	TaskType string            // only jobs of this task type
+	LiveOnly bool              // leave out completed, dead and cancelled jobs
+	Statuses []types.JobStatus // only jobs in one of these statuses
+	Limit    int               // at most this many jobs; 0 = no limit
+}
+
+func (q PayloadQuery) matches(job *types.Job) bool {
+	if q.LiveOnly && job.Status.IsTerminal() {
+		return false
+	}
+	return len(q.Statuses) == 0 || slices.Contains(q.Statuses, job.Status)
 }
 
 // ScheduleFilter specifies criteria for listing active schedules.
@@ -1959,6 +1976,7 @@ const jsonPathSearchChunkSize = 100
 // the given JSONPath + value, whatever its status. Uses RedisJSON's JSON.GET for
 // native path extraction.
 // If taskType is non-empty, only jobs of that type are scanned (via the by_task_type index).
+// Use FindJobsByPayloadPath to get all matching jobs, or only live ones.
 func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, value any, taskType string) (*types.Job, uint64, error) {
 	var found *types.Job
 	var rev uint64
@@ -1983,6 +2001,43 @@ func (s *RedisStore) FindJobByPayloadPath(ctx context.Context, jsonPath string, 
 		return nil, 0, err
 	}
 	return nil, 0, types.ErrJobNotFound
+}
+
+// FindJobsByPayloadPath returns the jobs whose Payload matches the given JSONPath
+// + value and that q selects, newest first. No match is not an error.
+func (s *RedisStore) FindJobsByPayloadPath(ctx context.Context, jsonPath string, value any, q PayloadQuery) ([]*types.Job, error) {
+	var jobs []*types.Job
+	err := s.scanJobsByPayloadPath(ctx, jsonPath, value, q.TaskType, func(ids []string) (bool, error) {
+		cmds := make(rueidis.Commands, 0, len(ids))
+		for _, id := range ids {
+			cmds = append(cmds, s.rdb.B().Hget().Key(JobKey(s.prefix, id)).Field("data").Build())
+		}
+		for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+			data, err := r.ToString()
+			if rueidis.IsRedisNil(err) {
+				continue // deleted in the meantime
+			}
+			if err != nil {
+				return false, fmt.Errorf("get job %s: %w", ids[i], err)
+			}
+			var job types.Job
+			if err := sonic.ConfigFastest.Unmarshal([]byte(data), &job); err != nil {
+				return false, fmt.Errorf("unmarshal job %s: %w", ids[i], err)
+			}
+			if !q.matches(&job) {
+				continue
+			}
+			jobs = append(jobs, &job)
+			if q.Limit > 0 && len(jobs) >= q.Limit {
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return jobs, nil
 }
 
 // scanJobsByPayloadPath passes the IDs of the jobs whose payload matches to visit,

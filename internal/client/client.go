@@ -666,6 +666,17 @@ func (c *Client) GetJobByParamJSONPathWithTaskType(ctx context.Context, path str
 	return job, nil
 }
 
+// GetJobsByParamJSONPath returns the jobs whose Payload matches the given path and
+// value and that q selects, newest first. No match is not an error. For example, all
+// live jobs of an event:
+//
+//	jobs, err := c.GetJobsByParamJSONPath(ctx, "event_id", "e-1", dureq.PayloadQuery{LiveOnly: true})
+//
+// Requires RedisJSON, like the other searches by payload.
+func (c *Client) GetJobsByParamJSONPath(ctx context.Context, path string, value any, q store.PayloadQuery) ([]*types.Job, error) {
+	return c.store.FindJobsByPayloadPath(ctx, path, value, q)
+}
+
 // GetWorkflowByParamJSONPath finds the first workflow where any task's Payload
 // matches the given JSONPath + value.
 func (c *Client) GetWorkflowByParamJSONPath(ctx context.Context, path string, value any) (*types.WorkflowInstance, error) {

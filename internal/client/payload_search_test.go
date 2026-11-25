@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -36,6 +38,91 @@ func storeJob(t *testing.T, cli *Client, id string, taskType types.TaskType, pay
 		CreatedAt: time.Now().Add(-age),
 	}); err != nil {
 		t.Fatalf("create job: %v", err)
+	}
+}
+
+func search(t *testing.T, cli *Client, path string, value any, q store.PayloadQuery) []string {
+	t.Helper()
+	jobs, err := cli.GetJobsByParamJSONPath(context.Background(), path, value, q)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	ids := []string{}
+	for _, job := range jobs {
+		ids = append(ids, job.ID)
+	}
+	return ids
+}
+
+func TestGetJobsByParamJSONPath_Selects(t *testing.T) {
+	cli := newSearchClient(t)
+	const event = `{"eventId":"e1"}`
+	for i, status := range []types.JobStatus{
+		types.JobStatusCancelled, types.JobStatusScheduled, types.JobStatusDead, types.JobStatusFailed,
+		types.JobStatusCompleted, types.JobStatusRunning, types.JobStatusPaused, types.JobStatusRetrying, types.JobStatusPending,
+	} {
+		storeJob(t, cli, string(status), "update", event, status, time.Duration(i)*time.Minute)
+	}
+	storeJob(t, cli, "other-type", "remind", event, types.JobStatusScheduled, time.Hour)
+	storeJob(t, cli, "other-event", "update", `{"eventId":"e2"}`, types.JobStatusScheduled, 0)
+	storeJob(t, cli, "no-event", "update", `{}`, types.JobStatusScheduled, 0)
+
+	for _, tc := range []struct {
+		name string
+		q    store.PayloadQuery
+		want []string // newest first
+	}{
+		{"everything", store.PayloadQuery{}, []string{"cancelled", "scheduled", "dead", "failed", "completed", "running", "paused", "retrying", "pending", "other-type"}},
+		{"of a task type", store.PayloadQuery{TaskType: "remind"}, []string{"other-type"}},
+		{"live", store.PayloadQuery{LiveOnly: true, TaskType: "update"}, []string{"scheduled", "failed", "running", "paused", "retrying", "pending"}},
+		{"statuses", store.PayloadQuery{Statuses: []types.JobStatus{types.JobStatusDead, types.JobStatusPaused}}, []string{"dead", "paused"}},
+		{"live and statuses", store.PayloadQuery{LiveOnly: true, Statuses: []types.JobStatus{types.JobStatusDead, types.JobStatusPaused}}, []string{"paused"}},
+		{"limit counts selected jobs", store.PayloadQuery{LiveOnly: true, Limit: 2}, []string{"scheduled", "failed"}},
+		{"nothing", store.PayloadQuery{TaskType: "unknown"}, []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := search(t, cli, "eventId", "e1", tc.q); !slices.Equal(got, tc.want) {
+				t.Fatalf("found %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// The single search is unchanged: the newest, whatever its status.
+	job, err := cli.GetJobByParamJSONPathWithTaskType(context.Background(), "eventId", "e1", "update")
+	if err != nil || job.ID != "cancelled" {
+		t.Fatalf("single search found %v, %v; want the cancelled job", job, err)
+	}
+}
+
+// Every matching job is found once, over many pages, also if they share a timestamp.
+func TestGetJobsByParamJSONPath_ManyJobs(t *testing.T) {
+	for _, sameTime := range []bool{false, true} {
+		t.Run(fmt.Sprintf("same timestamp %v", sameTime), func(t *testing.T) {
+			cli := newSearchClient(t)
+			ctx := context.Background()
+			now := time.Now()
+			want := 0
+			for i := range 350 {
+				job := &types.Job{
+					ID: fmt.Sprintf("job-%03d", i), TaskType: "update", Status: types.JobStatusScheduled,
+					Payload: json.RawMessage(fmt.Sprintf(`{"n":%d}`, i%7)), CreatedAt: now,
+				}
+				if !sameTime {
+					job.CreatedAt = now.Add(time.Duration(i) * time.Millisecond)
+				}
+				if i%7 == 3 {
+					want++
+				}
+				if _, err := cli.Store().CreateJob(ctx, job); err != nil {
+					t.Fatalf("create job: %v", err)
+				}
+			}
+			got := search(t, cli, "n", 3, store.PayloadQuery{TaskType: "update"})
+			unique := slices.Compact(slices.Sorted(slices.Values(got)))
+			if len(got) != want || len(unique) != want {
+				t.Fatalf("found %d jobs, %d of them different; want %d", len(got), len(unique), want)
+			}
+		})
 	}
 }
 
@@ -79,6 +166,9 @@ func TestPayloadSearch_SkipsVanishedJob(t *testing.T) {
 	if err != nil || job.ID != "kept" {
 		t.Fatalf("found %v, %v; want the job that is left", job, err)
 	}
+	if got := search(t, cli, "eventId", "e1", store.PayloadQuery{}); !slices.Equal(got, []string{"kept"}) {
+		t.Fatalf("found %v", got)
+	}
 }
 
 // A search that fails says so instead of finding nothing: the caller might create the
@@ -91,5 +181,8 @@ func TestPayloadSearch_ReportsErrors(t *testing.T) {
 
 	if _, err := cli.GetJobByParamJSONPath(ctx, "eventId", "e1"); err == nil || errors.Is(err, types.ErrJobNotFound) {
 		t.Fatalf("single search err = %v, want the failure", err)
+	}
+	if _, err := cli.GetJobsByParamJSONPath(ctx, "eventId", "e1", store.PayloadQuery{}); err == nil {
+		t.Fatal("no error")
 	}
 }

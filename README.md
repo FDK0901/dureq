@@ -134,7 +134,7 @@ Client (Go)
 - **Web Dashboard** — React-based UI (durequi) with real-time WebSocket updates
 - **Terminal UI** — Interactive TUI (dureqctl) for cluster monitoring
 - **Monitoring APIs** — HTTP REST, gRPC, and WebSocket for full cluster observability
-- **Payload Search** — JSONPath-based search across jobs, workflows, and batches
+- **Payload Search** — JSONPath-based search across jobs, workflows, and batches; `GetJobsByParamJSONPath` returns all matching jobs, optionally only live ones
 - **Multi-Tenancy** — Key prefix isolation per tenant
 
 ### Execution Guarantees

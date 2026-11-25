@@ -244,9 +244,7 @@ func (s *RedisStore) SaveJob(ctx context.Context, job *types.Job) (uint64, error
 	}
 
 	oldData, ver := parseSaveJobResult(result)
-	s.updateJobIndexes(ctx, job, oldData)
-	s.updateJobAssociationIndexes(ctx, job)
-	s.mirrorJobPayload(ctx, job) // best-effort JSON mirror for JSONPath search
+	s.saveJobIndexes(ctx, job, oldData, false)
 	return ver, nil
 }
 
@@ -270,10 +268,7 @@ func (s *RedisStore) CreateJob(ctx context.Context, job *types.Job) (uint64, err
 		return 0, fmt.Errorf("create job: %w", err)
 	}
 
-	// Add all indexes (no old data to diff against).
-	s.addJobIndexes(ctx, job)
-	s.updateJobAssociationIndexes(ctx, job)
-	s.mirrorJobPayload(ctx, job) // best-effort JSON mirror for JSONPath search
+	s.saveJobIndexes(ctx, job, "", false)
 	return 1, nil
 }
 
@@ -299,7 +294,29 @@ func (s *RedisStore) JobsExist(ctx context.Context, ids []string) ([]bool, error
 
 // GetJob retrieves a job by ID.
 func (s *RedisStore) GetJob(ctx context.Context, jobID string) (*types.Job, uint64, error) {
-	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(JobKey(s.prefix, jobID)).Build()).AsStrMap()
+	return parseJob(s.rdb.Do(ctx, s.getJobCmd(jobID)))
+}
+
+// GetJobAndIfScheduled retrieves a job by ID, and reports whether it has a schedule.
+func (s *RedisStore) GetJobAndIfScheduled(ctx context.Context, jobID string) (job *types.Job, rev uint64, scheduled bool, err error) {
+	results := s.rdb.DoMulti(ctx, s.getJobCmd(jobID), s.rdb.B().Exists().Key(ScheduleKey(s.prefix, jobID)).Build())
+	job, rev, err = parseJob(results[0])
+	if err != nil {
+		return nil, 0, false, err
+	}
+	n, err := results[1].AsInt64()
+	if err != nil {
+		return nil, 0, false, fmt.Errorf("get schedule: %w", err)
+	}
+	return job, rev, n > 0, nil
+}
+
+func (s *RedisStore) getJobCmd(jobID string) rueidis.Completed {
+	return s.rdb.B().Hgetall().Key(JobKey(s.prefix, jobID)).Build()
+}
+
+func parseJob(r rueidis.RedisResult) (*types.Job, uint64, error) {
+	result, err := r.AsStrMap()
 	if err != nil {
 		return nil, 0, fmt.Errorf("get job: %w", err)
 	}
@@ -359,13 +376,7 @@ func (s *RedisStore) UpdateJob(ctx context.Context, job *types.Job, expectedRev 
 		}
 	}
 
-	s.updateJobIndexes(ctx, job, oldData)
-	s.updateJobAssociationIndexes(ctx, job)
-	s.mirrorJobPayload(ctx, job) // best-effort JSON mirror for JSONPath search
-
-	// Append audit trail entry for the state transition.
-	s.appendJobAudit(ctx, job.ID, job.Status, job.LastError)
-
+	s.saveJobIndexes(ctx, job, oldData, true)
 	return ver, nil
 }
 
@@ -559,12 +570,28 @@ func (s *RedisStore) ListSchedules(ctx context.Context) ([]*types.ScheduleEntry,
 
 // SaveRun upserts a job run and maintains the active set and by-job index.
 func (s *RedisStore) SaveRun(ctx context.Context, run *types.JobRun) (uint64, error) {
+	cmds, err := s.runCmds(run)
+	if err != nil {
+		return 0, err
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+	for _, r := range results {
+		if err := r.Error(); err != nil {
+			return 0, fmt.Errorf("save run: %w", err)
+		}
+	}
+	ver, _ := results[1].AsInt64()
+	return uint64(ver), nil
+}
+
+// runCmds returns the commands that upsert a job run. The second one gives its version.
+func (s *RedisStore) runCmds(run *types.JobRun) (rueidis.Commands, error) {
 	data, err := sonic.ConfigFastest.Marshal(run)
 	if err != nil {
-		return 0, fmt.Errorf("marshal run: %w", err)
+		return nil, fmt.Errorf("marshal run: %w", err)
 	}
 
-	cmds := make(rueidis.Commands, 0, 6)
+	cmds := make(rueidis.Commands, 0, 8)
 	cmds = append(cmds, s.rdb.B().Hset().Key(RunKey(s.prefix, run.ID)).FieldValue().FieldValue("data", string(data)).Build())
 	cmds = append(cmds, s.rdb.B().Hincrby().Key(RunKey(s.prefix, run.ID)).Field("_version").Increment(1).Build())
 
@@ -575,16 +602,7 @@ func (s *RedisStore) SaveRun(ctx context.Context, run *types.JobRun) (uint64, er
 		cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveKey(s.prefix)).Member(run.ID).Build())
 		cmds = append(cmds, s.rdb.B().Srem().Key(RunsActiveByJobKey(s.prefix, run.JobID)).Member(run.ID).Build())
 	}
-	cmds = append(cmds, s.rdb.B().Zadd().Key(RunsByJobKey(s.prefix, run.JobID)).ScoreMember().ScoreMember(float64(run.StartedAt.UnixNano()), run.ID).Build())
-
-	results := s.rdb.DoMulti(ctx, cmds...)
-	for _, r := range results {
-		if err := r.Error(); err != nil {
-			return 0, fmt.Errorf("save run: %w", err)
-		}
-	}
-	ver, _ := results[1].AsInt64()
-	return uint64(ver), nil
+	return append(cmds, s.rdb.B().Zadd().Key(RunsByJobKey(s.prefix, run.JobID)).ScoreMember().ScoreMember(float64(run.StartedAt.UnixNano()), run.ID).Build()), nil
 }
 
 // GetRun retrieves a job run by ID.
@@ -680,10 +698,14 @@ func (s *RedisStore) RequestCancel(ctx context.Context, runID string) error {
 	return nil
 }
 
+// CancelRequestedCmd returns the command that gives 1 if the cancel flag of a run is set.
+func (s *RedisStore) CancelRequestedCmd(runID string) rueidis.Completed {
+	return s.rdb.B().Exists().Key(CancelFlagKey(s.prefix, runID)).Build()
+}
+
 // IsCancelRequested checks the durable cancel flag for a run.
 func (s *RedisStore) IsCancelRequested(ctx context.Context, runID string) (bool, error) {
-	flagKey := CancelFlagKey(s.prefix, runID)
-	result := s.rdb.Do(ctx, s.rdb.B().Exists().Key(flagKey).Build())
+	result := s.rdb.Do(ctx, s.CancelRequestedCmd(runID))
 	count, err := result.AsInt64()
 	if err != nil {
 		return false, err
@@ -1528,6 +1550,9 @@ func (s *RedisStore) GetHistoryRun(ctx context.Context, runID string) (*types.Jo
 // Cleanup
 // ============================================================
 
+// jobIndexTimeout bounds the upkeep of what is derived from a job.
+const jobIndexTimeout = 5 * time.Second
+
 const cleanupChunkSize = 500
 
 // Cleanup removes the runs that finished before olderThan from the run history, and
@@ -1710,84 +1735,59 @@ func (s *RedisStore) hydrateBatches(ctx context.Context, ids []string) ([]*types
 // Internal helpers
 // ============================================================
 
-func (s *RedisStore) updateJobAssociationIndexes(ctx context.Context, job *types.Job) {
+// jobAssociationCmds returns the commands that index a job by its workflow or batch.
+func (s *RedisStore) jobAssociationCmds(job *types.Job) rueidis.Commands {
 	score := float64(job.CreatedAt.UnixNano())
+	var cmds rueidis.Commands
 	if job.WorkflowID != nil && *job.WorkflowID != "" {
-		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByWorkflowKey(s.prefix, *job.WorkflowID)).ScoreMember().ScoreMember(score, job.ID).Build())
+		cmds = append(cmds, s.rdb.B().Zadd().Key(JobsByWorkflowKey(s.prefix, *job.WorkflowID)).ScoreMember().ScoreMember(score, job.ID).Build())
 	}
 	if job.BatchID != nil && *job.BatchID != "" {
-		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByBatchKey(s.prefix, *job.BatchID)).ScoreMember().ScoreMember(score, job.ID).Build())
+		cmds = append(cmds, s.rdb.B().Zadd().Key(JobsByBatchKey(s.prefix, *job.BatchID)).ScoreMember().ScoreMember(score, job.ID).Build())
 	}
+	return cmds
 }
 
-// addJobIndexes adds all secondary indexes for a newly created job.
-func (s *RedisStore) addJobIndexes(ctx context.Context, job *types.Job) {
+// jobIndexCmds returns the commands that add a job to its secondary indexes.
+func (s *RedisStore) jobIndexCmds(job *types.Job) rueidis.Commands {
 	score := float64(job.CreatedAt.UnixNano())
-	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByCreatedKey(s.prefix)).ScoreMember().ScoreMember(score, job.ID).Build())
-	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
-	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
+	cmds := make(rueidis.Commands, 0, 8+len(job.Tags))
+	cmds = append(cmds, s.rdb.B().Zadd().Key(JobsByCreatedKey(s.prefix)).ScoreMember().ScoreMember(score, job.ID).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
+	cmds = append(cmds, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
 	for _, tag := range job.Tags {
-		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, tag)).ScoreMember().ScoreMember(score, job.ID).Build())
+		cmds = append(cmds, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, tag)).ScoreMember().ScoreMember(score, job.ID).Build())
 	}
+	return append(cmds, s.jobAssociationCmds(job)...)
 }
 
-// updateJobIndexes diffs old and new job data and updates secondary indexes accordingly.
-func (s *RedisStore) updateJobIndexes(ctx context.Context, job *types.Job, oldDataStr string) {
-	score := float64(job.CreatedAt.UnixNano())
+// saveJobIndexes brings everything that is derived from a job up to date: its secondary
+// indexes, the mirror of its payload, and, unless audit is false, its audit trail.
+// oldDataStr is the job as it was stored before, or empty. The job itself is stored by now,
+// so this is done even if the context has ended.
+func (s *RedisStore) saveJobIndexes(ctx context.Context, job *types.Job, oldDataStr string, audit bool) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jobIndexTimeout)
+	defer cancel()
 
-	// Always ensure by_created is current.
-	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByCreatedKey(s.prefix)).ScoreMember().ScoreMember(score, job.ID).Build())
-
-	if oldDataStr == "" {
-		// No previous data — add all indexes as new.
-		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
-		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
-		for _, tag := range job.Tags {
-			s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, tag)).ScoreMember().ScoreMember(score, job.ID).Build())
-		}
-		return
-	}
-
+	cmds := append(s.jobIndexCmds(job), s.mirrorJobPayloadCmd(job)) // best-effort JSON mirror for JSONPath search
 	var old types.Job
-	if sonic.ConfigFastest.Unmarshal([]byte(oldDataStr), &old) != nil {
-		// Can't parse old data — just add new indexes.
-		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
-		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
-		for _, tag := range job.Tags {
-			s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, tag)).ScoreMember().ScoreMember(score, job.ID).Build())
+	if oldDataStr != "" && sonic.ConfigFastest.Unmarshal([]byte(oldDataStr), &old) == nil {
+		if old.Status != job.Status {
+			cmds = append(cmds, s.rdb.B().Zrem().Key(JobsByStatusKey(s.prefix, string(old.Status))).Member(job.ID).Build())
 		}
-		return
-	}
-
-	// Status index diff.
-	if old.Status != job.Status {
-		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByStatusKey(s.prefix, string(old.Status))).Member(job.ID).Build())
-	}
-	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByStatusKey(s.prefix, string(job.Status))).ScoreMember().ScoreMember(score, job.ID).Build())
-
-	// TaskType index diff.
-	if old.TaskType != job.TaskType {
-		s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByTaskTypeKey(s.prefix, string(old.TaskType))).Member(job.ID).Build())
-	}
-	s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTaskTypeKey(s.prefix, string(job.TaskType))).ScoreMember().ScoreMember(score, job.ID).Build())
-
-	// Tags index diff.
-	oldTags := make(map[string]bool, len(old.Tags))
-	for _, t := range old.Tags {
-		oldTags[t] = true
-	}
-	newTags := make(map[string]bool, len(job.Tags))
-	for _, t := range job.Tags {
-		newTags[t] = true
-	}
-	for t := range oldTags {
-		if !newTags[t] {
-			s.rdb.Do(ctx, s.rdb.B().Zrem().Key(JobsByTagKey(s.prefix, t)).Member(job.ID).Build())
+		if old.TaskType != job.TaskType {
+			cmds = append(cmds, s.rdb.B().Zrem().Key(JobsByTaskTypeKey(s.prefix, string(old.TaskType))).Member(job.ID).Build())
+		}
+		for _, tag := range old.Tags {
+			if !slices.Contains(job.Tags, tag) {
+				cmds = append(cmds, s.rdb.B().Zrem().Key(JobsByTagKey(s.prefix, tag)).Member(job.ID).Build())
+			}
 		}
 	}
-	for _, t := range job.Tags {
-		s.rdb.Do(ctx, s.rdb.B().Zadd().Key(JobsByTagKey(s.prefix, t)).ScoreMember().ScoreMember(score, job.ID).Build())
+	if audit {
+		cmds = append(cmds, s.jobAuditCmd(job.ID, job.Status, job.LastError))
 	}
+	s.rdb.DoMulti(ctx, cmds...)
 
 	// Clean old unique key if changed.
 	if old.UniqueKey != nil && *old.UniqueKey != "" {
@@ -1912,16 +1912,14 @@ func WorkMessageFromStreamValues(values map[string]string) types.WorkMessage {
 // RedisJSON payload mirrors — best-effort writes for JSONPath search
 // ============================================================
 
-// mirrorJobPayload stores the job's Payload as a RedisJSON document for JSONPath queries.
-// Uses a detached context so it never steals deadline budget from the caller.
-func (s *RedisStore) mirrorJobPayload(_ context.Context, job *types.Job) {
-	bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+// mirrorJobPayloadCmd returns the command that stores the job's Payload as a RedisJSON
+// document for JSONPath queries.
+func (s *RedisStore) mirrorJobPayloadCmd(job *types.Job) rueidis.Completed {
 	payload := job.Payload
 	if len(payload) == 0 {
 		payload = json.RawMessage("{}")
 	}
-	s.rdb.Do(bgCtx, s.rdb.B().JsonSet().Key(JobPayloadKey(s.prefix, job.ID)).Path("$").Value(string(payload)).Build())
+	return s.rdb.B().JsonSet().Key(JobPayloadKey(s.prefix, job.ID)).Path("$").Value(string(payload)).Build()
 }
 
 // mirrorWorkflowPayloads stores all task payloads from a workflow definition as a JSON array.
@@ -2380,16 +2378,14 @@ func (s *RedisStore) DeleteSignalStream(ctx context.Context, workflowID string) 
 
 const auditStreamMaxLen = 1000
 
-// appendJobAudit records a state transition in the per-job audit stream.
-func (s *RedisStore) appendJobAudit(ctx context.Context, jobID string, status types.JobStatus, lastError *string) {
-	key := JobAuditKey(s.prefix, jobID)
+// jobAuditCmd returns the command that appends a state transition to a job's audit trail.
+func (s *RedisStore) jobAuditCmd(jobID string, status types.JobStatus, lastError *string) rueidis.Completed {
 	errVal := ""
 	if lastError != nil {
 		errVal = *lastError
 	}
-	cmd := s.rdb.B().Xadd().Key(key).Maxlen().Almost().Threshold(strconv.FormatInt(auditStreamMaxLen, 10)).Id("*").
+	return s.rdb.B().Xadd().Key(JobAuditKey(s.prefix, jobID)).Maxlen().Almost().Threshold(strconv.FormatInt(auditStreamMaxLen, 10)).Id("*").
 		FieldValue().FieldValue("status", string(status)).FieldValue("error", errVal).FieldValue("ts", time.Now().Format(time.RFC3339Nano)).Build()
-	s.rdb.Do(ctx, cmd)
 }
 
 // AuditEntry represents a single state transition in a job's audit trail.

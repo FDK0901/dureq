@@ -51,6 +51,8 @@ type streamMessage struct {
 	StreamMsgID  string
 	TierName     string
 	Redeliveries int
+
+	completed bool // CompleteRun has been called
 }
 
 // maxRedeliveries is the limit before a message with no handler is sent to DLQ.
@@ -664,7 +666,7 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	// Prevents duplicate execution when XAUTOCLAIM reclaims a message
 	// while the original worker's handler is still running.
 	lockOwner := fmt.Sprintf("%s:%d", w.nodeID, time.Now().UnixNano())
-	rl, lockErr := w.locker.Lock(w.ctx, "run:"+work.RunID, lockOwner)
+	rl, cancelFlag, lockErr := w.locker.LockAndDo(w.ctx, "run:"+work.RunID, lockOwner, w.store.CancelRequestedCmd(work.RunID))
 	if lockErr != nil {
 		if errors.Is(lockErr, types.ErrLockFailed) {
 			// Don't ack: this may be the very entry the lock holder is executing,
@@ -724,14 +726,19 @@ func (w *Worker) processMessage(sm *streamMessage) {
 	// --- Durable cancel check (before handler start) ---
 	// If a cancel was requested while this message was pending (e.g., worker was offline),
 	// skip execution immediately.
-	if cancelled, _ := w.store.IsCancelRequested(w.ctx, work.RunID); cancelled {
+	if n, _ := cancelFlag.AsInt64(); n > 0 {
 		w.logger.Info().String("run_id", work.RunID).Msg("worker: cancel flag set before handler start, skipping")
 		w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID)
 		w.store.ClearCancelFlag(w.ctx, work.RunID)
 		return
 	}
-	// Clean up cancel flag when the run finishes (regardless of outcome).
-	defer w.store.ClearCancelFlag(w.ctx, work.RunID)
+	// Clean up cancel flag when the run finishes (regardless of outcome). CompleteRun has
+	// done so by then.
+	defer func() {
+		if !sm.completed {
+			w.store.ClearCancelFlag(w.ctx, work.RunID)
+		}
+	}()
 
 	now := time.Now()
 
@@ -750,7 +757,15 @@ func (w *Worker) processMessage(sm *streamMessage) {
 
 		OperationKey: work.OperationKey,
 	}
-	w.store.SaveRun(w.ctx, run)
+	w.disp.StartRun(w.ctx, run, types.JobEvent{
+		Type:      types.EventJobStarted,
+		JobID:     work.JobID,
+		RunID:     work.RunID,
+		NodeID:    w.nodeID,
+		TaskType:  work.TaskType,
+		Attempt:   work.Attempt,
+		Timestamp: now,
+	})
 
 	w.submitted.Add(1)
 	defer func() {
@@ -772,17 +787,6 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		defer hbWg.Done()
 		w.runHeartbeat(hbCtx, run, &runMu, work.OperationKey, sm)
 	}()
-
-	// Publish started event.
-	w.disp.PublishEvent(types.JobEvent{
-		Type:      types.EventJobStarted,
-		JobID:     work.JobID,
-		RunID:     work.RunID,
-		NodeID:    w.nodeID,
-		TaskType:  work.TaskType,
-		Attempt:   work.Attempt,
-		Timestamp: now,
-	})
 
 	// Set up execution context with deadline.
 	// Dynamic config overrides take precedence over static handler config.
@@ -1092,6 +1096,7 @@ func (w *Worker) onSuccessContinueAsNew(sm *streamMessage, work types.WorkMessag
 	}
 
 	syncRetrySave(w.syncer, func() error { return w.store.CompleteRun(w.ctx, batch) }, fmt.Sprintf("complete run %s (continue-as-new)", run.ID))
+	sm.completed = true
 
 	// Retryable GetJob + UpdateJob as a unit to prevent stuck jobs.
 	var hasWorkflow bool
@@ -1153,13 +1158,14 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 	}
 
 	syncRetrySave(w.syncer, func() error { return w.store.CompleteRun(w.ctx, batch) }, fmt.Sprintf("complete run %s", run.ID))
+	sm.completed = true
 
 	// Update job state as a retryable unit. GetJob + UpdateJob are wrapped
 	// together so a transient GetJob failure doesn't leave the job stuck in
 	// "running" with no active run (which orphan recovery can't find).
 	var jobForPostUpdate *types.Job
 	syncRetrySave(w.syncer, func() error {
-		job, rev, err := w.store.GetJob(w.ctx, work.JobID)
+		job, rev, scheduled, err := w.store.GetJobAndIfScheduled(w.ctx, work.JobID)
 		if err != nil {
 			return fmt.Errorf("get job: %w", err)
 		}
@@ -1175,8 +1181,7 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 		job.ConsecutiveErrors = 0
 		job.UpdatedAt = now
 
-		_, _, schedErr := w.store.GetSchedule(w.ctx, work.JobID)
-		if schedErr == nil {
+		if scheduled {
 			job.Status = types.JobStatusScheduled
 		} else {
 			job.Status = types.JobStatusCompleted

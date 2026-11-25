@@ -57,10 +57,25 @@ func NewLocker(cfg LockerConfig) *Locker {
 // Lock acquires a distributed lock for the given key.
 // Returns a RedisLock that must be Unlock'd when done.
 func (l *Locker) Lock(ctx context.Context, key, owner string) (*RedisLock, error) {
+	return l.newLock(key, owner, l.rdb.Do(ctx, l.lockCmd(key, owner)))
+}
+
+// LockAndDo is Lock, and in the same round trip it runs cmd, whose result it returns, too.
+func (l *Locker) LockAndDo(ctx context.Context, key, owner string, cmd rueidis.Completed) (*RedisLock, rueidis.RedisResult, error) {
+	results := l.rdb.DoMulti(ctx, l.lockCmd(key, owner), cmd)
+	rl, err := l.newLock(key, owner, results[0])
+	return rl, results[1], err
+}
+
+func (l *Locker) lockCmd(key, owner string) rueidis.Completed {
+	return l.rdb.B().Set().Key(store.LockKey(l.prefix, key)).Value(owner).Nx().Ex(l.lockTTL).Build()
+}
+
+// newLock returns the lock that lockCmd has acquired, if it has.
+func (l *Locker) newLock(key, owner string, result rueidis.RedisResult) (*RedisLock, error) {
 	fullKey := store.LockKey(l.prefix, key)
 
-	err := l.rdb.Do(ctx, l.rdb.B().Set().Key(fullKey).Value(owner).Nx().Ex(l.lockTTL).Build()).Error()
-	if err != nil {
+	if err := result.Error(); err != nil {
 		if rueidis.IsRedisNil(err) {
 			return nil, types.ErrLockFailed
 		}

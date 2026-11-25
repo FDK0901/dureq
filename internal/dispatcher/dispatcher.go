@@ -156,6 +156,18 @@ func (d *Dispatcher) PublishEvent(event types.JobEvent) {
 	d.hooks.Fire(ctx, event)
 }
 
+// StartRun stores a run that starts and publishes the event of that, like PublishEvent.
+func (d *Dispatcher) StartRun(ctx context.Context, run *types.JobRun, event types.JobEvent) {
+	if err := d.store.StartRun(ctx, run, event); err != nil {
+		d.logger.Warn().
+			String("job_id", run.JobID).
+			String("run_id", run.ID).
+			Err(err).
+			Msg("failed to save started run")
+	}
+	d.hooks.Fire(ctx, event)
+}
+
 // PublishResult stores a completion result and notifies waiting clients.
 func (d *Dispatcher) PublishResult(result types.WorkResult) {
 	ctx := context.Background()

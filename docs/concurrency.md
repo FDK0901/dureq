@@ -108,6 +108,20 @@ srv.RegisterHandler(types.HandlerDefinition{
 })
 ```
 
+A node takes its messages in order. If the next one is of a handler whose limit is reached, it waits for that one,
+and those behind it wait, too. Give a slow handler with a small limit a tier, or a node, of its own.
+
+## Throughput
+
+A node runs up to `MaxConcurrency` jobs (100 by default) and takes the next one as soon as one is done. What to look
+at if it should do more:
+
+- **`MaxConcurrency`**: for jobs that mostly wait, such as for other services, raise it.
+- **`FetchBatch`** of a tier (10 by default): how many messages a node takes at once. With many short jobs and a
+  larger value, it asks Redis less often. With a smaller one, a few jobs are spread more evenly over several nodes.
+- **Redis**: a job takes about ten round trips one after the other, so the latency to Redis counts for short jobs. To
+  measure it, see `bench/`.
+
 The overall pool size is set via `WithMaxConcurrency` (default: 100).
 
 ## Re-enqueue on Blocked

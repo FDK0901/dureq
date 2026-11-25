@@ -594,6 +594,45 @@ func (s *RedisStore) RepairCompletedOperation(ctx context.Context, jobID, tierNa
 
 // AddDelayed adds a work message to the delayed sorted set for future re-dispatch.
 func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.WorkMessage, executeAt time.Time) error {
+	data, err := delayedMessage(tierName, wm)
+	if err != nil {
+		return err
+	}
+
+	return s.rdb.Do(ctx, s.rdb.B().Zadd().Key(DelayedKey(s.prefix, tierName)).ScoreMember().ScoreMember(float64(executeAt.UnixNano()), string(data)).Build()).Error()
+}
+
+// PostponedMessage is a message that a worker has taken from a work stream and cannot process
+// for now.
+type PostponedMessage struct {
+	Work      *types.WorkMessage
+	MessageID string
+	Until     time.Time
+}
+
+// Postpone moves messages from the work stream of a tier to its delayed sorted set.
+func (s *RedisStore) Postpone(ctx context.Context, tierName string, msgs []PostponedMessage) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	args := make([]string, 0, 1+3*len(msgs))
+	args = append(args, ConsumerGroup)
+	for _, m := range msgs {
+		data, err := delayedMessage(tierName, m.Work)
+		if err != nil {
+			return err
+		}
+		args = append(args, strconv.FormatFloat(float64(m.Until.UnixNano()), 'f', 0, 64), string(data), m.MessageID)
+	}
+	keys := []string{DelayedKey(s.prefix, tierName), WorkStreamKey(s.prefix, tierName)}
+	if err := s.scriptPostpone.Exec(ctx, s.rdb, keys, args).Error(); err != nil {
+		return fmt.Errorf("postpone: %w", err)
+	}
+	return nil
+}
+
+// delayedMessage returns a work message as it is stored in the delayed sorted set.
+func delayedMessage(tierName string, wm *types.WorkMessage) ([]byte, error) {
 	m := map[string]interface{}{
 		"run_id":        wm.RunID,
 		"job_id":        wm.JobID,
@@ -624,12 +663,7 @@ func (s *RedisStore) AddDelayed(ctx context.Context, tierName string, wm *types.
 			m["concurrency_keys"] = string(ck)
 		}
 	}
-	data, err := sonic.ConfigFastest.Marshal(m)
-	if err != nil {
-		return err
-	}
-
-	return s.rdb.Do(ctx, s.rdb.B().Zadd().Key(DelayedKey(s.prefix, tierName)).ScoreMember().ScoreMember(float64(executeAt.UnixNano()), string(data)).Build()).Error()
+	return sonic.ConfigFastest.Marshal(m)
 }
 
 // MoveDelayedToStream atomically moves ripe delayed messages back to the work stream.

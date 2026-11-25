@@ -69,6 +69,7 @@ type Worker struct {
 	locker            *lock.Locker
 	pool              *taskPool                    // global pool for tasks without dedicated concurrency
 	subpools          map[types.TaskType]*taskPool // per-TaskType pools
+	shared            bool                         // some task types have no pool of their own
 	freed             chan struct{}                // signals that a pool has room again
 	globalMiddlewares []types.MiddlewareFunc
 	dynCfg            *dynconfig.Manager
@@ -112,10 +113,12 @@ func New(cfg Config) (*Worker, error) {
 	}
 
 	// Create per-TaskType subpools for handlers that specify Concurrency > 0.
+	shared := false
 	subpools := make(map[types.TaskType]*taskPool)
 	for _, tt := range cfg.Registry.TaskTypes() {
 		def, ok := cfg.Registry.Get(types.TaskType(tt))
 		if !ok || def.Concurrency <= 0 {
+			shared = true
 			continue
 		}
 		sp, err := newTaskPool(def.Concurrency, freed)
@@ -134,6 +137,7 @@ func New(cfg Config) (*Worker, error) {
 		locker:            cfg.Locker,
 		pool:              pool,
 		subpools:          subpools,
+		shared:            shared,
 		freed:             freed,
 		globalMiddlewares: cfg.GlobalMiddlewares,
 		dynCfg:            cfg.DynConfig,
@@ -154,6 +158,7 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	go w.priorityFetchLoop()
 	go w.claimStaleLoop()
+	go w.refreshLoop()
 	go w.cancelSubscribeLoop()
 
 	w.logger.Info().String("node_id", w.nodeID).Int("pool_capacity", w.pool.pool.Cap()).Int("tiers", len(w.tiers)).Msg("worker started with priority consumers")
@@ -168,6 +173,7 @@ func (w *Worker) Start(ctx context.Context) error {
 func (w *Worker) Stop() {
 	w.stopOnce.Do(func() {
 		close(w.quit)
+		w.returnHeld()
 
 		time.AfterFunc(w.shutdownTimeout, func() {
 			close(w.abort)
@@ -221,13 +227,16 @@ func (w *Worker) ActiveRunIDs() []string {
 	return ids
 }
 
-// availableCapacity returns the total number of free worker slots across
-// the global pool and all per-TaskType subpools. The value is a best-effort
-// estimate (racy) but sufficient for throttling XREADGROUP batch sizes.
+// availableCapacity returns how many messages the global pool and all per-TaskType subpools
+// take. The value is a best-effort estimate (racy) but sufficient for throttling XREADGROUP
+// batch sizes.
 func (w *Worker) availableCapacity() int {
-	avail := w.pool.free()
+	avail := 0
+	if w.shared {
+		avail = w.pool.free()
+	}
 	for _, sp := range w.subpools {
-		avail += sp.free()
+		avail += sp.room()
 	}
 	return avail
 }
@@ -243,6 +252,8 @@ const (
 	// row: all nodes are notified of every job.
 	minMissDelay = 1 * time.Millisecond
 	maxMissDelay = 16 * time.Millisecond
+	// returnTimeout bounds how long a worker that is stopping takes to return messages.
+	returnTimeout = 5 * time.Second
 )
 
 // priorityFetchLoop polls tier streams in weight-descending order via XREADGROUP.
@@ -340,9 +351,11 @@ func (w *Worker) pause(d time.Duration) bool {
 	}
 }
 
-// fetchTier takes up to count messages off a tier, has them processed, and returns how many
-// there were. If the rate limit of the tier does not allow any, it returns when to try again.
+// fetchTier takes up to count messages off a tier, has them processed or put back, and returns
+// how many there were. If the rate limit of the tier does not allow any, it returns when to try
+// again.
 func (w *Worker) fetchTier(tier store.TierConfig, count int) (fetched int, retryIn time.Duration) {
+	used := 0 // of the rate limit
 	// Check rate limit if configured.
 	if tier.RateLimit > 0 {
 		burst := tier.RateBurst
@@ -365,8 +378,8 @@ func (w *Worker) fetchTier(tier store.TierConfig, count int) (fetched int, retry
 			return 0, time.Duration(float64(count) / tier.RateLimit * float64(time.Second))
 		}
 		defer func() {
-			if fetched < count {
-				if err := w.rateLimiter.Return(w.ctx, tier.Name, count-fetched, limit); err != nil && w.ctx.Err() == nil {
+			if used < count {
+				if err := w.rateLimiter.Return(w.ctx, tier.Name, count-used, limit); err != nil && w.ctx.Err() == nil {
 					w.logger.Warn().Err(err).String("tier", tier.Name).Msg("worker: rate limit return failed")
 				}
 			}
@@ -383,21 +396,98 @@ func (w *Worker) fetchTier(tier store.TierConfig, count int) (fetched int, retry
 		return 0, 0
 	}
 
+	var sms []*streamMessage
 	for _, entries := range xStreams {
 		for _, entry := range entries {
-			fetched++
-			sm := parseStreamMessage(entry, tier.Name)
+			sms = append(sms, parseStreamMessage(entry, tier.Name))
+		}
+	}
+	fetched = len(sms)
+	used = fetched - w.process(tier.Name, sms)
+	return fetched, 0
+}
 
-			pool := w.poolForTaskType(sm.Work.TaskType)
-			if err := pool.submit(func() {
-				w.processMessage(sm)
-			}); err != nil {
+// process has messages of a tier processed. Those of a task type with a limit that has enough
+// of them are put back, so that they do not hold up the others, and process returns how many
+// there were.
+func (w *Worker) process(tierName string, sms []*streamMessage) (putBack int) {
+	tooMany := make(map[*taskPool][]*streamMessage)
+	for _, sm := range sms {
+		run := func() { w.processMessage(sm) }
+		pool, limited := w.subpools[sm.Work.TaskType]
+		if !limited {
+			if err := w.pool.submit(run); err != nil {
 				w.logger.Error().Err(err).Msg("worker: pool submit failed")
 				// Don't ack — XAUTOCLAIM will reclaim it later.
 			}
+		} else if !pool.offer(sm, run) {
+			tooMany[pool] = append(tooMany[pool], sm)
 		}
 	}
-	return fetched, 0
+	for pool, sms := range tooMany {
+		if err := w.postpone(w.ctx, tierName, sms, pool.returnTimes(len(sms))); err != nil {
+			if w.ctx.Err() == nil {
+				w.logger.Error().Err(err).String("tier", tierName).Int("messages", len(sms)).Msg("worker: failed to put back messages, waiting for room")
+			}
+			for _, sm := range sms {
+				pool.submit(func() { w.processMessage(sm) })
+			}
+			continue
+		}
+		putBack += len(sms)
+	}
+	return putBack
+}
+
+// postpone moves messages to the delayed set of their tier.
+func (w *Worker) postpone(ctx context.Context, tierName string, sms []*streamMessage, until []time.Time) error {
+	msgs := make([]store.PostponedMessage, len(sms))
+	for i, sm := range sms {
+		msgs[i] = store.PostponedMessage{Work: &sm.Work, MessageID: sm.StreamMsgID, Until: until[i]}
+	}
+	return w.store.Postpone(ctx, tierName, msgs)
+}
+
+// refreshLoop keeps other nodes from taking over messages that are kept at hand.
+func (w *Worker) refreshLoop() {
+	for w.pause(claimRefreshInterval) {
+		for _, sp := range w.subpools {
+			for _, sm := range sp.held() {
+				if err := w.store.RefreshMessageClaim(w.ctx, sm.TierName, w.nodeID, sm.StreamMsgID); err != nil && w.ctx.Err() == nil {
+					w.logger.Warn().String("run_id", sm.Work.RunID).Err(err).Msg("worker: stream claim refresh failed")
+				}
+			}
+		}
+	}
+}
+
+// returnHeld gives other nodes the messages that are kept at hand.
+func (w *Worker) returnHeld() {
+	byTier := make(map[string][]*streamMessage)
+	for _, sp := range w.subpools {
+		for _, sm := range sp.close() {
+			byTier[sm.TierName] = append(byTier[sm.TierName], sm)
+		}
+	}
+	for tierName, sms := range byTier {
+		w.returnMessages(tierName, sms)
+	}
+}
+
+// returnMessages gives other nodes messages that this one does not process, as it is stopping.
+func (w *Worker) returnMessages(tierName string, sms []*streamMessage) {
+	if len(sms) == 0 {
+		return
+	}
+	now := make([]time.Time, len(sms))
+	for i := range now {
+		now[i] = time.Now()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), returnTimeout)
+	defer cancel()
+	if err := w.postpone(ctx, tierName, sms, now); err != nil {
+		w.logger.Error().Err(err).String("tier", tierName).Int("messages", len(sms)).Msg("worker: failed to return messages, leaving them for XAUTOCLAIM")
+	}
 }
 
 // jobNotifySubscriber subscribes to the JobNotifyChannel and sends a wake-up
@@ -444,30 +534,17 @@ func (w *Worker) claimStaleLoop() {
 					}
 					continue
 				}
-				for _, xmsg := range msgs {
-					sm := parseStreamMessage(xmsg, tier.Name)
-					pool := w.poolForTaskType(sm.Work.TaskType)
-					if err := pool.submit(func() {
-						w.processMessage(sm)
-					}); err != nil {
-						w.logger.Error().Err(err).Msg("worker: pool submit for claimed message failed")
-					}
+				sms := make([]*streamMessage, len(msgs))
+				for i, xmsg := range msgs {
+					sms[i] = parseStreamMessage(xmsg, tier.Name)
 				}
+				w.process(tier.Name, sms)
 				if len(msgs) > 0 {
 					w.logger.Info().String("tier", tier.Name).Int("claimed", len(msgs)).Msg("worker: reclaimed stale messages")
 				}
 			}
 		}
 	}
-}
-
-// poolForTaskType returns the subpool for the given task type if one exists,
-// otherwise falls back to the global pool.
-func (w *Worker) poolForTaskType(tt types.TaskType) *taskPool {
-	if sp, ok := w.subpools[tt]; ok {
-		return sp
-	}
-	return w.pool
 }
 
 // parseStreamMessage constructs a streamMessage from a rueidis XRangeEntry.

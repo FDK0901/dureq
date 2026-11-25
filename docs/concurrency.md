@@ -108,8 +108,10 @@ srv.RegisterHandler(types.HandlerDefinition{
 })
 ```
 
-A node takes its messages in order. If the next one is of a handler whose limit is reached, it waits for that one,
-and those behind it wait, too. Give a slow handler with a small limit a tier, or a node, of its own.
+A handler that has reached its limit does not hold up the others. A node keeps about three seconds of work for it at
+hand and puts the rest back into the delayed set of the tier, from where it comes again after a second or more. So
+jobs of such a handler do not run strictly in order, and `GET /api/queues` counts them as `delayed`. If all handlers
+of a node have limits, nothing is put back: it takes only what it has room for.
 
 ## Throughput
 

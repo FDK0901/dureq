@@ -431,7 +431,8 @@ func TestCompleteRun_TriedAgain(t *testing.T) {
 	}
 }
 
-// A message that is queued again is the same afterwards.
+// A message that is put back or queued again is the same afterwards. One that has been
+// acknowledged by then is not put back.
 func TestWorkMessage_IsKeptAsItIs(t *testing.T) {
 	st, _ := newTestAPI(t, nil)
 	ctx := context.Background()
@@ -467,7 +468,27 @@ func TestWorkMessage_IsKeptAsItIs(t *testing.T) {
 	if err := st.ReenqueueWork(ctx, "normal", &work, 0); err != nil {
 		t.Fatal(err)
 	}
-	same("queued again", read())
+	entry := read()
+	same("queued again", entry)
+
+	taken := store.WorkMessageFromStreamValues(entry.FieldValues)
+	postponed := []store.PostponedMessage{{Work: &taken, MessageID: entry.ID, Until: time.Now()}}
+	for range 2 { // the second time, it has been acknowledged
+		if err := st.Postpone(ctx, "normal", postponed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := rdb.Do(ctx, rdb.B().Xpending().Key(key).Group(store.ConsumerGroup).Build()).ToArray()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := pending[0].AsInt64(); n != 0 {
+		t.Errorf("%d messages are pending, want none", n)
+	}
+	if n, err := st.MoveDelayedToStream(ctx, "normal", 10); err != nil || n != 1 {
+		t.Fatalf("moved %d messages (%v), want 1", n, err)
+	}
+	same("put back", read())
 }
 
 // The dead letter queue keeps every job: for some it is all there is left of them.

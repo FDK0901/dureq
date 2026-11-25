@@ -129,6 +129,24 @@ redis.call('HSET', key, 'data', ARGV[2], '_version', tostring(nv))
 return oldData .. '\n' .. tostring(nv)
 `
 
+// luaPostpone atomically moves messages that a worker has taken from the work stream to the
+// delayed sorted set. One that has been acknowledged in the meantime is left out.
+// KEYS[1] = delayed sorted set (dureq:{tier}:delayed)
+// KEYS[2] = work stream (dureq:{tier}:work)
+// ARGV[1] = consumer group
+// ARGV[2..N] = score, message, stream ID of each
+// Returns number of messages moved.
+const luaPostpone = `
+local moved = 0
+for i = 2, #ARGV, 3 do
+  if redis.call('XACK', KEYS[2], ARGV[1], ARGV[i+2]) == 1 then
+    redis.call('ZADD', KEYS[1], ARGV[i], ARGV[i+1])
+    moved = moved + 1
+  end
+end
+return moved
+`
+
 // luaMoveDelayedToStream atomically moves ripe messages from delayed sorted set to work stream.
 // Both keys use hash-tagged tier names for Redis Cluster slot co-location.
 // KEYS[1] = delayed sorted set (dureq:{tier}:delayed)

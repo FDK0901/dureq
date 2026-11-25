@@ -139,6 +139,7 @@ type RedisStore struct {
 	scriptCreateNX        *rueidis.Lua
 	scriptLeaderRefresh   *rueidis.Lua
 	scriptMoveDelayed     *rueidis.Lua
+	scriptPostpone        *rueidis.Lua
 	scriptFlushGroup      *rueidis.Lua
 	scriptClaimSideEffect *rueidis.Lua
 	scriptAcquireConcSlot *rueidis.Lua
@@ -182,6 +183,7 @@ func NewRedisStore(rdb rueidis.Client, cfg RedisStoreConfig, logger chainedlog.L
 		scriptCreateNX:        rueidis.NewLuaScript(luaCreateIfNotExists),
 		scriptLeaderRefresh:   rueidis.NewLuaScript(luaLeaderRefresh),
 		scriptMoveDelayed:     rueidis.NewLuaScript(luaMoveDelayedToStream),
+		scriptPostpone:        rueidis.NewLuaScript(luaPostpone),
 		scriptFlushGroup:      rueidis.NewLuaScript(luaFlushGroup),
 		scriptClaimSideEffect: rueidis.NewLuaScript(luaClaimSideEffect),
 		scriptAcquireConcSlot: rueidis.NewLuaScript(luaAcquireConcurrencySlot),

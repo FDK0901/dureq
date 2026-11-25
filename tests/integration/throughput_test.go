@@ -221,3 +221,101 @@ func TestWorker_IsNotifiedAfterReconnect(t *testing.T) {
 		t.Errorf("%d of 10 jobs had to wait until the worker looked for them", slow)
 	}
 }
+
+// limitedTally is a handler with a limit of its own that counts executions by the "id" of the
+// payload.
+func limitedTally(taskType types.TaskType, concurrency int, takes time.Duration, c *tally) types.HandlerDefinition {
+	return types.HandlerDefinition{TaskType: taskType, Concurrency: concurrency, Handler: func(_ context.Context, payload json.RawMessage) error {
+		var p struct {
+			ID string `json:"id"`
+		}
+		json.Unmarshal(payload, &p)
+		time.Sleep(takes)
+		c.add(p.ID)
+		return nil
+	}}
+}
+
+func enqueueIDs(t *testing.T, cli *client.Client, taskType types.TaskType, n int) (ids []string) {
+	t.Helper()
+	for i := range n {
+		id := fmt.Sprintf("%s-%03d", taskType, i)
+		if _, err := cli.Enqueue(context.Background(), taskType, map[string]string{"id": id}); err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// Jobs of a handler that has reached its limit do not hold up those behind them, and are run
+// once each in the end.
+func TestWorker_FullHandlerDoesNotHoldUpOthers(t *testing.T) {
+	var quick atomic.Int64
+	slow := &tally{}
+	_, cli := startTiered(t, 10, nil, counter("quick", &quick), limitedTally("slow", 1, 150*time.Millisecond, slow))
+	ids := enqueueIDs(t, cli, "slow", 60)
+	start := time.Now()
+	enqueueMany(t, cli, "quick", types.PriorityNormal, 300)
+	waitCount(t, 3*time.Second, &quick, 300)
+	waitFor(t, 25*time.Second, "slow jobs", func() bool { return len(slow.not(1, ids)) == 0 })
+	if took := time.Since(start); took > 13*time.Second {
+		t.Errorf("the slow jobs took %v, want about 9 seconds", took)
+	}
+	time.Sleep(2500 * time.Millisecond)
+	if off := slow.not(1, ids); len(off) > 0 {
+		t.Errorf("executions other than one: %v", off)
+	}
+}
+
+// If all handlers have limits, jobs wait in the queue, where other nodes see them.
+func TestWorker_OnlyFullHandlers(t *testing.T) {
+	c := &tally{}
+	_, cli := startTiered(t, 10, nil, limitedTally("slow", 2, 400*time.Millisecond, c))
+	ids := enqueueIDs(t, cli, "slow", 30)
+	ctx := context.Background()
+	rdb := cli.Store().Client()
+	var most int64
+	waitFor(t, 20*time.Second, "slow jobs", func() bool {
+		n, _ := rdb.Do(ctx, rdb.B().Zcard().Key(store.DelayedKey(cli.Store().Prefix(), "normal")).Build()).AsInt64()
+		most = max(most, n)
+		return len(c.not(1, ids)) == 0
+	})
+	if most > 0 {
+		t.Errorf("up to %d jobs were put back", most)
+	}
+}
+
+// Messages that a node keeps at hand go to other nodes when it stops.
+func TestWorker_ReturnsMessagesWhenStopped(t *testing.T) {
+	for name, limit := range map[string]int{"limited": 1} {
+		t.Run(name, func(t *testing.T) {
+			flushDB(t)
+			c := &tally{}
+			ctx := context.Background()
+			start := func(takes time.Duration) *server.Server {
+				t.Helper()
+				srv := newServer(t, "stop-"+xid.New().String(), 3)
+				var other atomic.Int64
+				srv.RegisterHandler(limitedTally("slow", limit, takes, c))
+				srv.RegisterHandler(counter("quick", &other))
+				h := counter("rare", &other)
+				h.Concurrency = 5
+				srv.RegisterHandler(h)
+				if err := srv.Start(ctx); err != nil {
+					t.Fatal(err)
+				}
+				return srv
+			}
+			first := start(time.Second)
+			cli := newClient(t)
+			t.Cleanup(cli.Close)
+			ids := enqueueIDs(t, cli, "slow", 12)
+			time.Sleep(500 * time.Millisecond)
+			second := start(50 * time.Millisecond)
+			t.Cleanup(func() { second.Stop() })
+			first.Stop()
+			waitFor(t, 10*time.Second, "slow jobs", func() bool { return len(c.not(1, ids)) == 0 })
+		})
+	}
+}

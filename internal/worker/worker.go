@@ -22,7 +22,6 @@ import (
 	"github.com/FDK0901/dureq/pkg/types"
 	"github.com/FDK0901/go-chainedlog"
 	"github.com/FDK0901/go-chainedlog/impl/chainedslog"
-	"github.com/panjf2000/ants/v2"
 	"github.com/redis/rueidis"
 )
 
@@ -65,8 +64,9 @@ type Worker struct {
 	registry          HandlerRegistry
 	disp              *dispatcher.Dispatcher
 	locker            *lock.Locker
-	pool              *ants.Pool                    // global pool for tasks without dedicated concurrency
-	subpools          map[types.TaskType]*ants.Pool // per-TaskType pools
+	pool              *taskPool                    // global pool for tasks without dedicated concurrency
+	subpools          map[types.TaskType]*taskPool // per-TaskType pools
+	freed             chan struct{}                // signals that a pool has room again
 	globalMiddlewares []types.MiddlewareFunc
 	dynCfg            *dynconfig.Manager
 	tiers             []store.TierConfig
@@ -102,19 +102,20 @@ func New(cfg Config) (*Worker, error) {
 		cfg.ShutdownTimeout = 30 * time.Second
 	}
 
-	pool, err := ants.NewPool(cfg.MaxConcurrency, ants.WithNonblocking(false))
+	freed := make(chan struct{}, 1)
+	pool, err := newTaskPool(cfg.MaxConcurrency, freed)
 	if err != nil {
 		return nil, err
 	}
 
 	// Create per-TaskType subpools for handlers that specify Concurrency > 0.
-	subpools := make(map[types.TaskType]*ants.Pool)
+	subpools := make(map[types.TaskType]*taskPool)
 	for _, tt := range cfg.Registry.TaskTypes() {
 		def, ok := cfg.Registry.Get(types.TaskType(tt))
 		if !ok || def.Concurrency <= 0 {
 			continue
 		}
-		sp, err := ants.NewPool(def.Concurrency, ants.WithNonblocking(false))
+		sp, err := newTaskPool(def.Concurrency, freed)
 		if err != nil {
 			return nil, err
 		}
@@ -130,6 +131,7 @@ func New(cfg Config) (*Worker, error) {
 		locker:            cfg.Locker,
 		pool:              pool,
 		subpools:          subpools,
+		freed:             freed,
 		globalMiddlewares: cfg.GlobalMiddlewares,
 		dynCfg:            cfg.DynConfig,
 		tiers:             cfg.Store.Config().Tiers,
@@ -151,7 +153,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	go w.claimStaleLoop()
 	go w.cancelSubscribeLoop()
 
-	w.logger.Info().String("node_id", w.nodeID).Int("pool_capacity", w.pool.Cap()).Int("tiers", len(w.tiers)).Msg("worker started with priority consumers")
+	w.logger.Info().String("node_id", w.nodeID).Int("pool_capacity", w.pool.pool.Cap()).Int("tiers", len(w.tiers)).Msg("worker started with priority consumers")
 	return nil
 }
 
@@ -170,10 +172,10 @@ func (w *Worker) Stop() {
 
 		releaseTimeout := w.shutdownTimeout + 5*time.Second
 		if w.pool != nil {
-			w.pool.ReleaseTimeout(releaseTimeout)
+			w.pool.pool.ReleaseTimeout(releaseTimeout)
 		}
 		for _, sp := range w.subpools {
-			sp.ReleaseTimeout(releaseTimeout)
+			sp.pool.ReleaseTimeout(releaseTimeout)
 		}
 
 		if w.cancel != nil {
@@ -188,9 +190,9 @@ func (w *Worker) Stats() *types.PoolStats {
 		return nil
 	}
 	return &types.PoolStats{
-		RunningWorkers: w.pool.Running(),
-		IdleWorkers:    w.pool.Free(),
-		MaxConcurrency: w.pool.Cap(),
+		RunningWorkers: w.pool.running(),
+		IdleWorkers:    w.pool.free(),
+		MaxConcurrency: w.pool.pool.Cap(),
 		TotalSubmitted: w.submitted.Load(),
 		TotalCompleted: w.completed.Load(),
 		TotalFailed:    w.failed.Load(),
@@ -220,9 +222,9 @@ func (w *Worker) ActiveRunIDs() []string {
 // the global pool and all per-TaskType subpools. The value is a best-effort
 // estimate (racy) but sufficient for throttling XREADGROUP batch sizes.
 func (w *Worker) availableCapacity() int {
-	avail := w.pool.Free()
+	avail := w.pool.free()
 	for _, sp := range w.subpools {
-		avail += sp.Free()
+		avail += sp.free()
 	}
 	return avail
 }
@@ -235,7 +237,7 @@ func (w *Worker) availableCapacity() int {
 // A Pub/Sub subscriber listens on JobNotifyChannel for push notifications
 // from DispatchWork, waking the fetch loop immediately instead of waiting
 // for the next polling interval (reduces dispatch-to-start latency from
-// ~500ms to near-zero).
+// ~500ms to near-zero). When there is no room, the end of a running message does.
 func (w *Worker) priorityFetchLoop() {
 	// Start push notification subscriber.
 	notify := make(chan struct{}, 1)
@@ -247,7 +249,7 @@ func (w *Worker) priorityFetchLoop() {
 			return
 		default:
 		}
-		fetched := 0
+		fetched, full := 0, false
 
 		// Skip all tiers if this node is draining.
 		if draining, _ := w.store.IsNodeDraining(w.ctx, w.nodeID); draining {
@@ -267,7 +269,8 @@ func (w *Worker) priorityFetchLoop() {
 
 			avail := w.availableCapacity()
 			if avail == 0 {
-				continue
+				full = true
+				break
 			}
 			batchSize := min(tier.FetchBatch, avail)
 
@@ -309,7 +312,7 @@ func (w *Worker) priorityFetchLoop() {
 					sm := parseStreamMessage(entry, tier.Name)
 
 					pool := w.poolForTaskType(sm.Work.TaskType)
-					if err := pool.Submit(func() {
+					if err := pool.submit(func() {
 						w.processMessage(sm)
 					}); err != nil {
 						w.logger.Error().Err(err).Msg("worker: pool submit failed")
@@ -318,7 +321,15 @@ func (w *Worker) priorityFetchLoop() {
 				}
 			}
 		}
-		if fetched == 0 {
+		if fetched == 0 && full {
+			// Wait for a running message to end.
+			select {
+			case <-w.freed:
+			case <-time.After(500 * time.Millisecond):
+			case <-w.quit:
+				return
+			}
+		} else if fetched == 0 {
 			// Wait for either a push notification or a fallback poll interval.
 			select {
 			case <-notify:
@@ -377,7 +388,7 @@ func (w *Worker) claimStaleLoop() {
 				for _, xmsg := range msgs {
 					sm := parseStreamMessage(xmsg, tier.Name)
 					pool := w.poolForTaskType(sm.Work.TaskType)
-					if err := pool.Submit(func() {
+					if err := pool.submit(func() {
 						w.processMessage(sm)
 					}); err != nil {
 						w.logger.Error().Err(err).Msg("worker: pool submit for claimed message failed")
@@ -393,7 +404,7 @@ func (w *Worker) claimStaleLoop() {
 
 // poolForTaskType returns the subpool for the given task type if one exists,
 // otherwise falls back to the global pool.
-func (w *Worker) poolForTaskType(tt types.TaskType) *ants.Pool {
+func (w *Worker) poolForTaskType(tt types.TaskType) *taskPool {
 	if sp, ok := w.subpools[tt]; ok {
 		return sp
 	}

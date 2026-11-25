@@ -847,6 +847,9 @@ type BatchItemState struct {
 	Error      *string    `json:"error,omitempty"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// Iteration tracks how many times the item was to run again although it had completed.
+	// The OperationKey includes it, so that the ledger does not block that.
+	Iteration int `json:"iteration,omitempty"`
 }
 
 // BatchItemResult stores the output of a single batch item execution.

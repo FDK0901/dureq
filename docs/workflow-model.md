@@ -102,6 +102,8 @@ or the job's own retry policy.
 
 ### Workflow-level retry
 
+A task that was still under way when the workflow failed is not started again by a retry. What became of it counts.
+
 Set `RetryPolicy` on the `WorkflowDefinition` to retry the entire workflow
 when it fails. On retry, only failed/dead/cancelled tasks are reset. Completed
 tasks are preserved so work resumes from the failure point.

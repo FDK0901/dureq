@@ -388,7 +388,7 @@ func TestBatch_UnknownItem_IsIgnored(t *testing.T) {
 		finishJob(t, st, job, types.JobStatusPending)
 	}
 	none := "none"
-	stray := newJob(xid.New().String(), "t", nil, time.Now())
+	stray := newJob(xid.New().String(), "t", nil, "op", time.Now())
 	stray.BatchID, stray.BatchItem, stray.BatchRole = &batch.ID, &none, strPtr("item")
 	finishJob(t, st, stray, types.JobStatusCompleted)
 	if err := newTestOrchestrator(st).handleJobCompleted(context.Background(), completed(stray)); err != nil && !errors.Is(err, types.ErrJobNotFound) {
@@ -396,6 +396,78 @@ func TestBatch_UnknownItem_IsIgnored(t *testing.T) {
 	}
 	if got := getBatch(t, st, batch.ID); got.CompletedItems != 0 || got.RunningItems != 2 {
 		t.Fatalf("%d completed, %d running", got.CompletedItems, got.RunningItems)
+	}
+}
+
+func TestResetBatch(t *testing.T) {
+	onetime := types.TaskType("prepare")
+	newBatch := func() *types.BatchInstance {
+		batch := &types.BatchInstance{
+			ID: "b", Status: types.WorkflowStatusFailed, Attempt: 1, TotalItems: 7, NextChunkIndex: 5, FailedItems: 1, CompletedItems: 1, RunningItems: 9, PendingItems: -4,
+			Definition:   types.BatchDefinition{OnetimeTaskType: &onetime},
+			OnetimeState: &types.BatchOnetimeState{Status: types.JobStatusCompleted},
+			ItemStates:   map[string]types.BatchItemState{},
+		}
+		for _, status := range []types.JobStatus{
+			types.JobStatusCompleted, types.JobStatusFailed, types.JobStatusDead, types.JobStatusCancelled,
+			types.JobStatusRunning, types.JobStatusRetrying, types.JobStatusPending,
+		} {
+			batch.ItemStates[string(status)] = types.BatchItemState{ItemID: string(status), Status: status, JobID: "j-" + string(status)}
+		}
+		return batch
+	}
+	for _, tc := range []struct {
+		failedOnly                  bool
+		pending, running, completed int
+	}{{true, 4, 2, 1}, {false, 5, 2, 0}} {
+		batch := newBatch()
+		ResetBatch(batch, tc.failedOnly, time.Now())
+		if batch.PendingItems != tc.pending || batch.RunningItems != tc.running || batch.CompletedItems != tc.completed || batch.FailedItems != 0 {
+			t.Errorf("failed only %v: %d pending, %d running, %d completed, %d failed", tc.failedOnly, batch.PendingItems, batch.RunningItems, batch.CompletedItems, batch.FailedItems)
+		}
+		for _, id := range []string{"failed", "dead", "cancelled"} {
+			if st := batch.ItemStates[id]; st.Status != types.JobStatusPending || st.JobID != "" || st.Iteration != 0 {
+				t.Errorf("%s item: %+v", id, st)
+			}
+		}
+		if st := batch.ItemStates["running"]; st.JobID != "j-running" {
+			t.Errorf("running item: %+v", st)
+		}
+		if st := batch.ItemStates["completed"]; (st.Status == types.JobStatusPending) == tc.failedOnly || (st.Iteration == 1) == tc.failedOnly {
+			t.Errorf("failed only %v: completed item: %+v", tc.failedOnly, st)
+		}
+		if batch.Status != types.WorkflowStatusRunning || batch.Attempt != 2 || batch.NextChunkIndex != 0 || batch.OnetimeState == nil {
+			t.Errorf("batch %+v", batch)
+		}
+	}
+	batch := newBatch()
+	batch.OnetimeState.Status = types.JobStatusCancelled
+	ResetBatch(batch, true, time.Now())
+	if batch.OnetimeState != nil {
+		t.Errorf("onetime task that was cancelled: %+v", batch.OnetimeState)
+	}
+}
+
+// An item that is to run again although it completed is another operation, or the ledger
+// would take it for done; one that failed is the same.
+func TestBatchItemJob_Operation(t *testing.T) {
+	batch := &types.BatchInstance{
+		ID: "b", Definition: types.BatchDefinition{Items: []types.BatchItem{{ID: "a"}, {ID: "b"}}},
+		ItemStates: map[string]types.BatchItemState{"a": {ItemID: "a", Status: types.JobStatusCompleted}, "b": {ItemID: "b", Status: types.JobStatusFailed}},
+	}
+	operations := func() (ops []string) {
+		for _, job := range ReserveBatchChunk(batch, time.Now()) {
+			ops = append(ops, job.Headers["x-dureq-operation-key"])
+		}
+		return ops
+	}
+	for _, want := range []string{"[b:item:a:1 b:item:b]", "[b:item:a:2 b:item:b]"} {
+		ResetBatch(batch, false, time.Now())
+		if got := fmt.Sprint(operations()); got != want {
+			t.Errorf("operations %s, want %s", got, want)
+		}
+		batch.ItemStates["a"] = types.BatchItemState{ItemID: "a", Status: types.JobStatusCompleted, Iteration: batch.ItemStates["a"].Iteration}
+		batch.ItemStates["b"] = types.BatchItemState{ItemID: "b", Status: types.JobStatusFailed}
 	}
 }
 
@@ -452,6 +524,37 @@ func TestWorkflowStarted_StartsChildWorkflowsOnce(t *testing.T) {
 	// It is gone by the time the event comes.
 	if err := newTestOrchestrator(st).handleWorkflowStarted(ctx, types.JobEvent{JobID: "none"}); err != nil {
 		t.Errorf("event of a workflow that is gone: %v", err)
+	}
+}
+
+// The end of a child workflow counts once.
+func TestChildWorkflow_EndCountsOnce(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	inner := &types.WorkflowDefinition{Name: "inner", Tasks: []types.WorkflowTask{{Name: "x", TaskType: "t"}}}
+	wf := newWorkflow(t, st, types.WorkflowDefinition{Name: "outer", Tasks: []types.WorkflowTask{
+		{Name: "one", ChildWorkflowDef: inner}, {Name: "two", ChildWorkflowDef: inner}, {Name: "join", TaskType: "t", DependsOn: []string{"one", "two"}},
+	}})
+	o := newTestOrchestrator(st)
+	if err := o.handleWorkflowStarted(ctx, types.JobEvent{JobID: wf.ID}); err != nil {
+		t.Fatal(err)
+	}
+	child, rev, err := st.GetWorkflow(ctx, getWorkflow(t, st, wf.ID).Tasks["one"].ChildWorkflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child.Status = types.WorkflowStatusCompleted
+	if _, err := st.UpdateWorkflow(ctx, child, rev); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := o.handleChildWorkflowCompleted(ctx, types.JobEvent{JobID: child.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := getWorkflow(t, st, wf.ID)
+	if got.Tasks["one"].Status != types.JobStatusCompleted || got.Tasks["join"].Status != types.JobStatusPending || got.PendingDeps["join"] != 1 {
+		t.Fatalf("tasks %+v, join waits for %d", got.Tasks, got.PendingDeps["join"])
 	}
 }
 

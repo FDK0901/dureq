@@ -834,11 +834,6 @@ func (o *Orchestrator) workflowTaskJob(ctx context.Context, wf *types.WorkflowIn
 	if taskDef.ResultFrom != "" {
 		job.Payload = o.resolveResultFromPayload(ctx, wf, taskDef)
 	}
-
-	// Set OperationKey header for exactly-once tracking across workflow task retries.
-	job.Headers = map[string]string{
-		"x-dureq-operation-key": fmt.Sprintf("%s:%s:%d", wf.ID, taskDef.Name, wf.Tasks[taskDef.Name].Iteration),
-	}
 	return job
 }
 
@@ -871,7 +866,7 @@ func (o *Orchestrator) ensureWorkflowJobs(ctx context.Context, wfID string) erro
 		return err
 	}
 	for _, job := range missing {
-		o.logger.Warn().String("workflow_id", wfID).String("task", *job.WorkflowTask).Msg("workflow: starting task that was reserved but not started")
+		o.logger.Debug().String("workflow_id", wfID).String("task", *job.WorkflowTask).Msg("workflow: starting task that is reserved but not started")
 		if err := o.startJob(ctx, job); err != nil {
 			return err
 		}
@@ -1175,13 +1170,15 @@ func (o *Orchestrator) progressParentWorkflowTask(ctx context.Context, childWf *
 			return
 		}
 
-		// Update the parent task state.
-		if state, ok := parentWf.Tasks[taskName]; ok {
-			state.Status = status
-			state.FinishedAt = &now
-			state.Error = errStr
-			parentWf.Tasks[taskName] = state
+		// Update the parent task state, unless it has ended or goes on as another child.
+		state, ok := parentWf.Tasks[taskName]
+		if !ok || state.Status.IsTerminal() || state.ChildWorkflowID != childWf.ID {
+			return
 		}
+		state.Status = status
+		state.FinishedAt = &now
+		state.Error = errStr
+		parentWf.Tasks[taskName] = state
 
 		if status == types.JobStatusCompleted {
 			// Decrement PendingDeps for downstream tasks that depend on this one.
@@ -1289,11 +1286,10 @@ func (o *Orchestrator) retryWorkflow(ctx context.Context, wf *types.WorkflowInst
 		}
 
 		if shouldReset {
-			state.Status = types.JobStatusPending
-			state.JobID = ""
-			state.Error = nil
-			state.StartedAt = nil
-			state.FinishedAt = nil
+			if state.Status == types.JobStatusCompleted {
+				state.Iteration++ // or the ledger takes it for done
+			}
+			resetTask(&state)
 			state.ConditionRoute = nil
 			state.SubflowTasks = nil
 			wf.Tasks[name] = state
@@ -1353,11 +1349,14 @@ func (o *Orchestrator) handleWorkflowResumed(ctx context.Context, event types.Jo
 	o.logger.Info().String("workflow_id", wfID).Int("ready", len(ready)).Msg("orchestrator: dispatched ready tasks for resumed workflow")
 }
 
-// handleWorkflowRetry dispatches root tasks after an API-triggered workflow retry.
+// handleWorkflowRetry goes on with a workflow that is retried.
 func (o *Orchestrator) handleWorkflowRetry(ctx context.Context, event types.JobEvent) error {
 	wfID := event.JobID
 	if wfID == "" {
 		return nil
+	}
+	if err := o.ensureWorkflowJobs(ctx, wfID); err != nil {
+		return err
 	}
 
 	wf, rev, err := o.store.GetWorkflow(ctx, wfID)
@@ -1368,18 +1367,64 @@ func (o *Orchestrator) handleWorkflowRetry(ctx context.Context, event types.JobE
 		return nil
 	}
 
+	// Tasks that ended while the workflow had ended, too, still count as running.
+	var endedJobs []*types.Job
+	var endedChildren []*types.WorkflowInstance
+	for name, state := range wf.Tasks {
+		if state.Status != types.JobStatusRunning && state.Status != types.JobStatusRetrying {
+			continue
+		}
+		lost := false
+		if state.ChildWorkflowID != "" {
+			child, _, err := o.store.GetWorkflow(ctx, state.ChildWorkflowID)
+			switch {
+			case errors.Is(err, types.ErrWorkflowNotFound) || err == nil && child.Status == types.WorkflowStatusCancelled:
+				lost = true
+			case err != nil:
+				return err
+			case child.Status.IsTerminal():
+				endedChildren = append(endedChildren, child)
+			}
+		} else if state.JobID != "" {
+			job, _, err := o.store.GetJob(ctx, state.JobID)
+			switch {
+			case errors.Is(err, types.ErrJobNotFound) || err == nil && job.Status == types.JobStatusCancelled:
+				lost = true
+			case err != nil:
+				return err
+			case job.Status.IsTerminal():
+				endedJobs = append(endedJobs, job)
+			}
+		}
+		if lost {
+			resetTask(&state)
+			wf.Tasks[name] = state
+		}
+	}
+
 	now := time.Now()
 	ready := ReadyTasks(wf)
 	for _, name := range ready {
 		o.dispatchWorkflowTask(ctx, wf, name, &now)
 	}
-
 	if err := o.saveDispatched(ctx, wf, rev, now); err != nil {
 		o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save workflow after retry dispatch")
 		return err
 	}
-
 	o.logger.Info().String("workflow_id", wfID).Int("ready", len(ready)).Msg("orchestrator: dispatched ready tasks for workflow retry")
+
+	for _, job := range endedJobs {
+		if err := o.replayEnd(ctx, job); err != nil {
+			return err
+		}
+	}
+	for _, child := range endedChildren {
+		status, errStr := types.JobStatusCompleted, (*string)(nil)
+		if child.Status == types.WorkflowStatusFailed {
+			status, errStr = types.JobStatusFailed, strPtr("child workflow failed")
+		}
+		o.progressParentWorkflowTask(ctx, child, status, errStr)
+	}
 	return nil
 }
 

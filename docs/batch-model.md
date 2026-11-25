@@ -85,7 +85,9 @@ batch, err := client.RetryBatch(ctx, batchID, false)
 ```
 
 On retry, the batch increments its `Attempt` counter. If `retryFailedOnly` is true,
-completed items are preserved and only failed items are re-dispatched.
+completed items are preserved, and only failed and cancelled items and those that were never
+dispatched are. An item that was still under way when the batch ended is not started again:
+what became of it counts. Otherwise completed items run again, too.
 
 ## Cancellation
 

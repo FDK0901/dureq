@@ -584,23 +584,7 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 	}
 
 	now := time.Now()
-	wf.Attempt++
-	wf.Status = types.WorkflowStatusRunning
-	wf.UpdatedAt = now
-	wf.CompletedAt = nil
-
-	// Reset only failed/dead/cancelled tasks — keep completed tasks.
-	for name, state := range wf.Tasks {
-		if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
-			state.Status = types.JobStatusPending
-			state.JobID = ""
-			state.Error = nil
-			state.StartedAt = nil
-			state.FinishedAt = nil
-			wf.Tasks[name] = state
-		}
-	}
-
+	workflow.ResetWorkflow(wf, now)
 	if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err != nil {
 		return err
 	}
@@ -720,39 +704,7 @@ func (a *APIService) RetryBatch(ctx context.Context, batchID string, retryFailed
 	}
 
 	now := time.Now()
-	batch.Attempt++
-	batch.Status = types.WorkflowStatusRunning
-	batch.UpdatedAt = now
-	batch.CompletedAt = nil
-
-	batch.FailedItems = 0
-	batch.RunningItems = 0
-	batch.PendingItems = 0
-	batch.CompletedItems = 0
-
-	for id, state := range batch.ItemStates {
-		if retryFailedOnly && state.Status != types.JobStatusFailed {
-			if state.Status == types.JobStatusCompleted {
-				batch.CompletedItems++
-			}
-			continue
-		}
-		state.Status = types.JobStatusPending
-		state.JobID = ""
-		state.Error = nil
-		state.StartedAt = nil
-		state.FinishedAt = nil
-		batch.ItemStates[id] = state
-		batch.PendingItems++
-	}
-	batch.NextChunkIndex = 0
-
-	// Reset onetime state if it hasn't completed (orchestrator will re-dispatch).
-	if batch.Definition.OnetimeTaskType != nil && *batch.Definition.OnetimeTaskType != "" &&
-		(batch.OnetimeState == nil || batch.OnetimeState.Status != types.JobStatusCompleted) {
-		batch.OnetimeState = nil
-	}
-
+	workflow.ResetBatch(batch, retryFailedOnly, now)
 	if _, err := a.store.UpdateBatch(ctx, batch, rev); err != nil {
 		return err
 	}
@@ -1284,22 +1236,9 @@ func (a *APIService) BulkRetryWorkflows(ctx context.Context, req BulkRequest) (*
 		if !wf.Status.IsRetryable() {
 			continue
 		}
-		wf.Attempt++
-		wf.Status = types.WorkflowStatusRunning
-		wf.UpdatedAt = now
-		wf.CompletedAt = nil
 		// Only reset failed/dead/cancelled tasks — preserve completed work
 		// (matches single-retry behavior in RetryWorkflow).
-		for name, state := range wf.Tasks {
-			if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
-				state.Status = types.JobStatusPending
-				state.JobID = ""
-				state.Error = nil
-				state.StartedAt = nil
-				state.FinishedAt = nil
-				wf.Tasks[name] = state
-			}
-		}
+		workflow.ResetWorkflow(wf, now)
 		if _, err := a.store.UpdateWorkflow(ctx, wf, rev); err == nil {
 			a.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventWorkflowRetrying, JobID: id, Attempt: wf.Attempt, Timestamp: now,
@@ -1440,31 +1379,8 @@ func (a *APIService) BulkRetryBatches(ctx context.Context, req BulkRequest) (*Bu
 		if !batch.Status.IsRetryable() {
 			continue
 		}
-		batch.Attempt++
-		batch.Status = types.WorkflowStatusRunning
-		batch.UpdatedAt = now
-		batch.CompletedAt = nil
 		// Only reset failed/dead/cancelled items — preserve completed work.
-		pendingCount := 0
-		completedCount := 0
-		for itemID, state := range batch.ItemStates {
-			if state.Status == types.JobStatusFailed || state.Status == types.JobStatusDead || state.Status == types.JobStatusCancelled {
-				state.Status = types.JobStatusPending
-				state.JobID = ""
-				state.Error = nil
-				state.StartedAt = nil
-				state.FinishedAt = nil
-				batch.ItemStates[itemID] = state
-				pendingCount++
-			} else if state.Status == types.JobStatusCompleted {
-				completedCount++
-			}
-		}
-		batch.FailedItems = 0
-		batch.RunningItems = 0
-		batch.PendingItems = pendingCount
-		batch.CompletedItems = completedCount
-		batch.NextChunkIndex = 0
+		workflow.ResetBatch(batch, true, now)
 		if _, err := a.store.UpdateBatch(ctx, batch, rev); err == nil {
 			a.dispatcher.PublishEvent(types.JobEvent{
 				Type: types.EventBatchRetrying, JobID: id, Attempt: batch.Attempt, Timestamp: now,

@@ -56,6 +56,7 @@ func ReserveBatchChunk(batch *types.BatchInstance, now time.Time) []*types.Job {
 			JobID:     xid.New().String(),
 			Status:    types.JobStatusRunning,
 			StartedAt: &now,
+			Iteration: batch.ItemStates[item.ID].Iteration,
 		}
 		batch.RunningItems++
 		batch.PendingItems--
@@ -64,15 +65,17 @@ func ReserveBatchChunk(batch *types.BatchInstance, now time.Time) []*types.Job {
 	return jobs
 }
 
-// ReserveTasks reserves tasks of a workflow.
-func ReserveTasks(wf *types.WorkflowInstance, names []string, now time.Time) []*types.Job {
+// ReserveRootTasks reserves the root tasks of a workflow that are jobs. Those that are
+// workflows of their own are left to the orchestrator, which starts them once it learns that
+// the workflow has started.
+func ReserveRootTasks(wf *types.WorkflowInstance, now time.Time) []*types.Job {
 	var jobs []*types.Job
-	for _, name := range names {
+	for _, name := range RootTasks(&wf.Definition) {
 		def := findTaskDef(&wf.Definition, name)
-		state, ok := wf.Tasks[name]
-		if def == nil || !ok {
+		if def.ChildWorkflowDef != nil {
 			continue
 		}
+		state := wf.Tasks[name]
 		state.JobID = xid.New().String()
 		state.Status = types.JobStatusRunning
 		state.StartedAt = &now
@@ -80,19 +83,6 @@ func ReserveTasks(wf *types.WorkflowInstance, names []string, now time.Time) []*
 		jobs = append(jobs, taskJob(wf, def, state.JobID, now))
 	}
 	return jobs
-}
-
-// ReserveRootTasks reserves the root tasks of a workflow that are jobs. Those that are
-// workflows of their own are left to the orchestrator, which starts them once it learns that
-// the workflow has started.
-func ReserveRootTasks(wf *types.WorkflowInstance, now time.Time) []*types.Job {
-	var names []string
-	for _, name := range RootTasks(&wf.Definition) {
-		if findTaskDef(&wf.Definition, name).ChildWorkflowDef == nil {
-			names = append(names, name)
-		}
-	}
-	return ReserveTasks(wf, names, now)
 }
 
 // The hooks of a workflow.
@@ -149,9 +139,90 @@ func hookDef(wf *types.WorkflowInstance, name string) *types.WorkflowHookDef {
 	return nil
 }
 
+// ResetWorkflow puts a workflow that has ended back to running. Tasks that failed or were
+// cancelled are pending again. The orchestrator goes on with it when it learns of that, and
+// finds out about tasks that were still under way when the workflow ended.
+func ResetWorkflow(wf *types.WorkflowInstance, now time.Time) {
+	wf.Attempt++
+	wf.Status = types.WorkflowStatusRunning
+	wf.UpdatedAt = now
+	wf.CompletedAt = nil
+	for name, state := range wf.Tasks {
+		switch state.Status {
+		case types.JobStatusFailed, types.JobStatusDead, types.JobStatusCancelled:
+			resetTask(&state)
+			wf.Tasks[name] = state
+		}
+	}
+}
+
+func resetTask(state *types.WorkflowTaskState) {
+	state.Status = types.JobStatusPending
+	state.JobID = ""
+	state.ChildWorkflowID = ""
+	state.Error = nil
+	state.StartedAt = nil
+	state.FinishedAt = nil
+}
+
+// ResetBatch puts a batch that has ended back to running. Items that failed or were
+// cancelled are pending again, and those that completed as well unless failedOnly is set.
+// The orchestrator goes on with it when it learns of that, and finds out about items that
+// were still under way when the batch ended.
+func ResetBatch(batch *types.BatchInstance, failedOnly bool, now time.Time) {
+	batch.Attempt++
+	batch.Status = types.WorkflowStatusRunning
+	batch.UpdatedAt = now
+	batch.CompletedAt = nil
+	batch.NextChunkIndex = 0
+
+	for id, state := range batch.ItemStates {
+		switch state.Status {
+		case types.JobStatusFailed, types.JobStatusDead, types.JobStatusCancelled:
+			resetItem(&state)
+		case types.JobStatusCompleted:
+			if !failedOnly {
+				resetItem(&state)
+				state.Iteration++
+			}
+		}
+		batch.ItemStates[id] = state
+	}
+	countItems(batch)
+
+	if NeedsBatchOnetime(batch) {
+		batch.OnetimeState = nil
+	}
+}
+
+func resetItem(state *types.BatchItemState) {
+	state.Status = types.JobStatusPending
+	state.JobID = ""
+	state.Error = nil
+	state.StartedAt = nil
+	state.FinishedAt = nil
+}
+
+// countItems counts the items of a batch by their states.
+func countItems(batch *types.BatchInstance) {
+	batch.PendingItems, batch.RunningItems, batch.CompletedItems, batch.FailedItems = 0, 0, 0, 0
+	for _, state := range batch.ItemStates {
+		switch state.Status {
+		case types.JobStatusPending:
+			batch.PendingItems++
+		case types.JobStatusRunning, types.JobStatusRetrying:
+			batch.RunningItems++
+		case types.JobStatusCompleted:
+			batch.CompletedItems++
+		case types.JobStatusFailed, types.JobStatusDead:
+			batch.FailedItems++
+		}
+	}
+}
+
 // batchOnetimeJob returns the job of the onetime task that is reserved.
 func batchOnetimeJob(batch *types.BatchInstance, now time.Time) *types.Job {
-	job := newJob(batch.OnetimeState.JobID, *batch.Definition.OnetimeTaskType, batch.Definition.OnetimePayload, now)
+	job := newJob(batch.OnetimeState.JobID, *batch.Definition.OnetimeTaskType, batch.Definition.OnetimePayload, batch.ID+":onetime", now)
 	job.Priority = batch.Definition.DefaultPriority
 	job.BatchID = &batch.ID
 	job.BatchRole = strPtr("onetime")
@@ -160,7 +231,12 @@ func batchOnetimeJob(batch *types.BatchInstance, now time.Time) *types.Job {
 
 // batchItemJob returns the job of an item that is reserved.
 func batchItemJob(batch *types.BatchInstance, item *types.BatchItem, now time.Time) *types.Job {
-	job := newJob(batch.ItemStates[item.ID].JobID, batch.Definition.ItemTaskType, item.Payload, now)
+	state := batch.ItemStates[item.ID]
+	operation := batch.ID + ":item:" + item.ID
+	if state.Iteration > 0 {
+		operation += fmt.Sprintf(":%d", state.Iteration)
+	}
+	job := newJob(state.JobID, batch.Definition.ItemTaskType, item.Payload, operation, now)
 	job.Priority = batch.Definition.DefaultPriority
 	job.RetryPolicy = batch.Definition.ItemRetryPolicy
 	job.BatchID = &batch.ID
@@ -171,7 +247,8 @@ func batchItemJob(batch *types.BatchInstance, item *types.BatchItem, now time.Ti
 
 // taskJob returns the job of a task of a workflow.
 func taskJob(wf *types.WorkflowInstance, def *types.WorkflowTask, jobID string, now time.Time) *types.Job {
-	job := newJob(jobID, def.TaskType, def.Payload, now)
+	operation := fmt.Sprintf("%s:%s:%d", wf.ID, def.Name, wf.Tasks[def.Name].Iteration)
+	job := newJob(jobID, def.TaskType, def.Payload, operation, now)
 	job.Priority = wf.Definition.DefaultPriority
 	job.WorkflowID = &wf.ID
 	job.WorkflowTask = &def.Name
@@ -184,21 +261,22 @@ func hookJob(wf *types.WorkflowInstance, name string, now time.Time) *types.Job 
 	if wf.Attempt > 1 { // a workflow that is retried ends once more
 		operation += fmt.Sprintf(":%d", wf.Attempt)
 	}
-	job := newJob(wf.HookStates[name].JobID, def.TaskType, def.Payload, now)
-	job.Headers = map[string]string{"x-dureq-operation-key": operation}
+	job := newJob(wf.HookStates[name].JobID, def.TaskType, def.Payload, operation, now)
 	job.Priority = wf.Definition.DefaultPriority
 	job.WorkflowID = &wf.ID
 	job.WorkflowTask = &taskName
 	return job
 }
 
-func newJob(id string, taskType types.TaskType, payload []byte, now time.Time) *types.Job {
+// newJob returns a job that is to run at once. Executions of the same operation count once.
+func newJob(id string, taskType types.TaskType, payload []byte, operation string, now time.Time) *types.Job {
 	return &types.Job{
 		ID:        id,
 		TaskType:  taskType,
 		Payload:   payload,
 		Schedule:  types.Schedule{Type: types.ScheduleImmediate},
 		Status:    types.JobStatusPending,
+		Headers:   map[string]string{"x-dureq-operation-key": operation},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}

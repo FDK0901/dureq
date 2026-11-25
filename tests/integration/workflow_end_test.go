@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"testing"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/client"
+	"github.com/FDK0901/dureq/internal/dispatcher"
+	"github.com/FDK0901/dureq/internal/monitor"
 	"github.com/FDK0901/dureq/pkg/types"
 )
 
@@ -98,6 +101,101 @@ func TestWorkflow_InitHook(t *testing.T) {
 	}
 }
 
+// A batch that was stopped with items pending and under way completes when it is retried,
+// and no item that succeeded runs again.
+func TestBatch_RetryOfStoppedBatch(t *testing.T) {
+	timeout := types.Duration(3 * time.Second)
+	for name, tc := range map[string]struct {
+		policy  types.BatchFailurePolicy
+		timeout *types.Duration
+		cancel  bool
+	}{
+		"fail fast": {policy: types.BatchFailFast},
+		"cancelled": {policy: types.BatchContinueOnError, cancel: true},
+		"timed out": {policy: types.BatchContinueOnError, timeout: &timeout},
+	} {
+		for how, retry := range map[string]func(cli *client.Client, api *monitor.APIService, id string) error{
+			"client": func(cli *client.Client, _ *monitor.APIService, id string) error {
+				_, err := cli.RetryBatch(context.Background(), id, true)
+				return err
+			},
+			"api": func(_ *client.Client, api *monitor.APIService, id string) error {
+				return api.RetryBatch(context.Background(), id, true)
+			},
+			"bulk": func(_ *client.Client, api *monitor.APIService, id string) error {
+				_, err := api.BulkRetryBatches(context.Background(), monitor.BulkRequest{IDs: []string{id}})
+				return err
+			},
+		} {
+			t.Run(name+" by "+how, func(t *testing.T) {
+				var c tally
+				release := make(chan struct{})
+				cli := startTally(t, "tally.stop", &c, func(id string) error {
+					first := len(c.not(1, []string{id})) == 0
+					switch {
+					case id == "i002" && first && name == "fail fast":
+						return &types.NonRetryableError{Err: errBoom}
+					case id == "i004" && first: // is under way when the batch is stopped
+						select {
+						case <-release:
+						case <-time.After(20 * time.Second):
+						}
+					}
+					return nil
+				})
+				items, ids := batchItems(12)
+				batch, err := cli.EnqueueBatch(context.Background(), types.BatchDefinition{
+					Name: "stop", ItemTaskType: "tally.stop", Items: items, ChunkSize: 5, FailurePolicy: tc.policy, ExecutionTimeout: tc.timeout,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.cancel {
+					waitFor(t, 10*time.Second, "i004 to run", func() bool { return len(c.not(1, []string{"i004"})) == 0 })
+					if err := cli.CancelBatch(context.Background(), batch.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				stopped := waitBatch(t, cli, batch.ID)
+				close(release)
+				time.Sleep(time.Second)
+				if stopped.Status == types.WorkflowStatusCompleted {
+					t.Fatalf("batch completed, want it stopped: %+v", stopped)
+				}
+
+				api := monitor.NewAPIService(cli.Store(), dispatcher.New(cli.Store(), nil), nil)
+				defer api.Shutdown()
+				if err := retry(cli, api, batch.ID); err != nil {
+					t.Fatalf("retry: %v", err)
+				}
+				var got *types.BatchInstance
+				deadline := time.Now().Add(12 * time.Second)
+				for time.Now().Before(deadline) {
+					got, _ = cli.GetBatch(context.Background(), batch.ID)
+					if got.Status.IsTerminal() {
+						break
+					}
+					time.Sleep(50 * time.Millisecond)
+				}
+				if got.Status != types.WorkflowStatusCompleted || got.CompletedItems != 12 || got.RunningItems != 0 || got.PendingItems != 0 {
+					states := map[types.JobStatus]int{}
+					for _, s := range got.ItemStates {
+						states[s.Status]++
+					}
+					t.Errorf("batch %s: %d completed, %d failed, %d running, %d pending; items %v", got.Status, got.CompletedItems, got.FailedItems, got.RunningItems, got.PendingItems, states)
+				}
+				want := map[string]int{}
+				if name == "fail fast" {
+					want["i002"] = 2 // failed, and retried
+				}
+				if off := c.not(1, ids); !maps.Equal(off, want) {
+					t.Errorf("not run once: %v, want %v", off, want)
+				}
+			})
+		}
+	}
+}
+
 // A task next to one that is skipped.
 func TestWorkflow_TasksNextToSkippedOneRunOnce(t *testing.T) {
 	var c tally
@@ -119,6 +217,77 @@ func TestWorkflow_TasksNextToSkippedOneRunOnce(t *testing.T) {
 		if off := c.not(1, []string{n("x"), n("y")}); len(off) > 0 {
 			t.Errorf("did not run once: %v", off)
 		}
+	}
+}
+
+// A task that is under way when the workflow fails, and done by the time it is retried.
+func TestWorkflow_RetryWithTaskUnderWay(t *testing.T) {
+	for how, retry := range map[string]func(cli *client.Client, api *monitor.APIService, id string) error{
+		"client": func(cli *client.Client, _ *monitor.APIService, id string) error {
+			_, err := cli.RetryWorkflow(context.Background(), id)
+			return err
+		},
+		"api": func(_ *client.Client, api *monitor.APIService, id string) error {
+			return api.RetryWorkflow(context.Background(), id)
+		},
+		"bulk": func(_ *client.Client, api *monitor.APIService, id string) error {
+			_, err := api.BulkRetryWorkflows(context.Background(), monitor.BulkRequest{IDs: []string{id}})
+			return err
+		},
+	} {
+		t.Run(how, func(t *testing.T) {
+			var c tally
+			cli := startTally(t, "tally.wf", &c, func(id string) error {
+				first := len(c.not(1, []string{id})) == 0
+				if id == "slow" {
+					time.Sleep(1500 * time.Millisecond)
+				}
+				if id == "bad" && first {
+					return &types.NonRetryableError{Err: errBoom}
+				}
+				return nil
+			})
+			wf, err := cli.EnqueueWorkflow(context.Background(), types.WorkflowDefinition{Name: "w", Tasks: []types.WorkflowTask{tallyTask("slow"), tallyTask("bad"), tallyTask("join", "slow", "bad")}}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitWorkflow(t, cli, wf.ID, types.WorkflowStatusFailed)
+			time.Sleep(2500 * time.Millisecond)
+			api := monitor.NewAPIService(cli.Store(), dispatcher.New(cli.Store(), nil), nil)
+			defer api.Shutdown()
+			if err := retry(cli, api, wf.ID); err != nil {
+				t.Fatal(err)
+			}
+			waitWorkflow(t, cli, wf.ID, types.WorkflowStatusCompleted)
+			if off := c.not(1, []string{"slow", "join"}); len(off) > 0 {
+				t.Errorf("did not run once: %v", off)
+			}
+		})
+	}
+}
+
+// Retrying all items runs all of them again.
+func TestBatch_RetryAllItems(t *testing.T) {
+	var c tally
+	cli := startTally(t, "tally.all", &c, func(id string) error {
+		if id == "i007" && len(c.not(1, []string{id})) == 0 {
+			return &types.NonRetryableError{Err: errBoom}
+		}
+		return nil
+	})
+	items, ids := batchItems(12)
+	batch, err := cli.EnqueueBatch(context.Background(), types.BatchDefinition{Name: "all", ItemTaskType: "tally.all", Items: items, ChunkSize: 5, FailurePolicy: types.BatchContinueOnError})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitBatch(t, cli, batch.ID)
+	if _, err := cli.RetryBatch(context.Background(), batch.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	waitBatch(t, cli, batch.ID)
+	time.Sleep(time.Second)
+	if off := c.not(2, ids); len(off) > 0 {
+		t.Errorf("did not run twice: %v", off)
 	}
 }
 
@@ -216,5 +385,61 @@ func TestWorkflow_HooksAfterRetry(t *testing.T) {
 	}
 	if off := c.not(2, []string{"exit"}); len(off) > 0 {
 		t.Errorf("did not run twice: %v", off)
+	}
+}
+
+// A child workflow that is under way when its parent fails, and done by the time that is
+// retried.
+func TestWorkflow_RetryWithChildUnderWay(t *testing.T) {
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		first := len(c.not(1, []string{id})) == 0
+		if id == "inner" {
+			time.Sleep(1500 * time.Millisecond)
+		}
+		if id == "bad" && first {
+			return &types.NonRetryableError{Err: errBoom}
+		}
+		return nil
+	})
+	child := types.WorkflowTask{Name: "child", ChildWorkflowDef: &types.WorkflowDefinition{Name: "inner", Tasks: []types.WorkflowTask{tallyTask("inner")}}}
+	wf, err := cli.EnqueueWorkflow(context.Background(), types.WorkflowDefinition{Name: "w", Tasks: []types.WorkflowTask{child, tallyTask("bad"), tallyTask("join", "child", "bad")}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitWorkflow(t, cli, wf.ID, types.WorkflowStatusFailed)
+	time.Sleep(2500 * time.Millisecond)
+	if _, err := cli.RetryWorkflow(context.Background(), wf.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitWorkflow(t, cli, wf.ID, types.WorkflowStatusCompleted)
+	if off := c.not(1, []string{"inner", "join"}); len(off) > 0 {
+		t.Errorf("did not run once: %v", off)
+	}
+}
+
+// A task whose result is never to be reused runs again when the workflow is retried.
+func TestWorkflow_RetryRunsTaskWithoutReuse(t *testing.T) {
+	var c tally
+	cli := startTally(t, "tally.wf", &c, func(id string) error {
+		if id == "bad" && len(c.not(1, []string{id})) == 0 {
+			return &types.NonRetryableError{Err: errBoom}
+		}
+		return nil
+	})
+	again, kept := tallyTask("again", "kept"), tallyTask("kept")
+	again.ResultReuse = types.ResultReuseNever
+	wf, err := cli.EnqueueWorkflow(context.Background(), types.WorkflowDefinition{
+		Name: "w", Tasks: []types.WorkflowTask{again, kept, tallyTask("bad", "again", "kept")}, RetryPolicy: &types.RetryPolicy{MaxAttempts: 2},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitWorkflow(t, cli, wf.ID, types.WorkflowStatusCompleted)
+	if off := c.not(2, []string{"again", "bad"}); len(off) > 0 {
+		t.Errorf("did not run twice: %v", off)
+	}
+	if off := c.not(1, []string{"kept"}); len(off) > 0 {
+		t.Errorf("did not run once: %v", off)
 	}
 }

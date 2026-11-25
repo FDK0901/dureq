@@ -67,11 +67,6 @@ func (o *Orchestrator) changeBatch(ctx context.Context, batchID string, change f
 // left to whoever created it.
 func (o *Orchestrator) startBatchJobs(ctx context.Context, batchID string, jobs []*types.Job) error {
 	for _, job := range jobs {
-		operation := "onetime"
-		if job.BatchItem != nil {
-			operation = "item:" + *job.BatchItem
-		}
-		job.Headers = map[string]string{"x-dureq-operation-key": batchID + ":" + operation}
 		if err := o.startJob(ctx, job); err != nil {
 			delete(o.checked, batchID) // the next event of the batch has it looked at again
 			o.logger.Error().String("batch_id", batchID).String("job_id", job.ID).Err(err).Msg("batch: failed to start job")
@@ -128,7 +123,7 @@ func (o *Orchestrator) ensureBatchJobs(ctx context.Context, batchID string) erro
 		return err
 	}
 	if len(missing) > 0 {
-		o.logger.Warn().String("batch_id", batchID).Int("jobs", len(missing)).Msg("batch: starting jobs that were reserved but not started")
+		o.logger.Debug().String("batch_id", batchID).Int("jobs", len(missing)).Msg("batch: starting jobs that are reserved but not started")
 	}
 	if err := o.startBatchJobs(ctx, batchID, missing); err != nil {
 		return err
@@ -312,7 +307,7 @@ func (o *Orchestrator) updateBatchItemRetrying(ctx context.Context, job *types.J
 	})
 }
 
-// handleBatchRetry dispatches the first chunk after an API-triggered batch retry.
+// handleBatchRetry goes on with a batch that is retried.
 func (o *Orchestrator) handleBatchRetry(ctx context.Context, event types.JobEvent) error {
 	batchID := event.JobID
 	if batchID == "" {
@@ -321,17 +316,75 @@ func (o *Orchestrator) handleBatchRetry(ctx context.Context, event types.JobEven
 	if err := o.ensureBatchJobs(ctx, batchID); err != nil {
 		return err
 	}
-	return o.changeBatch(ctx, batchID, func(batch *types.BatchInstance, now time.Time) *batchStep {
+	ended, lost, err := o.endedItems(ctx, batchID)
+	if err != nil {
+		return err
+	}
+
+	err = o.changeBatch(ctx, batchID, func(batch *types.BatchInstance, now time.Time) *batchStep {
+		for itemID, jobID := range lost {
+			if state := batch.ItemStates[itemID]; state.JobID == jobID {
+				resetItem(&state)
+				batch.ItemStates[itemID] = state
+				batch.NextChunkIndex = 0
+			}
+		}
+		countItems(batch)
 		if st := batch.OnetimeState; st != nil && st.Status == types.JobStatusRunning {
 			return nil // this event has been handled before
 		}
 		jobs := ReserveBatch(batch, now)
 		if len(jobs) == 0 {
-			return nil
+			return o.finishIfDone(batch, now)
 		}
 		o.logger.Info().String("batch_id", batchID).Msg("orchestrator: dispatching batch retry")
 		return &batchStep{jobs: jobs}
 	})
+	if err != nil {
+		return err
+	}
+
+	// What ended while the batch had ended, too, was not counted.
+	for _, job := range ended {
+		if err := o.replayEnd(ctx, job); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// endedItems returns the jobs of items that have ended although the items count as running,
+// and the items, with their job IDs, whose jobs are gone or cancelled.
+func (o *Orchestrator) endedItems(ctx context.Context, batchID string) (ended []*types.Job, lost map[string]string, err error) {
+	batch, _, err := o.store.GetBatch(ctx, batchID)
+	if err != nil {
+		return nil, nil, err
+	}
+	lost = make(map[string]string)
+	for itemID, state := range batch.ItemStates {
+		if state.JobID == "" || state.Status != types.JobStatusRunning && state.Status != types.JobStatusRetrying {
+			continue
+		}
+		job, _, err := o.store.GetJob(ctx, state.JobID)
+		switch {
+		case errors.Is(err, types.ErrJobNotFound) || err == nil && job.Status == types.JobStatusCancelled:
+			lost[itemID] = state.JobID
+		case err != nil:
+			return nil, nil, err
+		case job.Status.IsTerminal():
+			ended = append(ended, job)
+		}
+	}
+	return ended, lost, nil
+}
+
+// replayEnd handles the end of a job whose event came while its workflow or batch had ended.
+func (o *Orchestrator) replayEnd(ctx context.Context, job *types.Job) error {
+	event := types.JobEvent{JobID: job.ID, TaskType: job.TaskType, Error: job.LastError, Timestamp: time.Now()}
+	if job.Status == types.JobStatusCompleted {
+		return o.handleJobCompleted(ctx, event)
+	}
+	return o.handleJobFailed(ctx, event)
 }
 
 // advanceBatch goes on with a batch after an item: with the next chunk, or to its end.
@@ -363,7 +416,12 @@ func (o *Orchestrator) isBatchDone(batch *types.BatchInstance) bool {
 func (o *Orchestrator) finalizeBatch(batch *types.BatchInstance, now time.Time) *batchStep {
 	step := &batchStep{progress: true}
 	if batch.FailedItems > 0 && batch.Definition.RetryPolicy != nil && batch.Attempt < batch.Definition.RetryPolicy.MaxAttempts {
-		resetFailedItems(batch, now)
+		ResetBatch(batch, true, now)
+		// Recalculate deadline if ExecutionTimeout is set.
+		if batch.Definition.ExecutionTimeout != nil {
+			deadline := now.Add(batch.Definition.ExecutionTimeout.Std())
+			batch.Deadline = &deadline
+		}
 		step.jobs = ReserveBatch(batch, now)
 		o.logger.Info().String("batch_id", batch.ID).Int("attempt", batch.Attempt).Msg("batch retrying")
 		return step
@@ -380,37 +438,6 @@ func (o *Orchestrator) finalizeBatch(batch *types.BatchInstance, now time.Time) 
 		o.logger.Info().String("batch_id", batch.ID).Int("completed", batch.CompletedItems).Msg("batch completed successfully")
 	}
 	return step
-}
-
-// resetFailedItems puts the failed items of a batch back to pending for another attempt.
-func resetFailedItems(batch *types.BatchInstance, now time.Time) {
-	batch.Attempt++
-	batch.Status = types.WorkflowStatusRunning
-	batch.CompletedAt = nil
-
-	// Recalculate deadline if ExecutionTimeout is set.
-	if batch.Definition.ExecutionTimeout != nil {
-		deadline := now.Add(batch.Definition.ExecutionTimeout.Std())
-		batch.Deadline = &deadline
-	}
-
-	batch.FailedItems = 0
-	batch.RunningItems = 0
-	batch.PendingItems = 0
-	batch.CompletedItems = 0
-	for id, state := range batch.ItemStates {
-		switch state.Status {
-		case types.JobStatusCompleted:
-			batch.CompletedItems++
-		case types.JobStatusFailed:
-			batch.ItemStates[id] = types.BatchItemState{ItemID: state.ItemID, Status: types.JobStatusPending}
-			batch.PendingItems++
-		}
-	}
-	batch.NextChunkIndex = 0
-	if NeedsBatchOnetime(batch) {
-		batch.OnetimeState = nil
-	}
 }
 
 // role returns the role of a job in its batch.

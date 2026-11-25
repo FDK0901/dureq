@@ -60,3 +60,28 @@ func TestRecurring_AutoPaused_ResumesByItself(t *testing.T) {
 	waitStatus(t, cli, job.ID, types.JobStatusPaused)
 	waitFor(t, 60*time.Second, "runs after the pause", func() bool { return len(rec.seen()) >= threshold+3 })
 }
+
+// A node reports what it has executed.
+func TestNode_Totals(t *testing.T) {
+	rec := &recorder{fail: func(run int) error {
+		if run == 0 {
+			return errBoom
+		}
+		return nil
+	}}
+	_, cli := startRecorder(t, "node.totals", rec)
+	job := mustEvery(t, cli, "node.totals", time.Second, fastRetry(3), "node-totals")
+	waitFor(t, 20*time.Second, "runs", func() bool { return len(rec.seen()) >= 4 })
+	if err := cli.Cancel(context.Background(), job.ID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+
+	waitFor(t, 20*time.Second, "totals of the node", func() bool {
+		nodes, err := cli.Store().ListNodes(context.Background())
+		if err != nil || len(nodes) != 1 || nodes[0].PoolStats == nil {
+			return false
+		}
+		ps := nodes[0].PoolStats
+		return ps.TotalFailed == 1 && ps.TotalCompleted >= 3 && ps.TotalSubmitted == ps.TotalCompleted+ps.TotalFailed
+	})
+}

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/dispatcher"
@@ -79,8 +80,14 @@ type Worker struct {
 	shutdownTimeout time.Duration
 	stopOnce        sync.Once
 	syncer          *SyncRetrier
-	ctx             context.Context
-	cancel          context.CancelFunc
+
+	// Executions since the worker was created.
+	submitted atomic.Uint64
+	completed atomic.Uint64
+	failed    atomic.Uint64
+
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // New creates a new worker.
@@ -184,6 +191,9 @@ func (w *Worker) Stats() *types.PoolStats {
 		RunningWorkers: w.pool.Running(),
 		IdleWorkers:    w.pool.Free(),
 		MaxConcurrency: w.pool.Cap(),
+		TotalSubmitted: w.submitted.Load(),
+		TotalCompleted: w.completed.Load(),
+		TotalFailed:    w.failed.Load(),
 	}
 }
 
@@ -674,6 +684,16 @@ func (w *Worker) processMessage(sm *streamMessage) {
 		OperationKey: work.OperationKey,
 	}
 	w.store.SaveRun(w.ctx, run)
+
+	w.submitted.Add(1)
+	defer func() {
+		switch run.Status {
+		case types.RunStatusSucceeded:
+			w.completed.Add(1)
+		case types.RunStatusFailed:
+			w.failed.Add(1)
+		}
+	}()
 
 	// Start heartbeat goroutine for this run.
 	var runMu sync.Mutex

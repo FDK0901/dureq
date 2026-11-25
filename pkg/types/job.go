@@ -513,9 +513,9 @@ type PoolStats struct {
 	RunningWorkers int    `json:"running_workers"`
 	IdleWorkers    int    `json:"idle_workers"`
 	MaxConcurrency int    `json:"max_concurrency"`
-	TotalSubmitted uint64 `json:"total_submitted"`
-	TotalCompleted uint64 `json:"total_completed"`
-	TotalFailed    uint64 `json:"total_failed"`
+	TotalSubmitted uint64 `json:"total_submitted"` // executions started since the node did
+	TotalCompleted uint64 `json:"total_completed"` // of these, the ones that succeeded
+	TotalFailed    uint64 `json:"total_failed"`    // and the ones that failed, retried or not
 	QueueLength    int    `json:"queue_length"`
 }
 

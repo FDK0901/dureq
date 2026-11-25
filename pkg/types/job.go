@@ -486,6 +486,28 @@ type NodeInfo struct {
 	HandlerVersions map[string]string `json:"handler_versions,omitempty"`
 }
 
+// Pause puts the job on hold. It resumes by itself after retryAfter, or only when it is
+// resumed if that is 0.
+func (j *Job) Pause(now time.Time, retryAfter time.Duration) {
+	j.Status = JobStatusPaused
+	j.PausedAt = &now
+	j.ResumeAt = nil
+	if retryAfter > 0 {
+		resumeAt := now.Add(retryAfter)
+		j.ResumeAt = &resumeAt
+	}
+	j.UpdatedAt = now
+}
+
+// Resume takes the job off hold. The caller stores and dispatches it.
+func (j *Job) Resume(now time.Time) {
+	j.Status = JobStatusRetrying
+	j.PausedAt = nil
+	j.ResumeAt = nil
+	j.ConsecutiveErrors = 0
+	j.UpdatedAt = now
+}
+
 // PoolStats captures worker pool metrics for a node.
 type PoolStats struct {
 	RunningWorkers int    `json:"running_workers"`

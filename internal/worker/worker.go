@@ -956,17 +956,15 @@ func (w *Worker) pauseJob(work types.WorkMessage, execErr error) {
 
 	now := time.Now()
 	errStr := execErr.Error()
-	job.Status = types.JobStatusPaused
 	job.RunCount++
 	job.LastError = &errStr
-	job.PausedAt = &now
-	job.UpdatedAt = now
 
+	var retryAfter time.Duration
 	var pauseErr *types.PauseError
-	if errors.As(execErr, &pauseErr) && pauseErr.RetryAfter > 0 {
-		resumeAt := now.Add(pauseErr.RetryAfter)
-		job.ResumeAt = &resumeAt
+	if errors.As(execErr, &pauseErr) {
+		retryAfter = pauseErr.RetryAfter
 	}
+	job.Pause(now, retryAfter)
 
 	syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("pause job %s", work.JobID))
 
@@ -1235,12 +1233,7 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 
 	case shouldPause:
 		// Auto-pause: consecutive error threshold reached.
-		job.Status = types.JobStatusPaused
-		job.PausedAt = &now
-		if retryPolicy.PauseRetryDelay > 0 {
-			resumeAt := now.Add(retryPolicy.PauseRetryDelay)
-			job.ResumeAt = &resumeAt
-		}
+		job.Pause(now, retryPolicy.PauseRetryDelay)
 		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("pause job %s", work.JobID))
 		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
 		w.logger.Warn().String("job_id", work.JobID).Int("consecutive_errors", job.ConsecutiveErrors).Msg("worker: auto-paused after consecutive errors")

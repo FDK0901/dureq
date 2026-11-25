@@ -187,11 +187,7 @@ func (s *Scheduler) resumePausedJobs(ctx context.Context, now time.Time) {
 			continue
 		}
 
-		job.Status = types.JobStatusRetrying
-		job.PausedAt = nil
-		job.ResumeAt = nil
-		job.ConsecutiveErrors = 0
-		job.UpdatedAt = now
+		job.Resume(now)
 
 		if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
 			s.logger.Warn().String("job_id", job.ID).Err(err).Msg("scheduler: failed to resume paused job")
@@ -239,6 +235,24 @@ func (s *Scheduler) processScheduleEntry(ctx context.Context, entry *types.Sched
 		// Normally done when the job ended, unless that process stopped in between.
 		s.releaseEndedJobUniqueKey(ctx, entry.JobID)
 		return
+	}
+
+	// A paused job does not fire. What falls due meanwhile is skipped rather than
+	// caught up on: resuming the job runs what it was paused on and then goes on
+	// with the schedule. The cached job may be older than the pause (or the resume),
+	// so it is read anew.
+	if job.Status.IsPaused() {
+		s.cache.InvalidateJob(entry.JobID)
+		if job, rev, err = s.cache.GetJob(ctx, entry.JobID); err != nil {
+			s.logger.Error().String("job_id", entry.JobID).Err(err).Msg("scheduler: failed to get paused job")
+			return
+		}
+		if job.Status.IsPaused() {
+			s.logger.Debug().String("job_id", entry.JobID).Msg("scheduler: job is paused, skipping firing")
+			entry.LastProcessedAt = &now
+			s.advanceSchedule(ctx, entry, now)
+			return
+		}
 	}
 
 	// --- Overlap policy check ---

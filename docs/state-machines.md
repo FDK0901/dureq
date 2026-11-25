@@ -46,6 +46,10 @@ are logged as warnings via `UpdateJob`.
 ### Notes
 - `failed` is NOT terminal — it indicates a single attempt failed but retries remain
 - `paused` can be entered from `running` (via `PauseError`) or `failed` (auto-pause on consecutive errors)
+- A paused recurring job does not fire. Firings that fall due meanwhile are skipped and not caught up on. It resumes
+  after `PauseRetryDelay` (or `PauseError.RetryAfter`); without one, only by `ResumeJob` or `POST /api/jobs/{id}/resume`.
+  It then runs what it was paused on and goes on with its schedule
+- A run that was under way when its job was paused still counts: if it succeeds, the job is back on its schedule
 - `dead` → `retrying` is only allowed via explicit `RetryJob` / `BulkRetryJobs` API calls
 - Entering `dead` or `cancelled` releases the job's unique key (only if the job holds it); entering `completed` does not
 - A recurring job whose schedule has `KeepOnFailure` goes back to `scheduled` instead of `dead` when a firing is given up

@@ -604,11 +604,7 @@ func (c *Client) ResumeJob(ctx context.Context, jobID string) error {
 	}
 
 	now := time.Now()
-	job.Status = types.JobStatusRetrying
-	job.PausedAt = nil
-	job.ResumeAt = nil
-	job.ConsecutiveErrors = 0
-	job.UpdatedAt = now
+	job.Resume(now)
 
 	newRev, err := c.store.UpdateJob(ctx, job, rev)
 	if err != nil {

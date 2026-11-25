@@ -105,7 +105,7 @@ Client (Go)
 - **Batch Processing** — Optional onetime preprocessing, chunked parallel item execution, failure policies
 - **Group Aggregation** — Collect individual tasks into groups, automatically flush and aggregate into a single job based on grace period, max delay, or max size
 - **Mux Handler** — Pattern-based task type routing (`order.*`), global and per-handler middleware
-- **Priority Queues** — User-defined tiers, of which those with a higher weight are looked at first
+- **Priority Queues** — User-defined tiers, looked at in their order
 - **Concurrency Limits** — Per node (`MaxConcurrency`), per handler and node (`Concurrency`), and per key across the cluster (`ConcurrencyKeys`). A handler that has reached its limit does not hold up the others ([details](docs/concurrency.md))
 - **Task Queue Rate Limiting** — Distributed token bucket rate limiter per queue (Redis Lua-backed)
 
@@ -323,7 +323,7 @@ See [docs/batch-model.md](docs/batch-model.md).
 
 ## Priority Tiers
 
-All jobs share one queue unless you define tiers. The priority of a job, from 1 to 10, decides which one it goes to:
+All jobs share one queue unless you define tiers. List them from the most to the least important: workers look at them in that order, and the priority of a job, from 10 to 1, decides which one it goes to. `Weight` is shown by the monitoring API and does not change the order.
 
 ```go
 tiers := []dureq.TierConfig{

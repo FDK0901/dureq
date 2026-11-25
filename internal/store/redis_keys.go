@@ -82,10 +82,6 @@ func HistoryRunsKey(prefix string) string                   { return prefix + ":
 func HistoryRunKey(prefix, runID string) string             { return fmt.Sprintf("%s:history:run:%s", prefix, runID) }
 func HistoryRunsByJobKey(prefix, jobID string) string       { return fmt.Sprintf("%s:history:runs:by_job:%s", prefix, jobID) }
 func HistoryRunsByStatusKey(prefix, status string) string   { return fmt.Sprintf("%s:history:runs:by_status:%s", prefix, status) }
-func HistoryEventsKey(prefix string) string                 { return prefix + ":history:events" }
-func HistoryEventKey(prefix, eventID string) string         { return fmt.Sprintf("%s:history:event:%s", prefix, eventID) }
-func HistoryEventsByJobKey(prefix, jobID string) string     { return fmt.Sprintf("%s:history:events:by_job:%s", prefix, jobID) }
-func HistoryEventsByTypeKey(prefix, eventType string) string { return fmt.Sprintf("%s:history:events:by_type:%s", prefix, eventType) }
 
 // Consumer group names
 const ConsumerGroup = "dureq_workers"

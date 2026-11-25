@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bytedance/sonic"
 
@@ -214,48 +215,73 @@ func (s *RedisStore) removeStaleRuns(ctx context.Context, indexKey string, statu
 // Paginated Job Event listing (history)
 // ============================================================
 
-// ListJobEvents returns paginated job events from history.
+const (
+	eventScanChunkSize = 1000
+	// eventClockSkew is how far the clock of the node that published an event, which is
+	// the event's Timestamp, may be off that of Redis, which is the ID in the stream.
+	eventClockSkew = time.Minute
+)
+
+// ListJobEvents returns a page of the events, newest first, and how many there are. They
+// are read from the event stream, which keeps about the last EventStreamMaxLen of them.
+// If filter.SkipTotal is set, the count goes no further than the page.
 func (s *RedisStore) ListJobEvents(ctx context.Context, filter EventFilter) ([]types.JobEvent, int, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = 20
 	}
 
-	indexKey := HistoryEventsKey(s.prefix)
-	if filter.JobID != nil {
-		indexKey = HistoryEventsByJobKey(s.prefix, *filter.JobID)
-	} else if filter.EventType != nil {
-		indexKey = HistoryEventsByTypeKey(s.prefix, string(*filter.EventType))
-	}
-
-	min, max := "-inf", "+inf"
+	start, end := "-", "+"
 	if filter.Since != nil {
-		min = strconv.FormatFloat(float64(filter.Since.UnixNano()), 'f', 0, 64)
+		start = strconv.FormatInt(max(0, filter.Since.Add(-eventClockSkew).UnixMilli()), 10)
 	}
 	if filter.Until != nil {
-		max = strconv.FormatFloat(float64(filter.Until.UnixNano()), 'f', 0, 64)
+		end = strconv.FormatInt(max(0, filter.Until.Add(eventClockSkew).UnixMilli()), 10)
 	}
 
-	total, err := s.rdb.Do(ctx, s.rdb.B().Zcount().Key(indexKey).Min(min).Max(max).Build()).AsInt64()
-	if err != nil {
-		return nil, 0, fmt.Errorf("count events: %w", err)
-	}
-	if total == 0 {
-		return nil, 0, nil
-	}
+	// Without a filter there is no need to read all events to count them.
+	unfiltered := filter.JobID == nil && filter.EventType == nil && filter.Since == nil && filter.Until == nil
 
-	ids, err := s.rdb.Do(ctx, s.rdb.B().Zrevrangebyscore().Key(indexKey).Max(max).Min(min).Limit(int64(filter.Offset), int64(filter.Limit)).Build()).AsStrSlice()
-	if err != nil {
-		return nil, 0, fmt.Errorf("paginate events: %w", err)
+	var page []types.JobEvent
+	total := 0
+	for {
+		entries, err := s.rdb.Do(ctx, s.rdb.B().Xrevrange().Key(EventsStreamKey(s.prefix)).End(end).Start(start).Count(eventScanChunkSize).Build()).AsXRange()
+		if err != nil {
+			return nil, 0, fmt.Errorf("list events: %w", err)
+		}
+		for _, entry := range entries {
+			if filter.JobID != nil && entry.FieldValues["job_id"] != *filter.JobID {
+				continue
+			}
+			if filter.EventType != nil && entry.FieldValues["type"] != string(*filter.EventType) {
+				continue
+			}
+			inPage := total >= filter.Offset && len(page) < filter.Limit
+			if inPage || filter.Since != nil || filter.Until != nil {
+				var event types.JobEvent
+				if err := sonic.ConfigFastest.Unmarshal([]byte(entry.FieldValues["data"]), &event); err != nil {
+					continue
+				}
+				if filter.Since != nil && event.Timestamp.Before(*filter.Since) || filter.Until != nil && event.Timestamp.After(*filter.Until) {
+					continue
+				}
+				if inPage {
+					page = append(page, event)
+				}
+			}
+			total++
+		}
+		if len(entries) < eventScanChunkSize || filter.SkipTotal && len(page) == filter.Limit {
+			return page, total, nil
+		}
+		if unfiltered && len(page) == filter.Limit {
+			n, err := s.rdb.Do(ctx, s.rdb.B().Xlen().Key(EventsStreamKey(s.prefix)).Build()).AsInt64()
+			if err != nil {
+				return nil, 0, fmt.Errorf("count events: %w", err)
+			}
+			return page, int(n), nil
+		}
+		end = "(" + entries[len(entries)-1].ID
 	}
-	if len(ids) == 0 {
-		return nil, int(total), nil
-	}
-
-	events, err := s.hydrateEventValues(ctx, ids)
-	if err != nil {
-		return nil, 0, err
-	}
-	return events, int(total), nil
 }
 
 // ============================================================
@@ -473,27 +499,6 @@ func (s *RedisStore) hydrateRunValues(ctx context.Context, ids []string) ([]type
 		}
 	}
 	return runs, nil
-}
-
-func (s *RedisStore) hydrateEventValues(ctx context.Context, ids []string) ([]types.JobEvent, error) {
-	cmds := make(rueidis.Commands, 0, len(ids))
-	for _, id := range ids {
-		cmds = append(cmds, s.rdb.B().Hget().Key(HistoryEventKey(s.prefix, id)).Field("data").Build())
-	}
-	results := s.rdb.DoMulti(ctx, cmds...)
-
-	var events []types.JobEvent
-	for _, r := range results {
-		dataStr, err := r.ToString()
-		if err != nil {
-			continue
-		}
-		var event types.JobEvent
-		if sonic.ConfigFastest.Unmarshal([]byte(dataStr), &event) == nil {
-			events = append(events, event)
-		}
-	}
-	return events, nil
 }
 
 func (s *RedisStore) hydrateWorkflowValues(ctx context.Context, ids []string) ([]types.WorkflowInstance, error) {

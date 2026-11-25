@@ -132,6 +132,8 @@ Bulk operations: `POST /api/{jobs,workflows,batches}/bulk/{cancel,retry,delete}`
 
 Search by payload JSONPath: `GET /api/search/{jobs,workflows,batches}?path=field&value=val`
 
+`GET /api/history/events` reads the event stream, which keeps about the last `EventStreamMaxLen` events (50,000).
+
 ## Repair Operations
 
 ### Requeue a Stuck Run

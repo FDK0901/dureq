@@ -276,6 +276,14 @@ func (a *APIService) DeleteJob(ctx context.Context, jobID string) error {
 }
 
 func (a *APIService) ListJobEvents(ctx context.Context, filter store.EventFilter) ([]types.JobEvent, int, error) {
+	// A job has no events from before it was created, so these need not be gone through.
+	// The clocks of the nodes may differ a little.
+	if filter.JobID != nil && filter.Since == nil {
+		if job, _, err := a.store.GetJob(ctx, *filter.JobID); err == nil {
+			since := job.CreatedAt.Add(-time.Minute)
+			filter.Since = &since
+		}
+	}
 	return a.store.ListJobEvents(ctx, filter)
 }
 
@@ -374,7 +382,7 @@ func (a *APIService) CleanupRunHistory(ctx context.Context, age time.Duration) (
 }
 
 func (a *APIService) ListHistoryEvents(ctx context.Context, filter store.EventFilter) ([]types.JobEvent, int, error) {
-	return a.store.ListJobEvents(ctx, filter)
+	return a.ListJobEvents(ctx, filter)
 }
 
 // ===================== DLQ =====================

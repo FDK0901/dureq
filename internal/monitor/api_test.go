@@ -225,6 +225,136 @@ func TestQueues_Depth(t *testing.T) {
 	check("1 of them done, 1 to retry", 5, 2, 2, 1)
 }
 
+func publish(t *testing.T, st *store.RedisStore, event types.JobEvent) {
+	t.Helper()
+	if event.Timestamp.IsZero() {
+		event.Timestamp = time.Now()
+	}
+	if err := st.PublishEvent(context.Background(), event); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+}
+
+type eventPage struct {
+	Data  []types.JobEvent `json:"data"`
+	Total int              `json:"total"`
+}
+
+func TestHistoryEvents(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	var page eventPage
+	get(t, srv, "/api/history/events", &page)
+	if page.Total != 0 || len(page.Data) != 0 {
+		t.Fatalf("no events yet, got %+v", page)
+	}
+
+	createJob(t, st, "a", "t", types.JobStatusPending, 0)
+	for i := range 4 {
+		publish(t, st, types.JobEvent{Type: types.EventJobStarted, JobID: "a", RunID: fmt.Sprint("a", i)})
+		publish(t, st, types.JobEvent{Type: types.EventJobStarted, JobID: "b", RunID: fmt.Sprint("b", i)})
+	}
+	runs := func(path string) (string, int) {
+		t.Helper()
+		var page eventPage
+		get(t, srv, path, &page)
+		var ids []string
+		for _, e := range page.Data {
+			ids = append(ids, e.RunID)
+		}
+		return strings.Join(ids, " "), page.Total
+	}
+	for _, tc := range []struct {
+		path, want string
+		total      int
+	}{
+		{"/api/history/events", "b3 a3 b2 a2 b1 a1 b0 a0", 8},
+		{"/api/history/events?limit=3", "b3 a3 b2", 8},
+		{"/api/history/events?limit=3&offset=6", "b0 a0", 8},
+		{"/api/history/events?job_id=a", "a3 a2 a1 a0", 4},
+		{"/api/history/events?job_id=a&limit=2&offset=1", "a2 a1", 4},
+		{"/api/history/events?job_id=b&limit=1", "b3", 4}, // there is no such job (any more)
+		{"/api/history/events?job_id=none", "", 0},
+	} {
+		if got, total := runs(tc.path); got != tc.want || total != tc.total {
+			t.Errorf("%s: %q of %d, want %q of %d", tc.path, got, total, tc.want, tc.total)
+		}
+	}
+
+	// From a node whose clock is behind that of the client that created the job.
+	job := createJob(t, st, "late", "t", types.JobStatusPending, 0)
+	publish(t, st, types.JobEvent{Type: types.EventJobStarted, JobID: "late", RunID: "late0", Timestamp: job.CreatedAt.Add(-5 * time.Second)})
+	if got, total := runs("/api/history/events?job_id=late"); got != "late0" || total != 1 {
+		t.Errorf("event of a node with a clock that is behind: %q of %d", got, total)
+	}
+
+	var events []types.JobEvent
+	get(t, srv, "/api/jobs/a/events?limit=2", &events)
+	if len(events) != 2 || events[0].RunID != "a3" || events[1].RunID != "a2" {
+		t.Fatalf("events of the job: %+v", events)
+	}
+}
+
+// Events that a completed run leaves behind are written in a different way.
+func TestHistoryEvents_CompletedRun(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	createJob(t, st, "a", "t", types.JobStatusPending, 0)
+	run := &types.JobRun{ID: "r", JobID: "a", Status: types.RunStatusSucceeded, StartedAt: time.Now()}
+	err := st.CompleteRun(context.Background(), &store.CompletionBatch{
+		Run:    run,
+		Event:  types.JobEvent{Type: types.EventJobCompleted, JobID: "a", RunID: "r", Timestamp: time.Now()},
+		Result: types.WorkResult{RunID: "r", JobID: "a", Success: true}, DailyStatField: "processed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []types.JobEvent
+	get(t, srv, "/api/jobs/a/events", &events)
+	if len(events) != 1 || events[0].Type != types.EventJobCompleted {
+		t.Fatalf("events %+v, want the completion", events)
+	}
+}
+
+// A scan goes over more than one chunk of the stream, and over the time span asked for.
+func TestListJobEvents_LongStream(t *testing.T) {
+	st, _ := newTestAPI(t, nil)
+	ctx := context.Background()
+	rdb := st.Client()
+	const n = 2500
+	cmds := make(rueidis.Commands, 0, n)
+	start := time.Now().Add(-n * time.Second).Truncate(time.Second)
+	for i := range n {
+		at := start.Add(time.Duration(i) * time.Second)
+		jobID := "other"
+		if i%100 == 0 {
+			jobID = "rare"
+		}
+		data, _ := json.Marshal(types.JobEvent{Type: types.EventJobStarted, JobID: jobID, RunID: fmt.Sprint(i), Timestamp: at})
+		cmds = append(cmds, rdb.B().Xadd().Key(store.EventsStreamKey(st.Prefix())).Id(fmt.Sprintf("%d-0", at.UnixMilli())).FieldValue().
+			FieldValue("type", string(types.EventJobStarted)).FieldValue("job_id", jobID).FieldValue("data", string(data)).Build())
+	}
+	for _, r := range rdb.DoMulti(ctx, cmds...) {
+		if err := r.Error(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rare := "rare"
+	events, total, err := st.ListJobEvents(ctx, store.EventFilter{JobID: &rare, Limit: 3, Offset: 20})
+	if err != nil || total != 25 || len(events) != 3 || events[0].RunID != "400" || events[2].RunID != "200" {
+		t.Fatalf("got %v of %d (%v), want the runs 400, 300, 200 of 25", events, total, err)
+	}
+	if _, total, _ = st.ListJobEvents(ctx, store.EventFilter{JobID: &rare, Limit: 3, SkipTotal: true}); total >= 25 {
+		t.Fatalf("counted %d events although the total was to be skipped", total)
+	}
+	if events, total, err = st.ListJobEvents(ctx, store.EventFilter{Limit: 10}); err != nil || total != n || len(events) != 10 || events[0].RunID != "2499" {
+		t.Fatalf("unfiltered: %d events of %d (%v)", len(events), total, err)
+	}
+	since, until := start.Add(1000*time.Second), start.Add(1010*time.Second)
+	if events, total, err = st.ListJobEvents(ctx, store.EventFilter{Since: &since, Until: &until, Limit: 5}); err != nil || total != 11 || len(events) != 5 || events[0].RunID != "1010" {
+		t.Fatalf("time span: %v of %d (%v), want 5 of 11 from 1010 on", events, total, err)
+	}
+}
+
 type runPage struct {
 	Data  []types.JobRun `json:"data"`
 	Total int            `json:"total"`

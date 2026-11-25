@@ -97,8 +97,9 @@ func (g *GRPCServer) ListJobEvents(ctx context.Context, req *pb.ListJobEventsReq
 	}
 
 	events, _, err := g.svc.ListJobEvents(ctx, store.EventFilter{
-		JobID: &jobID,
-		Limit: limit,
+		JobID:     &jobID,
+		Limit:     limit,
+		SkipTotal: true,
 	})
 	if err != nil {
 		return nil, toGRPCError(err)

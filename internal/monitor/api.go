@@ -267,8 +267,9 @@ func (a *API) listJobEvents(w http.ResponseWriter, r *http.Request) {
 		limit = maxPageLimit
 	}
 	events, _, err := a.svc.ListJobEvents(r.Context(), store.EventFilter{
-		JobID: &jobID,
-		Limit: limit,
+		JobID:     &jobID,
+		Limit:     limit,
+		SkipTotal: true,
 	})
 	if err != nil {
 		writeServiceError(w, err)

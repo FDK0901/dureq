@@ -48,6 +48,7 @@ type EventFilter struct {
 	Until     *time.Time
 	Limit     int
 	Offset    int
+	SkipTotal bool // do not count the events past the page
 }
 
 // StatsFilter specifies criteria for aggregated stats queries.
@@ -1485,37 +1486,6 @@ func (s *RedisStore) GetHistoryRun(ctx context.Context, runID string) (*types.Jo
 		return nil, 0, fmt.Errorf("unmarshal history run: %w", err)
 	}
 	return &run, parseVersion(result["_version"]), nil
-}
-
-// ============================================================
-// History: Job Events
-// ============================================================
-
-// SaveJobEvent persists a job event to the history indexes.
-func (s *RedisStore) SaveJobEvent(ctx context.Context, event *types.JobEvent) error {
-	data, err := sonic.ConfigFastest.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal job event: %w", err)
-	}
-
-	eventID := fmt.Sprintf("%s_%s_%d", event.JobID, string(event.Type), event.Timestamp.UnixNano())
-	score := float64(event.Timestamp.UnixNano())
-
-	cmds := make(rueidis.Commands, 0, 4)
-	cmds = append(cmds, s.rdb.B().Hset().Key(HistoryEventKey(s.prefix, eventID)).FieldValue().FieldValue("data", string(data)).Build())
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryEventsKey(s.prefix)).ScoreMember().ScoreMember(score, eventID).Build())
-	if event.JobID != "" {
-		cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryEventsByJobKey(s.prefix, event.JobID)).ScoreMember().ScoreMember(score, eventID).Build())
-	}
-	cmds = append(cmds, s.rdb.B().Zadd().Key(HistoryEventsByTypeKey(s.prefix, string(event.Type))).ScoreMember().ScoreMember(score, eventID).Build())
-
-	results := s.rdb.DoMulti(ctx, cmds...)
-	for _, r := range results {
-		if err := r.Error(); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // ============================================================

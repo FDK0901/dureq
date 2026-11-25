@@ -31,7 +31,7 @@ are logged as warnings via `UpdateJob`.
 | `pending` | `scheduled`, `running`, `cancelled` |
 | `scheduled` | `running`, `completed`, `pending`, `cancelled` |
 | `running` | `completed`, `failed`, `retrying`, `paused`, `dead`, `scheduled`, `cancelled` |
-| `retrying` | `running`, `paused`, `dead`, `cancelled` |
+| `retrying` | `running`, `paused`, `dead`, `scheduled`, `completed`, `cancelled` |
 | `paused` | `retrying`, `running`, `dead`, `cancelled` |
 | `failed` | `retrying`, `paused`, `dead`, `scheduled`, `pending`, `cancelled` |
 | `completed` | `scheduled` (recurring), `pending` (manual retry) |
@@ -48,6 +48,7 @@ are logged as warnings via `UpdateJob`.
 - `paused` can be entered from `running` (via `PauseError`) or `failed` (auto-pause on consecutive errors)
 - `dead` → `retrying` is only allowed via explicit `RetryJob` / `BulkRetryJobs` API calls
 - Entering `dead` or `cancelled` releases the job's unique key (only if the job holds it); entering `completed` does not
+- A recurring job whose schedule has `KeepOnFailure` goes back to `scheduled` instead of `dead` when a firing is given up
 - What is still queued of a cancelled standalone job is dropped, and a retry of it runs the job again
 - A job leaves `dead` or `cancelled` only while holding its unique key again. `Retry` is refused if another job holds it,
   and the result of a run that was still going when a standalone job was cancelled does not change its status

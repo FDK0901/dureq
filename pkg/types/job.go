@@ -183,6 +183,11 @@ type Schedule struct {
 	// This prevents thundering herd when many jobs share the same schedule.
 	// E.g., Jitter of 30s means the firing time is offset by rand(0, 30s).
 	Jitter *Duration `json:"jitter,omitempty"`
+
+	// KeepOnFailure keeps a recurring job going when one of its firings is given up
+	// (retries used up, or a non-retryable error): that firing goes to the DLQ and
+	// the job waits for its next one. Default: the job goes dead and its schedule ends.
+	KeepOnFailure bool `json:"keep_on_failure,omitempty"`
 }
 
 // AtTime represents a time of day as hour, minute, second.

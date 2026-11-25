@@ -53,7 +53,7 @@ var jobTransitions = map[JobStatus][]JobStatus{
 	JobStatusPending:   {JobStatusScheduled, JobStatusRunning, JobStatusCompleted, JobStatusFailed, JobStatusRetrying, JobStatusDead, JobStatusCancelled},
 	JobStatusScheduled: {JobStatusRunning, JobStatusCompleted, JobStatusPending, JobStatusCancelled},
 	JobStatusRunning:   {JobStatusCompleted, JobStatusFailed, JobStatusRetrying, JobStatusPaused, JobStatusDead, JobStatusScheduled, JobStatusCancelled},
-	JobStatusRetrying:  {JobStatusRunning, JobStatusPaused, JobStatusDead, JobStatusCancelled},
+	JobStatusRetrying:  {JobStatusRunning, JobStatusPaused, JobStatusDead, JobStatusScheduled, JobStatusCompleted, JobStatusCancelled},
 	JobStatusPaused:    {JobStatusRetrying, JobStatusRunning, JobStatusDead, JobStatusCancelled},
 	JobStatusFailed:    {JobStatusRetrying, JobStatusPaused, JobStatusDead, JobStatusScheduled, JobStatusPending, JobStatusCancelled},
 	JobStatusCompleted: {JobStatusScheduled, JobStatusPending}, // recurring: scheduled, manual retry: pending

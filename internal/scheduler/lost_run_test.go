@@ -51,19 +51,24 @@ func loseAllRuns(t *testing.T, st *store.RedisStore, s *Scheduler, jobID string)
 func TestCheckOrphanedRuns_RecurringJob_EndsAtTheLimit(t *testing.T) {
 	two := 2
 	for _, tc := range []struct {
-		name       string
-		dlqAfter   *int
-		wantLost   int
-		wantStatus types.JobStatus
+		name          string
+		keepOnFailure bool
+		dlqAfter      *int
+		wantLost      int
+		wantStatus    types.JobStatus
 	}{
-		{"dead by default", nil, 4, types.JobStatusDead},
-		{"dead after DLQAfter", &two, 3, types.JobStatusDead},
+		{"dead by default", false, nil, 4, types.JobStatusDead},
+		{"dead after DLQAfter", false, &two, 3, types.JobStatusDead},
+		{"kept on its schedule", true, nil, 4, types.JobStatusScheduled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newTestStore(t)
 			s := New(Config{Store: st, Dispatcher: dispatcher.New(st, nil)})
 			entry := createScheduledJob(t, st, nil, time.Now().Add(time.Hour))
-			editJob(t, st, entry.JobID, func(job *types.Job) { job.DLQAfter = tc.dlqAfter })
+			editJob(t, st, entry.JobID, func(job *types.Job) {
+				job.Schedule.KeepOnFailure = tc.keepOnFailure
+				job.DLQAfter = tc.dlqAfter
+			})
 
 			if lost := loseAllRuns(t, st, s, entry.JobID); lost != tc.wantLost {
 				t.Fatalf("ended after %d lost runs, want %d", lost, tc.wantLost)
@@ -72,7 +77,37 @@ func TestCheckOrphanedRuns_RecurringJob_EndsAtTheLimit(t *testing.T) {
 			if job.Status != tc.wantStatus {
 				t.Fatalf("status = %s, want %s", job.Status, tc.wantStatus)
 			}
+			if !tc.keepOnFailure {
+				return
+			}
+			if job.Attempt != 0 {
+				t.Fatalf("stored attempt = %d, want 0 for the next firing", job.Attempt)
+			}
+			if _, _, err := st.GetSchedule(context.Background(), entry.JobID); err != nil {
+				t.Fatalf("schedule: %v", err)
+			}
+			rdb := st.Client()
+			if n, err := rdb.Do(context.Background(), rdb.B().Xlen().Key(store.DLQStreamKey(st.Prefix())).Build()).AsInt64(); err != nil || n != 1 {
+				t.Fatalf("%d messages in the DLQ (%v), want 1", n, err)
+			}
 		})
+	}
+}
+
+// With its schedule gone there is nothing to keep.
+func TestCheckOrphanedRuns_KeepOnFailure_NoSchedule_Dead(t *testing.T) {
+	st := newTestStore(t)
+	s := New(Config{Store: st, Dispatcher: dispatcher.New(st, nil)})
+	entry := createScheduledJob(t, st, nil, time.Now().Add(time.Hour))
+	editJob(t, st, entry.JobID, func(job *types.Job) { job.Schedule.KeepOnFailure = true })
+	if err := st.DeleteSchedule(context.Background(), entry.JobID); err != nil {
+		t.Fatalf("delete schedule: %v", err)
+	}
+
+	loseAllRuns(t, st, s, entry.JobID)
+
+	if got := getJob(t, st, entry.JobID).Status; got != types.JobStatusDead {
+		t.Fatalf("status = %s, want dead", got)
 	}
 }
 

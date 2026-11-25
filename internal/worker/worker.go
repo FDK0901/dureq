@@ -1111,9 +1111,13 @@ func (w *Worker) onSuccess(sm *streamMessage, work types.WorkMessage, run *types
 	}
 
 	// Drain overlap buffer if the job has a buffer policy.
-	if jobForPostUpdate != nil && (jobForPostUpdate.Schedule.OverlapPolicy == types.OverlapBufferOne || jobForPostUpdate.Schedule.OverlapPolicy == types.OverlapBufferAll) {
+	if jobForPostUpdate != nil && hasOverlapBuffer(jobForPostUpdate) {
 		go w.drainOverlapBuffer(work.JobID, jobForPostUpdate)
 	}
+}
+
+func hasOverlapBuffer(job *types.Job) bool {
+	return job.Schedule.OverlapPolicy == types.OverlapBufferOne || job.Schedule.OverlapPolicy == types.OverlapBufferAll
 }
 
 // drainOverlapBuffer dispatches a buffered job after a run completes.
@@ -1227,9 +1231,7 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 
 	switch {
 	case errClass == types.ErrorClassNonRetryable:
-		w.saveDead(job, rev)
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
-		w.disp.DispatchToDLQ(w.ctx, job, errStr)
+		w.giveUp(sm, job, rev, errStr)
 
 	case shouldPause:
 		// Auto-pause: consecutive error threshold reached.
@@ -1255,9 +1257,7 @@ func (w *Worker) onFailure(sm *streamMessage, work types.WorkMessage, run *types
 		return // skip the generic failed event below
 
 	case job.Attempt >= maxAttempts:
-		w.saveDead(job, rev)
-		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
-		w.disp.DispatchToDLQ(w.ctx, job, errStr)
+		w.giveUp(sm, job, rev, errStr)
 
 	case errClass == types.ErrorClassRateLimited:
 		job.Status = types.JobStatusRetrying
@@ -1324,6 +1324,36 @@ func failedAttempts(job *types.Job, work types.WorkMessage, maxAttempts int) int
 		return min(work.Attempt, job.ConsecutiveErrors)
 	}
 	return work.Attempt
+}
+
+// giveUp ends an execution that is not retried any more: it goes to the DLQ, and its
+// job goes dead or, if its schedule is to be kept, waits for the next firing.
+func (w *Worker) giveUp(sm *streamMessage, job *types.Job, rev uint64, errStr string) {
+	if w.keepsSchedule(job) {
+		failed := *job // with the attempts it has used up
+		job.Status = types.JobStatusScheduled
+		job.Attempt = 0
+		syncRetrySave(w.syncer, func() error { _, err := w.store.UpdateJob(w.ctx, job, rev); return err }, fmt.Sprintf("update job %s", job.ID))
+		w.disp.DispatchToDLQ(w.ctx, &failed, errStr)
+		syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+		if hasOverlapBuffer(job) {
+			go w.drainOverlapBuffer(job.ID, job)
+		}
+		return
+	}
+
+	w.saveDead(job, rev)
+	syncRetryAck(w.syncer, func() error { return w.store.AckMessage(w.ctx, sm.TierName, sm.StreamMsgID) }, sm.TierName, sm.StreamMsgID)
+	w.disp.DispatchToDLQ(w.ctx, job, errStr)
+}
+
+// keepsSchedule reports whether a job stays on its schedule when a firing is given up.
+func (w *Worker) keepsSchedule(job *types.Job) bool {
+	if !job.Schedule.KeepOnFailure || !job.Schedule.Type.IsRecurring() {
+		return false
+	}
+	_, _, err := w.store.GetSchedule(w.ctx, job.ID)
+	return !errors.Is(err, types.ErrScheduleNotFound)
 }
 
 // saveDead stores the job as dead and then frees its unique key.

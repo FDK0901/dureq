@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"sync"
@@ -20,6 +21,7 @@ type Dispatcher interface {
 	Dispatch(ctx context.Context, job *types.Job, attempt int) error
 	// DispatchFiring reports false, without error, if the firing was already dispatched.
 	DispatchFiring(ctx context.Context, job *types.Job, attempt int) (bool, error)
+	DispatchToDLQ(ctx context.Context, job *types.Job, lastErr string) error
 	PublishEvent(event types.JobEvent)
 }
 
@@ -614,6 +616,31 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 				})
 
 				s.logger.Info().String("job_id", run.JobID).Int("attempt", job.Attempt).Msg("scheduler: auto-recovered orphaned job")
+
+			case s.keepsSchedule(ctx, job):
+				// Retries exhausted, but the job goes on with its next firing.
+				failed := *job
+				failed.Attempt = attempt
+				job.Status = types.JobStatusScheduled
+				job.Attempt = 0
+				job.LastError = &errMsg
+				job.UpdatedAt = now
+				if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+					s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to put job with exhausted firing back on its schedule")
+				}
+				s.dispatcher.DispatchToDLQ(ctx, &failed, errMsg)
+
+				s.dispatcher.PublishEvent(types.JobEvent{
+					Type:      types.EventJobFailed,
+					JobID:     run.JobID,
+					RunID:     run.ID,
+					NodeID:    run.NodeID,
+					TaskType:  job.TaskType,
+					Attempt:   attempt,
+					Error:     &errMsg,
+					Timestamp: now,
+				})
+
 			default:
 				// Retries exhausted.
 				job.Status = types.JobStatusDead
@@ -668,6 +695,15 @@ func lostAttempt(job *types.Job, run *types.JobRun, maxAttempts int) int {
 		return min(run.Attempt, job.ConsecutiveErrors)
 	}
 	return run.Attempt
+}
+
+// keepsSchedule reports whether a job stays on its schedule when a firing is given up.
+func (s *Scheduler) keepsSchedule(ctx context.Context, job *types.Job) bool {
+	if !job.Schedule.KeepOnFailure || !job.Schedule.Type.IsRecurring() {
+		return false
+	}
+	_, _, err := s.store.GetSchedule(ctx, job.ID)
+	return !errors.Is(err, types.ErrScheduleNotFound)
 }
 
 // releaseEndedJobUniqueKey frees the unique key of a dead or cancelled job.

@@ -116,6 +116,10 @@ Other schedule types:
 | `WEEKLY` | `IncludedDays` + `AtTimes` | Specific weekdays |
 | `MONTHLY` | `IncludedDays` + `AtTimes` | Specific month days |
 
+## Failing Firings
+
+Every firing of a recurring job has its own retries. If a firing uses them up, the job goes `dead` and its schedule ends. Set `KeepOnFailure: true` on the `Schedule` to send only that firing to the DLQ and go on with the next one.
+
 ## Overlap Policy
 
 For recurring schedules, set `OverlapPolicy` to control what happens when a new firing occurs while the previous run is still active:

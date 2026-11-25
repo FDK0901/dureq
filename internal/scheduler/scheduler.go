@@ -160,9 +160,7 @@ func (s *Scheduler) tick(ctx context.Context) {
 		return
 	}
 
-	for _, entry := range dueSchedules {
-		s.processScheduleEntry(ctx, entry, now)
-	}
+	s.processDue(ctx, dueSchedules, now)
 
 	// Orphan detection runs less frequently than the main tick.
 	if s.orphanInterval > 0 && now.Sub(s.lastOrphanCheck) >= s.orphanInterval {
@@ -171,6 +169,30 @@ func (s *Scheduler) tick(ctx context.Context) {
 		s.resumePausedJobs(ctx, now)
 		s.trimWorkStreams(ctx)
 	}
+}
+
+// dueConcurrency is how many schedules that are due are processed at once.
+const dueConcurrency = 32
+
+// processDue processes schedules that are due, each of which belongs to a job of its own.
+func (s *Scheduler) processDue(ctx context.Context, entries []*types.ScheduleEntry, now time.Time) {
+	due := make(chan *types.ScheduleEntry)
+	var wg sync.WaitGroup
+	for range min(dueConcurrency, len(entries)) {
+		wg.Go(func() {
+			for entry := range due {
+				s.processScheduleEntry(ctx, entry, now)
+			}
+		})
+	}
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			break // another leader goes on
+		}
+		due <- entry
+	}
+	close(due)
+	wg.Wait()
 }
 
 // trimWorkStreams removes what has been processed from the work streams.

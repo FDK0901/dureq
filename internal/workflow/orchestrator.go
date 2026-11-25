@@ -321,7 +321,9 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 		}
 
 		// Save the task completion first (without dispatching).
-		wf.Status = types.WorkflowStatusRunning
+		if wf.Status != types.WorkflowStatusSuspended {
+			wf.Status = types.WorkflowStatusRunning
+		}
 		wf.UpdatedAt = now
 		newRev, err := o.store.UpdateWorkflow(ctx, wf, rev)
 		if err != nil {
@@ -339,29 +341,9 @@ func (o *Orchestrator) handleJobCompleted(ctx context.Context, event types.JobEv
 			return nil
 		}
 
-		// Task completion saved. Now dispatch ready tasks.
-		ready := ReadyTasks(wf)
-		if len(ready) > 0 {
-			for _, name := range ready {
-				o.dispatchWorkflowTask(ctx, wf, name, &now)
-			}
-			if err := o.saveDispatched(ctx, wf, newRev, now); err != nil {
-				o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save dispatched task states (non-critical)")
-			}
-		} else if AnyTaskFatallyFailed(wf) {
-			// No ready tasks and some task has fatally failed — the workflow is stuck
-			// because downstream tasks can never have their dependencies met.
-			// Check if workflow-level retry is available.
-			if wf.Definition.RetryPolicy != nil && wf.Attempt < wf.Definition.RetryPolicy.MaxAttempts {
-				o.retryWorkflow(ctx, wf, newRev, &now)
-				return nil
-			}
-
-			if err := o.endWorkflow(ctx, wf, newRev, types.WorkflowStatusFailed, now); err != nil {
-				o.logger.Error().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save stuck workflow as failed")
-				return err
-			}
-			o.logger.Info().String("workflow_id", wfID).Msg("workflow failed: no ready tasks and some tasks failed (stuck)")
+		// Task completion saved. Now go on with what is ready.
+		if err := o.advanceWorkflow(ctx, wf, newRev, now); err != nil {
+			o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save dispatched task states (non-critical)")
 		}
 		return nil
 	}
@@ -697,7 +679,9 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 			}
 
 			// Save task failure and dispatch next ready tasks.
-			wf.Status = types.WorkflowStatusRunning
+			if wf.Status != types.WorkflowStatusSuspended {
+				wf.Status = types.WorkflowStatusRunning
+			}
 			wf.UpdatedAt = now
 			newRev, err := o.store.UpdateWorkflow(ctx, wf, rev)
 			if err != nil {
@@ -710,14 +694,8 @@ func (o *Orchestrator) handleJobFailed(ctx context.Context, event types.JobEvent
 
 			// If workflow is suspended, don't dispatch any new tasks.
 			if wf.Status != types.WorkflowStatusSuspended {
-				ready := ReadyTasks(wf)
-				if len(ready) > 0 {
-					for _, name := range ready {
-						o.dispatchWorkflowTask(ctx, wf, name, &now)
-					}
-					if err := o.saveDispatched(ctx, wf, newRev, now); err != nil {
-						o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save dispatched task states (non-critical)")
-					}
+				if err := o.advanceWorkflow(ctx, wf, newRev, now); err != nil {
+					o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save dispatched task states (non-critical)")
 				}
 			}
 
@@ -878,6 +856,27 @@ func (o *Orchestrator) ensureWorkflowJobs(ctx context.Context, wfID string) erro
 	}
 	o.markChecked(wfID)
 	return nil
+}
+
+// advanceWorkflow dispatches the ready tasks of a workflow. If there are none and a task has
+// failed for good, the rest can never be ready, so the workflow is retried or fails.
+func (o *Orchestrator) advanceWorkflow(ctx context.Context, wf *types.WorkflowInstance, rev uint64, now time.Time) error {
+	ready := ReadyTasks(wf)
+	if len(ready) > 0 {
+		for _, name := range ready {
+			o.dispatchWorkflowTask(ctx, wf, name, &now)
+		}
+		return o.saveDispatched(ctx, wf, rev, now)
+	}
+	if !AnyTaskFatallyFailed(wf) {
+		return nil
+	}
+	if wf.Definition.RetryPolicy != nil && wf.Attempt < wf.Definition.RetryPolicy.MaxAttempts {
+		o.retryWorkflow(ctx, wf, rev, &now)
+		return nil
+	}
+	o.logger.Info().String("workflow_id", wf.ID).Msg("workflow failed: no ready tasks and some tasks failed (stuck)")
+	return o.endWorkflow(ctx, wf, rev, types.WorkflowStatusFailed, now)
 }
 
 // endWorkflow stores that a workflow has completed or failed, and starts its hooks.
@@ -1207,14 +1206,11 @@ func (o *Orchestrator) progressParentWorkflowTask(ctx context.Context, childWf *
 				return
 			}
 
-			ready := ReadyTasks(parentWf)
-			for _, name := range ready {
-				o.dispatchWorkflowTask(ctx, parentWf, name, &now)
+			if parentWf.Status == types.WorkflowStatusSuspended {
+				return // it goes on when it is resumed
 			}
-			if len(ready) > 0 {
-				if err := o.saveDispatched(ctx, parentWf, newRev, now); err != nil {
-					o.logger.Warn().String("workflow_id", parentID).Err(err).Msg("orchestrator: failed to save dispatched task states (non-critical)")
-				}
+			if err := o.advanceWorkflow(ctx, parentWf, newRev, now); err != nil {
+				o.logger.Warn().String("workflow_id", parentID).Err(err).Msg("orchestrator: failed to save dispatched task states (non-critical)")
 			}
 		} else {
 			// Child failed — check if parent has retry policy.
@@ -1254,9 +1250,12 @@ func (o *Orchestrator) updateWorkflowTaskRetrying(ctx context.Context, job *type
 // retryWorkflow resets only failed/dead/cancelled tasks and re-dispatches ready tasks.
 func (o *Orchestrator) retryWorkflow(ctx context.Context, wf *types.WorkflowInstance, rev uint64, now *time.Time) {
 	wf.Attempt++
-	wf.Status = types.WorkflowStatusRunning
 	wf.UpdatedAt = *now
 	wf.CompletedAt = nil
+	suspended := wf.Status == types.WorkflowStatusSuspended
+	if !suspended {
+		wf.Status = types.WorkflowStatusRunning
+	}
 
 	// Recalculate deadline if ExecutionTimeout is set.
 	if wf.Definition.ExecutionTimeout != nil {
@@ -1314,6 +1313,9 @@ func (o *Orchestrator) retryWorkflow(ctx context.Context, wf *types.WorkflowInst
 		o.logger.Error().String("workflow_id", wf.ID).Err(err).Msg("orchestrator: failed to save workflow retry reset")
 		return
 	}
+	if suspended {
+		return // it goes on when it is resumed
+	}
 
 	// Dispatch tasks whose dependencies are all completed.
 	ready := ReadyTasks(wf)
@@ -1341,17 +1343,11 @@ func (o *Orchestrator) handleWorkflowResumed(ctx context.Context, event types.Jo
 		return
 	}
 
-	now := time.Now()
-	ready := ReadyTasks(wf)
-	for _, name := range ready {
-		o.dispatchWorkflowTask(ctx, wf, name, &now)
-	}
-
-	if err := o.saveDispatched(ctx, wf, rev, now); err != nil {
+	if err := o.advanceWorkflow(ctx, wf, rev, time.Now()); err != nil {
 		o.logger.Warn().String("workflow_id", wfID).Err(err).Msg("orchestrator: failed to save workflow after resume dispatch")
 	}
 
-	o.logger.Info().String("workflow_id", wfID).Int("ready", len(ready)).Msg("orchestrator: dispatched ready tasks for resumed workflow")
+	o.logger.Info().String("workflow_id", wfID).Msg("orchestrator: resumed workflow goes on")
 }
 
 // handleWorkflowRetry goes on with a workflow that is retried.

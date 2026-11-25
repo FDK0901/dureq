@@ -178,6 +178,9 @@ pending -> running -> completed | failed | cancelled | continued | suspended
 
 Terminal states: `completed`, `failed`, `cancelled`, `continued`.
 
+A suspended workflow dispatches nothing. What is under way goes on, and what becomes ready is dispatched when the
+workflow is resumed. It can still fail, time out, or complete if nothing is left to dispatch.
+
 ## Execution Timeout and Priority
 
 Set `ExecutionTimeout` on the definition to enforce a deadline for the entire

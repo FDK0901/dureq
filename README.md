@@ -80,7 +80,7 @@ Client (Go)
 |                                                            |
 |  +---------------+  +----------------+                     |
 |  | Orchestrator  |  | Monitor API    |                     |
-|  | (leader)      |  | HTTP/gRPC/WS   |                     |
+|  | (leader)      |  | (dureqd)       |                     |
 |  +---------------+  +----------------+                     |
 +-----------------------------------------------------------+
          ^
@@ -94,21 +94,23 @@ Client (Go)
 - **Leader-elected coordinator**: only the leader runs Scheduler + Orchestrator
 - **All nodes are workers**: every node polls Redis Streams and executes handlers
 - **Direct Redis data flow**: no actors, no RPC between components on the same node
+- **Nothing that is yet to be done is trimmed**: messages leave a work stream once they have been acknowledged, and events leave the orchestrator's stream once it has processed them. Jobs, the run history and the dead letter queue are kept until you clean them up
 - **Core runtime dependency**: Redis only (Standalone, Sentinel, or Cluster). Optional dashboards, APIs, and application-specific handlers run outside the core execution path.
 
 ## Features
 
 ### Core
 - **Flexible Scheduling** — Immediate, one-time, interval, cron, daily, weekly, monthly with timezone support
-- **Workflow Orchestration** — DAG-based task dependencies with automatic state advancement and child workflows
+- **Workflow Orchestration** — DAG-based task dependencies with automatic state advancement, child workflows, condition nodes and loops, dynamic subflows, result piping, lifecycle hooks, and suspend/resume
 - **Batch Processing** — Optional onetime preprocessing, chunked parallel item execution, failure policies
 - **Group Aggregation** — Collect individual tasks into groups, automatically flush and aggregate into a single job based on grace period, max delay, or max size
 - **Mux Handler** — Pattern-based task type routing (`order.*`), global and per-handler middleware
-- **Priority Queues** — User-defined tiers with weighted fair queuing
+- **Priority Queues** — User-defined tiers, of which those with a higher weight are looked at first
+- **Concurrency Limits** — Per node (`MaxConcurrency`), per handler and node (`Concurrency`), and per key across the cluster (`ConcurrencyKeys`). A handler that has reached its limit does not hold up the others ([details](docs/concurrency.md))
 - **Task Queue Rate Limiting** — Distributed token bucket rate limiter per queue (Redis Lua-backed)
 
 ### Reliability
-- **Retry Policies** — Exponential backoff with jitter, error classification (retryable, non-retryable, rate-limited)
+- **Retry Policies** — Exponential backoff with jitter, error classification (retryable, non-retryable, rate-limited), and control flow errors (skip, repeat, pause)
 - **Overlap Policies** — Control concurrent runs for recurring jobs (allow all, skip, buffer one, buffer all, replace)
 - **Catchup / Backfill** — Recover missed executions within a configurable window
 - **Schedule Jitter** — Random offset on scheduled execution times to prevent thundering herd
@@ -117,24 +119,28 @@ Client (Go)
 - **Transactional Completion** — `pkg/integration/postgres` adapter commits business write + dureq completion marker in the same SQL transaction for exactly-once business outcomes
 - **Durable Cancellation** — Persisted cancel flag (`SET EX 24h`) + Pub/Sub fast path + 10s polling fallback; survives Pub/Sub disconnections
 - **Unique Keys** — Deduplication via unique keys with lookup and manual deletion; released when the job goes dead or is cancelled, kept when it completes. `EnqueueOrReplace` cancels the job that holds the key and puts a new one in its place
+- **Dead Letter Queue** — Keeps every job that has used up its attempts, unless you limit it
+- **Durable Workflow Events** — What the orchestrator has to see has a stream of its own without a limit, and is tried again until it has been processed
 - **Worker Versioning** — BuildID-style safe deployments; version-mismatched work is re-enqueued for matching workers
 - **ScheduleToStart Timeout** — Fail jobs that wait too long in the queue before starting
 - **Workflow Signals** — Send asynchronous external data to running workflows. `ReadSignals` + `AckSignals` provides at-least-once delivery; see [guarantees](docs/guarantees.md) and [signals](docs/signals.md) docs
 
 ### Operations
 - **Leader Election** — Automatic failover with configurable TTL and epoch-based fencing tokens
-- **Dynamic Configuration** — Runtime-updateable settings (concurrency, timeouts, retry) via Redis, per-handler overrides
-- **Archival / Retention** — Automatic cleanup of completed/dead/cancelled jobs after configurable retention period
+- **Dynamic Configuration** — Scheduler interval, and timeout and attempts per handler, changed at runtime via Redis
+- **Archival / Retention** — Off by default. Opt in to have completed/failed/dead/cancelled jobs, and finished runs, removed after a while, or remove runs by hand
+- **Pause / Resume** — Queues, jobs, and workflows; a job can pause itself, and a recurring one after so many errors in a row
 - **Node Drain** — Graceful worker drain: stop accepting new work while finishing in-flight tasks
 - **Audit Trail** — Per-job state transition history stored as capped Redis Streams
 - **Progress Reporting** — In-flight progress updates from handlers via `types.ReportProgress(ctx, data)`
 - **Distributed Locking** — Redis-based locks with automatic extension
 
 ### Observability
-- **Web Dashboard** — React-based UI (durequi) with real-time WebSocket updates
+- **Web Dashboard** — React-based UI (durequi, a repository of its own) with real-time WebSocket updates
 - **Terminal UI** — Interactive TUI (dureqctl) for cluster monitoring
 - **Monitoring APIs** — HTTP REST, gRPC, and WebSocket for full cluster observability
-- **Payload Search** — JSONPath-based search across jobs, workflows, and batches; `GetJobsByParamJSONPath` returns all matching jobs, optionally only live ones
+- **Payload Search** — JSONPath-based search across jobs, workflows, and batches; `GetJobsByParamJSONPath` returns all matching jobs, optionally only live ones (needs RedisJSON)
+- **Run and Event History** — Finished runs by job and status, and about the last 50,000 events
 - **Multi-Tenancy** — Key prefix isolation per tenant
 
 ### Execution Guarantees
@@ -150,6 +156,7 @@ dureq provides **at-least-once delivery with L2 exactly-once internal completion
 | Internal completion | Exactly-once per OperationKey | Two-phase: ledger CAS commit (Phase 1) + idempotent pipeline (Phase 2) |
 | Business outcome | Exactly-once (opt-in) | `pkg/integration/postgres.CompleteTx` — same SQL TX as business write |
 | Cancellation | Durable | Persisted flag (`SET EX 24h`) + Pub/Sub + 10s polling |
+| Workflow progress | At-least-once event, counted once | Events are kept until the orchestrator has processed them; each is applied once by CAS |
 | Workflow signals | At-least-once | `ReadSignals` + `AckSignals`; deprecated `ConsumeSignals` provides at-most-once |
 | Durability | Opt-in | `WAIT` / `WAITAOF` after critical writes (configurable) |
 
@@ -160,7 +167,7 @@ For full details including failure scenarios, see [docs/guarantees.md](docs/guar
 ### Prerequisites
 
 - Go 1.26.11+ (the go.mod minimum; older toolchains have known security vulnerabilities)
-- Redis 7+
+- Redis 7+. Payload search needs RedisJSON, which Redis 8 comes with; everything else works without
 
 ### Quick Example
 
@@ -282,10 +289,12 @@ cli.EnqueueWorkflow(ctx, types.WorkflowDefinition{
         {Name: "ship",     TaskType: "order.ship",     DependsOn: []string{"charge", "reserve"}},
         {Name: "notify",   TaskType: "order.notify",   DependsOn: []string{"ship"}},
     },
-})
+}, nil) // the input of the workflow, if it has one
 ```
 
-The orchestrator validates the DAG (no cycles, all dependencies exist), dispatches root tasks first, and advances downstream tasks as dependencies complete. On retry, only failed tasks and their dependents are re-executed — completed tasks are preserved.
+The orchestrator validates the DAG (no cycles, all dependencies exist), dispatches root tasks first, and advances downstream tasks as dependencies complete. On retry, only failed tasks and their dependents are re-executed — completed tasks are preserved. Each retry has the `ExecutionTimeout` to itself.
+
+A task can be a child workflow (`ChildWorkflowDef`). If the child fails, times out or is cancelled, so does the task, unless that has `AllowFailure`. A suspended workflow starts nothing new until it is resumed. See [docs/workflow-model.md](docs/workflow-model.md).
 
 ## Batches
 
@@ -309,6 +318,24 @@ cli.EnqueueBatch(ctx, types.BatchDefinition{
 - **Chunked dispatch**: configurable chunk size provides backpressure
 - **Failure policies**: `continue_on_error` (collect all results) or `fail_fast` (stop on first failure)
 - **Per-item results**: individual success/failure stored and queryable
+
+See [docs/batch-model.md](docs/batch-model.md).
+
+## Priority Tiers
+
+All jobs share one queue unless you define tiers. The priority of a job, from 1 to 10, decides which one it goes to:
+
+```go
+tiers := []dureq.TierConfig{
+    {Name: "high", Weight: 100},
+    {Name: "normal", Weight: 50},
+    {Name: "bulk", Weight: 10, RateLimit: 200}, // at most 200 jobs a second, across all nodes
+}
+srv, _ := dureq.NewServer(dureq.WithRedisURL("redis://localhost:6379"), dureq.WithPriorityTiers(tiers))
+cli, _ := dureq.NewClient(dureq.WithClientRedisURL("redis://localhost:6379"), dureq.WithClientTiers(tiers))
+```
+
+Use the same tiers for all servers and clients. See [docs/concurrency.md](docs/concurrency.md).
 
 ## Group Aggregation
 
@@ -373,6 +400,8 @@ return &types.NonRetryableError{Err: err}                    // permanent, skip 
 return &types.RateLimitedError{Err: err, RetryAfter: 30*time.Second} // retry after delay
 ```
 
+A job that has used up its attempts goes `dead` and into the dead letter queue. Retries start again by hand, with `Client.Retry` or the monitoring API.
+
 ## Handler Context
 
 Inside a handler, access job metadata via context:
@@ -410,6 +439,8 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 
 ## Monitoring API
 
+[dureqd](docs/dureqd.md) serves it, over HTTP on `:8080` and gRPC on `:9090` by default. In a server of your own, build endpoints on `dureq.NewAPIService`, which has the same calls.
+
 ### Endpoints
 
 **Jobs:**
@@ -425,6 +456,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `PUT`    | `/api/jobs/{id}/payload` | Update job payload                |
 | `GET`    | `/api/jobs/{id}/events`  | Job event history                 |
 | `GET`    | `/api/jobs/{id}/runs`    | Job run history                   |
+| `GET`    | `/api/jobs/{id}/progress` | Progress of the job's active runs |
 
 **Workflows:**
 
@@ -434,6 +466,11 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`  | `/api/workflows/{id}`        | Get workflow details     |
 | `POST` | `/api/workflows/{id}/cancel` | Cancel workflow          |
 | `POST` | `/api/workflows/{id}/retry`  | Retry from failure point |
+| `POST` | `/api/workflows/{id}/suspend` | Suspend workflow        |
+| `POST` | `/api/workflows/{id}/resume` | Resume a suspended workflow |
+| `GET`  | `/api/workflows/{id}/tasks/{task}/result` | Result of a task |
+| `GET`  | `/api/workflows/{id}/signals/stats` | Signals of a workflow |
+| `POST` | `/api/workflows/validate`    | Check a definition       |
 
 **Batches:**
 
@@ -483,21 +520,30 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`    | `/api/stats`                | Cluster stats                      |
 | `GET`    | `/api/stats/daily`          | Daily aggregated statistics        |
 | `GET`    | `/api/nodes`                | Worker nodes                       |
+| `GET`    | `/api/nodes/{id}`           | A worker node                      |
 | `GET`    | `/api/schedules`            | Active schedules                   |
-| `GET`    | `/api/queues`               | Queue tiers (backlog, weight, paused) |
+| `GET`    | `/api/schedules/{jobId}`    | The schedule of a job              |
+| `GET`    | `/api/queues`               | Queue tiers (weight, paused, and how many jobs are `waiting`, `in_flight` and `delayed`) |
 | `POST`   | `/api/queues/{tier}/pause`  | Pause a queue                      |
 | `POST`   | `/api/queues/{tier}/resume` | Resume a queue                     |
 | `GET`    | `/api/dlq`                  | Dead letter queue                  |
 | `GET`    | `/api/history/runs`         | Historical runs (filterable)       |
 | `DELETE` | `/api/history/runs`         | Remove runs (`?older_than=720h`)   |
 | `GET`    | `/api/history/events`       | Historical events                  |
+| `GET`    | `/api/runs`                 | Active runs                        |
 | `GET`    | `/api/runs/{id}`            | A run, active or finished          |
+| `GET`    | `/api/runs/{id}/progress`   | Progress of a run                  |
+| `POST`   | `/api/runs/{id}/requeue`    | Queue a stuck run again            |
 | `GET`    | `/api/search/jobs`          | Newest job by payload JSONPath     |
 | `GET`    | `/api/search/jobs/all`      | All jobs by payload JSONPath       |
 | `GET`    | `/api/search/workflows`     | Search workflows by payload        |
 | `GET`    | `/api/search/batches`       | Search batches by payload          |
 | `GET`    | `/api/unique-keys/{key}`    | Check unique key                   |
 | `DELETE` | `/api/unique-keys/{key}`    | Delete unique key                  |
+| `GET`    | `/api/locks/{key}`          | Check a lock                       |
+| `DELETE` | `/api/locks/{key}`          | Release a lock                     |
+| `GET`    | `/api/concurrency/{key}`    | Slots in use of a concurrency key  |
+| `GET`    | `/api/groups`               | Groups being aggregated            |
 | `GET`    | `/api/redis/info`           | Redis server info                  |
 | `GET`    | `/api/sync-retries`         | Pending sync retries               |
 | `GET`    | `/api/health`               | Health check                       |
@@ -510,69 +556,70 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 
 ## Event Types
 
-| Category     | Events                                                                                                                     |
-| ------------ | -------------------------------------------------------------------------------------------------------------------------- |
-| **Job**      | `enqueued`, `scheduled`, `dispatched`, `started`, `completed`, `failed`, `retrying`, `dead`, `cancelled`                   |
-| **Schedule** | `created`, `removed`                                                                                                       |
-| **Workflow** | `started`, `completed`, `failed`, `cancelled`, `task.dispatched`, `task.completed`, `task.failed`, `timed_out`, `retrying` |
-| **Batch**    | `started`, `completed`, `failed`, `cancelled`, `item.completed`, `item.failed`, `progress`, `timed_out`, `retrying`        |
-| **Node**     | `joined`, `left`, `crash_detected`                                                                                         |
-| **Leader**   | `elected`, `lost`                                                                                                          |
+| Category     | Events |
+| ------------ | ------ |
+| **Job**      | `dispatched`, `started`, `completed`, `failed`, `retrying`, `dead`, `cancelled`, `paused`, `resumed`, `auto_recovered`, `schedule_to_start_timeout` |
+| **Schedule** | `created`, `removed` |
+| **Workflow** | `started`, `completed`, `failed`, `cancelled`, `timed_out`, `retrying`, `suspended`, `resumed`, `signal.received`, `task.dispatched`, `task.completed`, `task.failed`, `hook.dispatched`, `hook.completed`, `hook.failed` |
+| **Batch**    | `started`, `completed`, `failed`, `cancelled`, `timed_out`, `retrying`, `progress`, `item.completed`, `item.failed`, `onetime.completed`, `onetime.failed` |
+| **Node**     | `crash_detected` |
 
 ## Configuration
 
 ### Server Options
 
-| Option                            | Default        | Description                  |
-| --------------------------------- | -------------- | ---------------------------- |
-| `dureq.WithRedisURL(url)`         | -              | Redis connection URL         |
-| `dureq.WithRedisDB(db)`           | `0`            | Redis database number        |
-| `dureq.WithRedisPassword(pw)`     | -              | Redis password               |
-| `dureq.WithRedisPoolSize(n)`      | -              | Connection pool size         |
-| `dureq.WithRedisSentinel(...)`    | -              | Redis Sentinel failover      |
-| `dureq.WithRedisCluster(addrs)`   | -              | Redis Cluster mode (multi-shard supported) |
-| `dureq.WithNodeID(id)`            | auto-generated | Unique node identifier       |
-| `dureq.WithMaxConcurrency(n)`     | `100`          | Maximum concurrent workers   |
-| `dureq.WithLockTTL(d)`            | `30s`          | Distributed lock TTL         |
-| `dureq.WithKeyPrefix(prefix)`     | -              | Redis key prefix             |
-| `dureq.WithPriorityTiers(tiers)`  | -              | Custom priority tier mapping |
-| `dureq.WithGroupAggregation(cfg)` | disabled       | Enable group aggregation     |
-| `dureq.WithRetentionPeriod(d)`    | off            | Retention for completed jobs |
-| `dureq.WithRunHistoryRetention(d)` | off           | Retention for finished runs  |
-| `dureq.WithLogger(logger)`        | -              | Custom logger                |
+| Option                                | Default        | Description |
+| ------------------------------------- | -------------- | ----------- |
+| `dureq.WithRedisURL(url)`             | -              | Redis connection URL |
+| `dureq.WithRedisUsername(name)`       | -              | Redis ACL username |
+| `dureq.WithRedisPassword(pw)`         | -              | Redis password |
+| `dureq.WithRedisDB(db)`               | `0`            | Redis database number |
+| `dureq.WithRedisPoolSize(n)`          | `10`           | Connections for blocking commands, 10 at least |
+| `dureq.WithRedisSentinel(...)`        | -              | Redis Sentinel failover |
+| `dureq.WithRedisCluster(addrs)`       | -              | Redis Cluster mode (multi-shard supported) |
+| `dureq.WithNodeID(id)`                | auto-generated | Unique node identifier |
+| `dureq.WithMaxConcurrency(n)`         | `100`          | Jobs that run at once on this node |
+| `dureq.WithPriorityTiers(tiers)`      | one, `normal`  | Priority tiers |
+| `dureq.WithMode(mode)`                | `ModeFull`     | Which parts run on this node, such as `ModeQueue \| ModeScheduler` |
+| `dureq.WithKeyPrefix(prefix)`         | -              | Redis key prefix |
+| `dureq.WithSchedulerTickInterval(d)`  | `1s`           | How often the leader looks for due schedules |
+| `dureq.WithHeartbeatInterval(d)`      | `5s`           | How often a node reports its health |
+| `dureq.WithElectionTTL(d)`            | `10s`          | Leader election TTL |
+| `dureq.WithLockTTL(d)`                | `30s`          | Distributed lock TTL |
+| `dureq.WithShutdownTimeout(d)`        | `30s`          | How long jobs have to finish on shutdown before they are put back |
+| `dureq.WithGroupAggregation(cfg)`     | disabled       | Enable group aggregation |
+| `dureq.WithRetentionPeriod(d)`        | off            | Retention for ended jobs |
+| `dureq.WithRunHistoryRetention(d)`    | off            | Retention for finished runs |
+| `dureq.WithLogger(logger)`            | slog           | Custom logger |
 
 ### Client Options
 
-| Option                              | Default | Description                  |
-| ----------------------------------- | ------- | ---------------------------- |
-| `dureq.WithClientRedisURL(url)`     | -       | Redis connection URL         |
-| `dureq.WithClientRedisDB(db)`       | `0`     | Redis database number        |
-| `dureq.WithClientRedisPassword(pw)` | -       | Redis password               |
-| `dureq.WithClientKeyPrefix(prefix)` | -       | Key namespace                |
-| `dureq.WithClientTiers(tiers)`      | -       | Custom priority tier mapping |
-| `dureq.WithClientRedisStore(store)` | -       | Use existing store           |
+| Option                                | Default        | Description |
+| ------------------------------------- | -------------- | ----------- |
+| `dureq.WithClientRedisURL(url)`       | -              | Redis connection URL |
+| `dureq.WithClientRedisUsername(name)` | -              | Redis ACL username |
+| `dureq.WithClientRedisPassword(pw)`   | -              | Redis password |
+| `dureq.WithClientRedisDB(db)`         | `0`            | Redis database number |
+| `dureq.WithClientRedisPoolSize(n)`    | `10`           | Connections for blocking commands, 10 at least |
+| `dureq.WithClientClusterAddrs(addrs)` | -              | Redis Cluster mode |
+| `dureq.WithClientKeyPrefix(prefix)`   | -              | Key namespace, the same as the servers' |
+| `dureq.WithClientTiers(tiers)`        | one, `normal`  | Priority tiers, the same as the servers' |
+| `dureq.WithClientRedisStore(store)`   | -              | Use existing store |
 
 ## Dynamic Configuration
 
-Settings can be updated at runtime without restarting nodes. Overrides are stored in Redis and polled every 10 seconds.
-
-**Global overrides:**
+These settings can be changed at runtime without restarting nodes. They are stored in Redis and looked up every 10 seconds.
 
 ```bash
-# Via Redis directly
-redis-cli HSET dureq:config:global MaxConcurrency 200
-redis-cli HSET dureq:config:global SchedulerTickInterval 5s
+# How often the leader looks for due schedules
+redis-cli HSET dureq:config:global scheduler_tick_interval 5s
+
+# Per handler
+redis-cli HSET dureq:config:handler:email.send timeout 60s
+redis-cli HSET dureq:config:handler:email.send max_attempts 5
 ```
 
-**Per-handler overrides:**
-
-```bash
-redis-cli HSET dureq:config:handler:email.send Concurrency 20
-redis-cli HSET dureq:config:handler:email.send Timeout 60s
-redis-cli HSET dureq:config:handler:email.send MaxAttempts 5
-```
-
-These overrides take precedence over values set at server startup. Delete a field to revert to the startup default.
+They take precedence over what was set at startup. Delete a field to go back to that. With a key prefix, the keys start with `<prefix>_dureq:`.
 
 ## Project Structure
 
@@ -583,7 +630,7 @@ dureq/
 |   +-- dureqctl/            # Interactive terminal UI (Bubble Tea)
 +-- internal/
 |   +-- server/              # Server setup, handler registry, options
-|   +-- worker/              # Redis Streams consumer, goroutine pool, retry
+|   +-- worker/              # Redis Streams consumer, goroutine pools, retry
 |   +-- dispatcher/          # Job -> Stream dispatch, priority tier mapping
 |   +-- scheduler/           # Leader-only schedule scanner, orphan detection
 |   +-- workflow/            # DAG orchestrator, batch state machine
@@ -595,10 +642,13 @@ dureq/
 |   +-- lock/                # Distributed locking with auto-extension
 |   +-- dynconfig/           # Dynamic configuration (runtime-updateable via Redis)
 |   +-- ratelimit/           # Distributed token bucket rate limiter
-|   +-- archival/            # Retention-based cleanup of old jobs
+|   +-- archival/            # Retention-based cleanup of old jobs and runs
 |   +-- cache/               # In-memory schedule and job cache
-|   +-- lifecycle/           # Graceful shutdown coordination
+|   +-- lifecycle/           # Job state machine
+|   +-- periodic/            # Keeps recurring jobs in line with a list of them
+|   +-- api/                 # HTTP client of the monitoring API (for dureqctl)
 +-- pkg/
+|   +-- dureq/               # What applications import: servers, clients, options
 |   +-- types/               # Public domain types (Job, Schedule, Workflow, Batch)
 |   +-- sideeffect/          # At-most-once side effect helpers (Step, ExternalCall)
 |   +-- integration/
@@ -606,6 +656,10 @@ dureq/
 +-- examples/                # Runnable demos
 +-- tests/
 |   +-- integration/         # Integration tests (requires Redis)
+|   +-- failure/             # Tests of failures such as node crashes
++-- bench/                   # Benchmarks (requires Redis)
++-- configs/                 # Example configuration of dureqd
++-- docs/                    # Guarantees, models, operations
 +-- proto/
 |   +-- dureq/monitor/v1/   # gRPC service definitions
 +-- gen/                     # Generated protobuf code
@@ -623,6 +677,7 @@ dureq/
 | `workflow/`                 | DAG workflow with task dependencies                          |
 | `workflow_with_mux/`        | Workflow with mux handler                                    |
 | `child_workflow/`           | Parent-child workflow with cancellation propagation          |
+| `condition_workflow/`       | Branching on what a handler returns                          |
 | `signals/`                  | Workflow signals (async external input to running workflows) |
 | `batch/`                    | Batch processing with onetime preprocessing                  |
 | `batch_with_mux/`           | Batch with pattern-based routing                             |
@@ -631,6 +686,14 @@ dureq/
 | `overlap_policy/`           | Overlap policy demonstration (including REPLACE)             |
 | `retention/`                | Archival and retention management                            |
 | `condition_loop/`           | Workflow condition nodes with loop-back (while-loop pattern) |
+| `subflow_workflow/`         | Tasks generated while the workflow runs                      |
+| `result_piping/`            | The output of a task as the input of the next (`ResultFrom`) |
+| `priority_workflow/`        | Ready tasks in order of their priority                       |
+| `allow_failure/`            | A workflow that goes on when a task fails                    |
+| `lifecycle_hooks/`          | Workflow hooks, and purging personal data                    |
+| `pause_resume/`             | Jobs that pause, and resume by themselves or by hand         |
+| `typed_handler/`            | Type-safe handlers, and control flow errors                  |
+| `idempotent_handler/`       | Handlers that may run more than once                         |
 | `pg_completion/`            | Transactional completion with PostgreSQL (exactly-once outcome) |
 
 ```bash
@@ -638,12 +701,32 @@ cd examples/workflow_with_mux
 go run main.go
 ```
 
+## Benchmarks
+
+```bash
+docker run -d --rm -p 6381:6379 redis:8 redis-server --requirepass your-password
+REDIS_URL=redis://localhost:6381 REDIS_DB=15 go test -run '^$' -bench . ./bench/
+```
+
+`BenchmarkBacklog*` measure how fast a node works off what has piled up. The others measure single operations. One node on an 18-core machine, with Redis 8 in a container next to it (medians):
+
+| Benchmark | v0.2.5 | v0.3.0 |
+| --------- | ------ | ------ |
+| Jobs that do nothing, `MaxConcurrency` 10 | 7.2/s | 3,830/s |
+| Jobs that do nothing, `MaxConcurrency` 100 | 1,122/s | 13,022/s |
+| Jobs that take 10 ms, `MaxConcurrency` 100 | 63/s | 6,039/s |
+| Jobs of one of three tiers, the others empty | 24/s | 8,801/s |
+| Jobs among others whose handler is full | 1.6/s | 13,208/s |
+| Jobs that fail once | 99/s | 2,902/s |
+| One-time jobs that are due at once | 323/s | 5,130/s |
+| Tasks of workflows | 303/s | 5,652/s |
+
 ## Dependencies
 
 | Dependency                                                | Purpose                       |
 | --------------------------------------------------------- | ----------------------------- |
 | [rueidis](https://github.com/redis/rueidis)               | High-performance Redis client |
-| [ants](https://github.com/panjf2000/ants)                 | Goroutine pool                |
+| [ants](https://github.com/panjf2000/ants)                 | Goroutine pools               |
 | [robfig/cron](https://github.com/robfig/cron)             | Cron expression parsing       |
 | [sonic](https://github.com/bytedance/sonic)               | Fast JSON serialization       |
 | [xid](https://github.com/rs/xid)                          | Globally unique ID generation |
@@ -653,3 +736,4 @@ go run main.go
 | [koanf](https://github.com/knadh/koanf)                   | Configuration management      |
 | [grpc-go](https://google.golang.org/grpc)                 | gRPC server                   |
 | [vtprotobuf](https://github.com/planetscale/vtprotobuf)   | Optimized protobuf marshaling |
+| [pq](https://github.com/lib/pq)                           | PostgreSQL driver (tests and examples) |

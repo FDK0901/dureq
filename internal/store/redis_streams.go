@@ -35,7 +35,7 @@ func (s *RedisStore) EnsureStreams(ctx context.Context) error {
 	}
 
 	// Orchestrator consumer groups: on its stream, and on the events stream for events from
-	// nodes before v0.3.0.
+	// nodes before v0.3.1.
 	for _, key := range []string{OrchestratorStreamKey(s.prefix), EventsStreamKey(s.prefix)} {
 		err = s.rdb.Do(ctx, s.rdb.B().XgroupCreate().Key(key).Group(OrchestratorConsumerGroup).Id("0").Mkstream().Build()).Error()
 		if err != nil && !isGroupExistsErr(err) {
@@ -198,7 +198,7 @@ func (s *RedisStore) eventCmds(event types.JobEvent) (cmds, publish rueidis.Comm
 }
 
 // routedField marks an event in the event stream whose writer has given the orchestrator its
-// own copy, if that has to see it. Nodes before v0.3.0 do not set it.
+// own copy, if that has to see it. Nodes before v0.3.1 do not set it.
 const routedField = "routed"
 
 // forOrchestrator reports whether the orchestrator has to see an event.
@@ -241,7 +241,7 @@ func (s *RedisStore) DoneOrchestratorEvents(ctx context.Context, ids ...string) 
 }
 
 // ForwardEvents gives the orchestrator its copy of events in the event stream from nodes
-// before v0.3.0, which do not. It looks at up to count events and returns how many there were.
+// before v0.3.1, which do not. It looks at up to count events and returns how many there were.
 // Those that an orchestrator of such a version had taken and not finished come first.
 func (s *RedisStore) ForwardEvents(ctx context.Context, consumer string, count int64) (int, error) {
 	key := EventsStreamKey(s.prefix)

@@ -1062,7 +1062,7 @@ func (s *RedisStore) GetWorkflow(ctx context.Context, id string) (*types.Workflo
 }
 
 // nameWorkflowTasks fills in the names of the task states of workflows that versions
-// before v0.3.0 created: there, they were the keys only.
+// before v0.3.1 created: there, they were the keys only.
 func nameWorkflowTasks(wf *types.WorkflowInstance) {
 	for name, state := range wf.Tasks {
 		if state.Name == "" {

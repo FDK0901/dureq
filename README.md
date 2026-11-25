@@ -710,7 +710,7 @@ REDIS_URL=redis://localhost:6381 REDIS_DB=15 go test -run '^$' -bench . ./bench/
 
 `BenchmarkBacklog*` measure how fast a node works off what has piled up. The others measure single operations. One node on an 18-core machine, with Redis 8 in a container next to it (medians):
 
-| Benchmark | v0.2.5 | v0.3.0 |
+| Benchmark | v0.2.5 | v0.3.1 |
 | --------- | ------ | ------ |
 | Jobs that do nothing, `MaxConcurrency` 10 | 7.2/s | 3,830/s |
 | Jobs that do nothing, `MaxConcurrency` 100 | 1,122/s | 13,022/s |

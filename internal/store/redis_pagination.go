@@ -217,7 +217,7 @@ func (s *RedisStore) ListJobRuns(ctx context.Context, filter RunFilter) ([]types
 }
 
 // removeStaleRuns removes the runs that have a different status by now from the index of
-// a status, and reports whether there were any. Versions before v0.3.0 left a run that
+// a status, and reports whether there were any. Versions before v0.3.1 left a run that
 // was retried in the index of every status it has had.
 func (s *RedisStore) removeStaleRuns(ctx context.Context, indexKey string, status types.RunStatus, runs []types.JobRun) (bool, error) {
 	var stale []string

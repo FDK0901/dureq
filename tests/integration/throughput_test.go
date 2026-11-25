@@ -4,6 +4,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -124,6 +125,24 @@ func TestWorker_RateLimit(t *testing.T) {
 	if took := time.Since(start); took < 1500*time.Millisecond {
 		t.Errorf("15 jobs at 5 a second took only %v", took)
 	}
+}
+
+// Many retries that are due at once do not wait for each other.
+func TestRetries_ManyAtOnce(t *testing.T) {
+	var n atomic.Int64
+	_, cli := startTiered(t, 50, nil, types.HandlerDefinition{
+		TaskType:    "again",
+		RetryPolicy: &types.RetryPolicy{MaxAttempts: 3, InitialDelay: 100 * time.Millisecond, MaxDelay: 100 * time.Millisecond, Multiplier: 1},
+		Handler: func(ctx context.Context, _ json.RawMessage) error {
+			if types.GetAttempt(ctx) == 0 {
+				return errors.New("again")
+			}
+			n.Add(1)
+			return nil
+		},
+	})
+	enqueueMany(t, cli, "again", types.PriorityNormal, 1000)
+	waitCount(t, 7*time.Second, &n, 1000)
 }
 
 // A busy worker notices that a queue is paused, and that its node is draining.

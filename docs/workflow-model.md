@@ -22,7 +22,8 @@ def := types.WorkflowDefinition{
 wf, err := client.EnqueueWorkflow(ctx, def, orderInput)
 ```
 
-Tasks with no `DependsOn` are root tasks and are dispatched immediately.
+Tasks with no `DependsOn` are root tasks and are dispatched immediately. `EnqueueWorkflow`
+returns an error, and the workflow is `failed`, if none of them could be dispatched.
 Downstream tasks are dispatched when all their dependencies complete.
 
 ## Task Types

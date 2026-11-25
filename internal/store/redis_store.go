@@ -277,6 +277,26 @@ func (s *RedisStore) CreateJob(ctx context.Context, job *types.Job) (uint64, err
 	return 1, nil
 }
 
+// JobsExist reports for each ID whether there is a job.
+func (s *RedisStore) JobsExist(ctx context.Context, ids []string) ([]bool, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	cmds := make(rueidis.Commands, 0, len(ids))
+	for _, id := range ids {
+		cmds = append(cmds, s.rdb.B().Exists().Key(JobKey(s.prefix, id)).Build())
+	}
+	exist := make([]bool, len(ids))
+	for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+		n, err := r.AsInt64()
+		if err != nil {
+			return nil, fmt.Errorf("job exists: %w", err)
+		}
+		exist[i] = n > 0
+	}
+	return exist, nil
+}
+
 // GetJob retrieves a job by ID.
 func (s *RedisStore) GetJob(ctx context.Context, jobID string) (*types.Job, uint64, error) {
 	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(JobKey(s.prefix, jobID)).Build()).AsStrMap()

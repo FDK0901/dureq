@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/dispatcher"
@@ -25,9 +26,12 @@ type Orchestrator struct {
 	dispatcher *dispatcher.Dispatcher
 	logger     chainedlog.Logger
 
-	// The batches and workflows whose reserved jobs have been looked at. Only the event
-	// loop uses it.
-	checked map[string]struct{}
+	// The batches and workflows whose reserved jobs have been looked at.
+	checkedMu sync.Mutex
+	checked   map[string]struct{}
+
+	// The topmost ancestor of workflows. Only the event loop uses it.
+	roots map[string]string
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -52,6 +56,7 @@ func NewOrchestrator(cfg OrchestratorConfig) *Orchestrator {
 		dispatcher: cfg.Dispatcher,
 		logger:     cfg.Logger,
 		checked:    make(map[string]struct{}),
+		roots:      make(map[string]string),
 	}
 }
 
@@ -109,7 +114,9 @@ const (
 // stream until it has been processed.
 func (o *Orchestrator) eventLoop(ctx context.Context) {
 	defer close(o.done)
+	o.checkedMu.Lock()
 	clear(o.checked)
+	o.checkedMu.Unlock()
 
 	streamKey := store.OrchestratorStreamKey(o.store.Prefix())
 
@@ -158,34 +165,57 @@ func (o *Orchestrator) drainPending(ctx context.Context, streamKey string) (fail
 	return true
 }
 
-// processEvents processes events in their order and removes them, except those that fail, which
-// it reports. Those of jobs that are not part of a workflow or batch are removed at once.
-func (o *Orchestrator) processEvents(ctx context.Context, entries []rueidis.XRangeEntry) (ok bool) {
-	var jobIDs []string
-	for _, entry := range entries {
-		if isJobEvent(entry) {
-			jobIDs = append(jobIDs, entry.FieldValues["job_id"])
-		}
-	}
-	concerned := o.store.JobsInWorkflowOrBatch(ctx, jobIDs)
+// eventConcurrency is how many families of workflows, and batches, are processed at once.
+const eventConcurrency = 32
 
-	todo := make([]rueidis.XRangeEntry, 0, len(entries))
+// processEvents processes events and removes them, except those that fail, which it reports.
+// Those that there is nothing to do for are removed at once. Events of a batch, or of a
+// workflow, its child workflows, and theirs, are processed one after the other, in their order.
+func (o *Orchestrator) processEvents(ctx context.Context, entries []rueidis.XRangeEntry) (ok bool) {
+	keys := o.eventKeys(ctx, entries)
+	var failed atomic.Bool
 	var done []string
-	for _, entry := range entries {
-		if isJobEvent(entry) {
-			c := concerned[0]
-			concerned = concerned[1:]
-			if !c {
-				done = append(done, entry.ID)
-				continue
-			}
+	var order []string
+	byKey := make(map[string][]rueidis.XRangeEntry)
+	for i, entry := range entries {
+		switch keys[i] {
+		case "":
+			done = append(done, entry.ID)
+			continue
+		case unknownKey:
+			failed.Store(true)
+			continue
 		}
-		todo = append(todo, entry)
+		if _, ok := byKey[keys[i]]; !ok {
+			order = append(order, keys[i])
+		}
+		byKey[keys[i]] = append(byKey[keys[i]], entry)
 	}
 	o.store.DoneOrchestratorEvents(ctx, done...)
 
+	todo := make(chan []rueidis.XRangeEntry)
+	var wg sync.WaitGroup
+	for range min(eventConcurrency, len(order)) {
+		wg.Go(func() {
+			for entries := range todo {
+				if !o.processInOrder(ctx, entries) {
+					failed.Store(true)
+				}
+			}
+		})
+	}
+	for _, key := range order {
+		todo <- byKey[key]
+	}
+	close(todo)
+	wg.Wait()
+	return !failed.Load()
+}
+
+// processInOrder processes events one after the other.
+func (o *Orchestrator) processInOrder(ctx context.Context, entries []rueidis.XRangeEntry) (ok bool) {
 	ok = true
-	for _, entry := range todo {
+	for _, entry := range entries {
 		if ctx.Err() != nil {
 			return false
 		}
@@ -200,6 +230,114 @@ func (o *Orchestrator) processEvents(ctx context.Context, entries []rueidis.XRan
 		}
 	}
 	return ok
+}
+
+// unknownKey is the key of an event that could not be looked up.
+const unknownKey = "?"
+
+// eventKeys returns for each event what it has to be processed in order with: its batch, or the
+// topmost ancestor of its workflow. It is "" if there is nothing to do for the event.
+func (o *Orchestrator) eventKeys(ctx context.Context, entries []rueidis.XRangeEntry) []string {
+	var jobIDs []string
+	for _, entry := range entries {
+		if isJobEvent(entry) {
+			jobIDs = append(jobIDs, entry.FieldValues["job_id"])
+		}
+	}
+	owners := o.store.JobOwners(ctx, jobIDs)
+
+	keys := make([]string, len(entries))
+	workflows := make([]string, len(entries))
+	for i, entry := range entries {
+		if !isJobEvent(entry) {
+			workflows[i] = entry.FieldValues["job_id"]
+			continue
+		}
+		owner := owners[0]
+		owners = owners[1:]
+		if owner.Err != nil {
+			o.logger.Warn().Err(owner.Err).String("stream_id", entry.ID).Msg("orchestrator: failed to look up event, leaving for retry")
+			keys[i] = unknownKey
+		} else if owner.BatchID != "" {
+			keys[i] = owner.BatchID
+		} else {
+			workflows[i] = owner.WorkflowID
+		}
+	}
+	o.findRoots(ctx, workflows)
+	for i, entry := range entries {
+		if workflows[i] == "" {
+			continue
+		}
+		root, ok := o.roots[workflows[i]]
+		switch {
+		case !ok:
+			keys[i] = unknownKey
+		case root == workflows[i] && isWorkflowEnd(entry):
+			// No parent has to learn of it.
+		default:
+			keys[i] = root
+		}
+	}
+	return keys
+}
+
+// findRoots sees to it that the topmost ancestors of workflows are known, unless they cannot be
+// looked up. Those that are gone, or are not workflows but batches, count as their own.
+func (o *Orchestrator) findRoots(ctx context.Context, ids []string) {
+	const maxRoots = 10_000
+	if len(o.roots) >= maxRoots {
+		clear(o.roots)
+	}
+	parents := make(map[string]string)
+	for level := ids; len(level) > 0; {
+		var unknown []string
+		for _, id := range level {
+			if _, ok := o.roots[id]; ok || id == "" {
+				continue
+			}
+			if _, ok := parents[id]; !ok {
+				parents[id] = unknownKey
+				unknown = append(unknown, id)
+			}
+		}
+		level = nil
+		for i, found := range o.store.WorkflowParents(ctx, unknown) {
+			if found.Err != nil {
+				o.logger.Warn().Err(found.Err).String("workflow_id", unknown[i]).Msg("orchestrator: failed to look up workflow, leaving its events for retry")
+				continue
+			}
+			parents[unknown[i]] = found.ID
+			level = append(level, found.ID)
+		}
+	}
+	for id := range parents {
+		root := id
+		for range len(parents) + 1 { // at most that many steps up
+			if known, ok := o.roots[root]; ok {
+				o.roots[id] = known
+				break
+			}
+			parent, ok := parents[root]
+			if !ok || parent == unknownKey {
+				break
+			}
+			if parent == "" {
+				o.roots[id] = root
+				break
+			}
+			root = parent
+		}
+	}
+}
+
+// isWorkflowEnd reports whether an event only concerns the parent of its workflow.
+func isWorkflowEnd(entry rueidis.XRangeEntry) bool {
+	switch types.EventType(entry.FieldValues["type"]) {
+	case types.EventWorkflowCompleted, types.EventWorkflowFailed, types.EventWorkflowTimedOut, types.EventWorkflowCancelled:
+		return true
+	}
+	return false
 }
 
 func isJobEvent(entry rueidis.XRangeEntry) bool {
@@ -897,7 +1035,7 @@ func (o *Orchestrator) workflowTaskJob(ctx context.Context, wf *types.WorkflowIn
 // ensureWorkflowJobs starts the jobs of a workflow that are reserved but do not exist, like
 // ensureBatchJobs.
 func (o *Orchestrator) ensureWorkflowJobs(ctx context.Context, wfID string) error {
-	if _, ok := o.checked[wfID]; ok {
+	if o.isChecked(wfID) {
 		return nil
 	}
 	wf, _, err := o.store.GetWorkflow(ctx, wfID)

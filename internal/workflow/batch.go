@@ -71,7 +71,7 @@ func (o *Orchestrator) changeBatch(ctx context.Context, batchID string, change f
 func (o *Orchestrator) startBatchJobs(ctx context.Context, batchID string, jobs []*types.Job) error {
 	for _, job := range jobs {
 		if err := o.startJob(ctx, job); err != nil {
-			delete(o.checked, batchID) // the next event of the batch has it looked at again
+			o.unmarkChecked(batchID) // the next event of the batch has it looked at again
 			o.logger.Error().String("batch_id", batchID).String("job_id", job.ID).Err(err).Msg("batch: failed to start job")
 			return err
 		}
@@ -99,7 +99,7 @@ func (o *Orchestrator) startJob(ctx context.Context, job *types.Job) error {
 // reserved them stopped before they could start them. It does so at the first event of the
 // batch that this orchestrator sees, which includes one that its predecessor did not finish.
 func (o *Orchestrator) ensureBatchJobs(ctx context.Context, batchID string) error {
-	if _, ok := o.checked[batchID]; ok {
+	if o.isChecked(batchID) {
 		return nil
 	}
 	batch, _, err := o.store.GetBatch(ctx, batchID)
@@ -157,10 +157,25 @@ func (o *Orchestrator) missingJobs(ctx context.Context, jobs []*types.Job) ([]*t
 // markChecked remembers that the reserved jobs of a batch or workflow have been looked at.
 func (o *Orchestrator) markChecked(id string) {
 	const maxChecked = 10_000
+	o.checkedMu.Lock()
+	defer o.checkedMu.Unlock()
 	if len(o.checked) >= maxChecked {
 		clear(o.checked) // looking at one again does no harm
 	}
 	o.checked[id] = struct{}{}
+}
+
+func (o *Orchestrator) unmarkChecked(id string) {
+	o.checkedMu.Lock()
+	defer o.checkedMu.Unlock()
+	delete(o.checked, id)
+}
+
+func (o *Orchestrator) isChecked(id string) bool {
+	o.checkedMu.Lock()
+	defer o.checkedMu.Unlock()
+	_, ok := o.checked[id]
+	return ok
 }
 
 // staleJob reports whether an event is not about the job that the state waits for: its work

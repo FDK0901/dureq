@@ -292,29 +292,56 @@ func (s *RedisStore) JobsExist(ctx context.Context, ids []string) ([]bool, error
 	return exist, nil
 }
 
-// JobsInWorkflowOrBatch reports for each ID whether the job is part of a workflow or batch.
-// One that cannot be read counts as such, but not one that does not exist.
-func (s *RedisStore) JobsInWorkflowOrBatch(ctx context.Context, ids []string) []bool {
-	if len(ids) == 0 {
-		return nil
-	}
+// JobOwner says which workflow or batch a job is part of, if any.
+type JobOwner struct {
+	WorkflowID string `json:"workflow_id"`
+	BatchID    string `json:"batch_id"`
+	Err        error  `json:"-"` // it could not be looked up
+}
+
+// JobOwners returns for each ID the owner of the job. One that does not exist has none.
+func (s *RedisStore) JobOwners(ctx context.Context, ids []string) []JobOwner {
 	cmds := make(rueidis.Commands, 0, len(ids))
 	for _, id := range ids {
 		cmds = append(cmds, s.rdb.B().Hget().Key(JobKey(s.prefix, id)).Field("data").Build())
 	}
-	part := make([]bool, len(ids))
+	owners := make([]JobOwner, len(ids))
 	for i, r := range s.rdb.DoMulti(ctx, cmds...) {
-		data, err := r.ToString()
-		if rueidis.IsRedisNil(err) {
-			continue
-		}
-		var job struct {
-			WorkflowID *string `json:"workflow_id"`
-			BatchID    *string `json:"batch_id"`
-		}
-		part[i] = err != nil || sonic.ConfigFastest.UnmarshalFromString(data, &job) != nil || job.WorkflowID != nil || job.BatchID != nil
+		owners[i].Err = unmarshalPart(r, &owners[i])
 	}
-	return part
+	return owners
+}
+
+// WorkflowParent is the parent of a workflow, if any.
+type WorkflowParent struct {
+	ID  string `json:"parent_workflow_id"`
+	Err error  `json:"-"` // it could not be looked up
+}
+
+// WorkflowParents returns for each ID the parent of the workflow. One that does not exist has
+// none.
+func (s *RedisStore) WorkflowParents(ctx context.Context, ids []string) []WorkflowParent {
+	cmds := make(rueidis.Commands, 0, len(ids))
+	for _, id := range ids {
+		cmds = append(cmds, s.rdb.B().Hget().Key(WorkflowKey(s.prefix, id)).Field("data").Build())
+	}
+	parents := make([]WorkflowParent, len(ids))
+	for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+		parents[i].Err = unmarshalPart(r, &parents[i])
+	}
+	return parents
+}
+
+// unmarshalPart reads what part has of a JSON document, if that exists.
+func unmarshalPart(r rueidis.RedisResult, part any) error {
+	data, err := r.ToString()
+	if rueidis.IsRedisNil(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return sonic.ConfigFastest.UnmarshalFromString(data, part)
 }
 
 // GetJob retrieves a job by ID.

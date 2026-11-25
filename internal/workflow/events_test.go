@@ -220,3 +220,135 @@ func TestEvents_OfDeleted(t *testing.T) {
 		t.Errorf("%d events are left", n)
 	}
 }
+
+// The events of a workflow and its child workflows have one key, those of others have others.
+func TestEventKeys(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	inner := types.WorkflowDefinition{Name: "w", Tasks: []types.WorkflowTask{{Name: "a", TaskType: "t"}}}
+	child := func(parent *types.WorkflowInstance) *types.WorkflowInstance {
+		t.Helper()
+		wf := newWorkflow(t, st, inner)
+		wf.ParentWorkflowID = &parent.ID
+		if _, err := st.SaveWorkflow(ctx, wf); err != nil {
+			t.Fatal(err)
+		}
+		return wf
+	}
+	top, other := newWorkflow(t, st, inner), newWorkflow(t, st, inner)
+	mid := child(top)
+	low := child(mid)
+	lost := child(&types.WorkflowInstance{ID: "gone"})
+	broken := newWorkflow(t, st, inner)
+	underBroken := child(broken)
+	if err := st.Client().Do(ctx, st.Client().B().Hset().Key(store.WorkflowKey(st.Prefix(), broken.ID)).FieldValue().FieldValue("data", "{").Build()).Error(); err != nil {
+		t.Fatal(err)
+	}
+	jobOf := func(wfID, batchID string) string {
+		t.Helper()
+		job := newJob(xid.New().String(), "t", nil, "op", time.Now())
+		if wfID != "" {
+			job.WorkflowID = &wfID
+		}
+		if batchID != "" {
+			job.BatchID = &batchID
+		}
+		finishJob(t, st, job, types.JobStatusCompleted)
+		return job.ID
+	}
+
+	for range 2 { // the second time, they are known
+		o := newTestOrchestrator(st)
+		for range 2 {
+			var entries []rueidis.XRangeEntry
+			var want []string
+			add := func(eventType types.EventType, id, key string) {
+				entries = append(entries, rueidis.XRangeEntry{FieldValues: map[string]string{"type": string(eventType), "job_id": id}})
+				want = append(want, key)
+			}
+			add(types.EventJobCompleted, jobOf(low.ID, ""), top.ID)
+			add(types.EventJobCompleted, jobOf(top.ID, ""), top.ID)
+			add(types.EventWorkflowStarted, mid.ID, top.ID)
+			add(types.EventWorkflowCompleted, low.ID, top.ID)
+			add(types.EventWorkflowCompleted, top.ID, "")
+			add(types.EventWorkflowRetrying, top.ID, top.ID)
+			add(types.EventJobFailed, jobOf(other.ID, ""), other.ID)
+			add(types.EventJobCompleted, jobOf("", "batch"), "batch")
+			add(types.EventBatchRetrying, "batch", "batch")
+			add(types.EventJobCompleted, jobOf("", ""), "")
+			add(types.EventJobCompleted, "none", "")
+			add(types.EventWorkflowFailed, lost.ID, "gone")
+			add(types.EventJobCompleted, jobOf(underBroken.ID, ""), unknownKey)
+			add(types.EventWorkflowResumed, broken.ID, unknownKey)
+			for i, got := range o.eventKeys(ctx, entries) {
+				if got != want[i] {
+					t.Errorf("%s: key %q, want %q", entries[i].FieldValues["type"], got, want[i])
+				}
+			}
+		}
+	}
+}
+
+// A workflow whose ancestors are known already, as far as they are, has the same key as they.
+func TestEventKeys_ChildOfKnown(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	chain := []*types.WorkflowInstance{newWorkflow(t, st, types.WorkflowDefinition{Name: "w"})}
+	for range 4 {
+		wf := newWorkflow(t, st, types.WorkflowDefinition{Name: "w"})
+		wf.ParentWorkflowID = &chain[len(chain)-1].ID
+		if _, err := st.SaveWorkflow(ctx, wf); err != nil {
+			t.Fatal(err)
+		}
+		chain = append(chain, wf)
+	}
+	for known := range chain {
+		for next := known + 1; next < len(chain); next++ {
+			o := newTestOrchestrator(st)
+			o.findRoots(ctx, []string{chain[known].ID})
+			o.findRoots(ctx, []string{chain[next].ID})
+			if got := o.roots[chain[next].ID]; got != chain[0].ID {
+				t.Errorf("workflow %d after %d: root %q, want %q", next, known, got, chain[0].ID)
+			}
+		}
+	}
+}
+
+// Workflows that are related to each other as a cycle, which cannot be, do not stop the loop.
+func TestEventKeys_Cycle(t *testing.T) {
+	st := newTestStore(t)
+	a := newWorkflow(t, st, types.WorkflowDefinition{Name: "w"})
+	b := newWorkflow(t, st, types.WorkflowDefinition{Name: "w"})
+	a.ParentWorkflowID, b.ParentWorkflowID = &b.ID, &a.ID
+	for _, wf := range []*types.WorkflowInstance{a, b} {
+		if _, err := st.SaveWorkflow(context.Background(), wf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newTestOrchestrator(st).findRoots(context.Background(), []string{a.ID, b.ID})
+}
+
+// Events of one family of workflows do not overlap, and those of many workflows all count.
+func TestEvents_OfManyWorkflows(t *testing.T) {
+	st := newTestStore(t)
+	const n = 200
+	var wfs []*types.WorkflowInstance
+	for range n {
+		wf, job := runningWorkflow(t, st)
+		publishEvents(t, st, 2, completed(job)) // twice, as it may come
+		wfs = append(wfs, wf)
+	}
+	startOrchestrator(t, st)
+	for _, wf := range wfs {
+		waitTask(t, st, wf.ID, "b", types.JobStatusRunning)
+	}
+	count := dispatched(t, st)
+	for _, wf := range wfs {
+		if jobID := getWorkflow(t, st, wf.ID).Tasks["b"].JobID; count[jobID] != 1 {
+			t.Errorf("task b was dispatched %d times", count[jobID])
+		}
+	}
+	if len(count) != n {
+		t.Errorf("%d jobs were dispatched, want %d", len(count), n)
+	}
+}

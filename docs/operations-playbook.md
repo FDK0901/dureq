@@ -20,7 +20,7 @@ Use `WithMode` to control which subsystems run on a given node.
 | `ModeQueue` | `1` | Worker pool + dispatcher |
 | `ModeScheduler` | `2` | Schedule scanner + orphan detection + archival (leader-only) |
 | `ModeWorkflow` | `4` | Workflow orchestrator + batch orchestrator (leader-only) |
-| `ModeMonitor` | `8` | HTTP monitoring API |
+| `ModeMonitor` | `8` | Nothing in a server of your own. A `dureqd` in this mode alone runs no jobs and serves the monitoring API, which it does in every mode |
 | `ModeFull` | `15` | All of the above |
 
 ### Recommended Topology
@@ -30,7 +30,7 @@ For small deployments, use `ModeFull` on every node. For larger clusters:
 ```
 Worker nodes:    ModeQueue
 Leader node:     ModeScheduler | ModeWorkflow
-Monitor node:    ModeMonitor
+Monitor node:    ModeMonitor (dureqd)
 ```
 
 Leader election is automatic. Any node with `ModeScheduler` or `ModeWorkflow`
@@ -78,7 +78,8 @@ Use before rolling deployments.
 
 ## Monitoring API Endpoints
 
-The monitoring API is enabled with `ModeMonitor`. Key route groups:
+`dureqd` serves the monitoring API, in every mode. A server of your own does not; build endpoints on
+`dureq.NewAPIService`, which has the same calls. Key route groups:
 
 ### Jobs
 

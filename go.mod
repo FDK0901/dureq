@@ -4,6 +4,9 @@ go 1.26.11
 
 toolchain go1.27.4
 
+// Published by mistake: it has the code of v0.2.5. Use v0.3.1.
+retract v0.3.0
+
 require (
 	github.com/FDK0901/go-chainedlog v0.0.0-20260220050318-a2155544d88e
 	github.com/bytedance/sonic v1.15.5

@@ -56,7 +56,7 @@ All keys must have available capacity for the job to proceed.
 ## Priority Tiers
 
 By default, all jobs share a single Redis Stream. Use `WithPriorityTiers` to
-split work across multiple streams with weighted consumption.
+split work across multiple streams. List the tiers from the most to the least important.
 
 ```go
 srv, _ := server.New(
@@ -69,16 +69,20 @@ srv, _ := server.New(
 )
 ```
 
-Workers read from higher-weight tiers more frequently. A job's `Priority` value
-(1--10) is mapped to a tier automatically:
+Workers look at the tiers in the order of the list, and take up to `FetchBatch`
+messages from each, as long as they have room. `Weight` is shown by the monitoring API
+and does not change the order.
+
+A job's `Priority` value (1--10) is mapped to a tier by that order, too. With three tiers:
 
 | Priority | Tier |
 |----------|------|
-| 8--10 | First configured tier (highest weight) |
-| 3--7 | Middle tier |
-| 1--2 | Last configured tier (lowest weight) |
+| 8--10 | First configured tier |
+| 5--7 | Second tier |
+| 1--4 | Last configured tier |
 
-The mapping scales proportionally when more than three tiers are configured.
+Each tier gets `10 / number of tiers` priorities, rounded down, from 10 downwards, and the
+last one those that are left.
 
 Set priority on enqueue via the `Priority` field. Built-in constants:
 `PriorityLow` (1), `PriorityNormal` (5), `PriorityHigh` (8), `PriorityCritical` (10).
@@ -93,7 +97,7 @@ POST /api/queues/{tierName}/pause
 POST /api/queues/{tierName}/resume
 ```
 
-Or programmatically: `store.PauseQueue(ctx, "bulk")` / `store.ResumeQueue(ctx, "bulk")`.
+Or programmatically: `store.PauseQueue(ctx, "bulk")` / `store.UnpauseQueue(ctx, "bulk")`.
 Use during deployments to halt a priority level without affecting other tiers.
 
 ## Node-Level Concurrency

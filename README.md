@@ -105,7 +105,7 @@ Client (Go)
 - **Batch Processing** — Optional onetime preprocessing, chunked parallel item execution, failure policies
 - **Group Aggregation** — Collect individual tasks into groups, automatically flush and aggregate into a single job based on grace period, max delay, or max size
 - **Mux Handler** — Pattern-based task type routing (`order.*`), global and per-handler middleware
-- **Priority Queues** — User-defined tiers, of which those with a higher weight are looked at first
+- **Priority Queues** — User-defined tiers, looked at in their order
 - **Concurrency Limits** — Per node (`MaxConcurrency`), per handler and node (`Concurrency`), and per key across the cluster (`ConcurrencyKeys`). A handler that has reached its limit does not hold up the others ([details](docs/concurrency.md))
 - **Task Queue Rate Limiting** — Distributed token bucket rate limiter per queue (Redis Lua-backed)
 
@@ -323,7 +323,7 @@ See [docs/batch-model.md](docs/batch-model.md).
 
 ## Priority Tiers
 
-All jobs share one queue unless you define tiers. The priority of a job, from 1 to 10, decides which one it goes to:
+All jobs share one queue unless you define tiers. List them from the most to the least important: workers look at them in that order, and the priority of a job, from 10 to 1, decides which one it goes to. `Weight` is shown by the monitoring API and does not change the order.
 
 ```go
 tiers := []dureq.TierConfig{
@@ -710,7 +710,7 @@ REDIS_URL=redis://localhost:6381 REDIS_DB=15 go test -run '^$' -bench . ./bench/
 
 `BenchmarkBacklog*` measure how fast a node works off what has piled up. The others measure single operations. One node on an 18-core machine, with Redis 8 in a container next to it (medians):
 
-| Benchmark | v0.2.5 | v0.3.0 |
+| Benchmark | v0.2.5 | v0.3.1 |
 | --------- | ------ | ------ |
 | Jobs that do nothing, `MaxConcurrency` 10 | 7.2/s | 3,830/s |
 | Jobs that do nothing, `MaxConcurrency` 100 | 1,122/s | 13,022/s |

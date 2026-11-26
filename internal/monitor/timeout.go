@@ -43,10 +43,24 @@ func (a *APIService) Timed(ctx context.Context, f func(ctx context.Context) erro
 	timed, cancel := context.WithTimeout(ctx, d)
 	defer cancel()
 	err := f(timed)
-	if errors.Is(timed.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+	if timedOut(ctx, timed) {
 		return unavailable()
 	}
 	return err
+}
+
+// timedOut reports whether the time of timed, made from parent, is up. A read that rueidis gives
+// up for it, such as a dial, can end a moment before timed says so itself, so that it goes by the
+// clock, too.
+func timedOut(parent, timed context.Context) bool {
+	if parent.Err() != nil {
+		return false
+	}
+	if errors.Is(timed.Err(), context.DeadlineExceeded) {
+		return true
+	}
+	deadline, ok := timed.Deadline()
+	return ok && !time.Now().Before(deadline)
 }
 
 // withTimeout gives a request no more than d, and answers 503 with Retry-After if the time is up
@@ -64,7 +78,7 @@ func withTimeout(d time.Duration, next http.Handler) http.Handler {
 		defer cancel()
 		buf := &bufferedResponse{header: make(http.Header), status: http.StatusOK}
 		next.ServeHTTP(buf, r.WithContext(ctx))
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) && r.Context().Err() == nil {
+		if timedOut(r.Context(), ctx) {
 			w.Header().Set("Retry-After", unavailableRetryAfter)
 			writeServiceError(w, unavailable())
 			return

@@ -24,14 +24,7 @@ import (
 // REDIS_PASSWORD) under a unique key prefix. Skips if Redis is unavailable.
 func newTestAPI(t *testing.T, disp Dispatcher) (*store.RedisStore, *httptest.Server) {
 	t.Helper()
-	addr := strings.TrimPrefix(os.Getenv("REDIS_URL"), "redis://")
-	if addr == "" {
-		t.Skip("REDIS_URL not set")
-	}
-	password := os.Getenv("REDIS_PASSWORD")
-	if password == "" {
-		password = "your-password"
-	}
+	addr, password := testRedis(t)
 	rdb, err := rueidis.NewClient(rueidis.ClientOption{InitAddress: []string{addr}, Password: password})
 	if err != nil {
 		t.Skipf("redis unavailable: %v", err)
@@ -52,6 +45,20 @@ func newTestAPI(t *testing.T, disp Dispatcher) (*store.RedisStore, *httptest.Ser
 	srv := httptest.NewServer(api.Handler())
 	t.Cleanup(srv.Close)
 	return st, srv
+}
+
+// testRedis returns the address and password of the test Redis, or skips.
+func testRedis(t *testing.T) (addr, password string) {
+	t.Helper()
+	addr = strings.TrimPrefix(os.Getenv("REDIS_URL"), "redis://")
+	if addr == "" {
+		t.Skip("REDIS_URL not set")
+	}
+	password = os.Getenv("REDIS_PASSWORD")
+	if password == "" {
+		password = "your-password"
+	}
+	return addr, password
 }
 
 // call requests path and decodes the response into out, if it is one of a 2xx.

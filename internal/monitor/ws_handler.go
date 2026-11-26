@@ -12,8 +12,9 @@ import (
 const (
 	wsPingInterval = 30 * time.Second
 	wsWriteTimeout = 10 * time.Second
-	wsHeartbeat    = 15 * time.Second
 )
+
+var wsHeartbeat = 15 * time.Second
 
 // Messages that a client gets beside events if it asks for them, with ?v=2.
 var (
@@ -24,11 +25,27 @@ var (
 	wsResyncMsg = []byte(`{"type":"ws.resync"}`)
 )
 
+const wsStalledReason = "events are not being read: Redis does not answer"
+
 // HandleWebSocket returns an http.HandlerFunc that upgrades connections to
 // WebSocket and streams real-time events from the Hub. Whether a web page of another origin
 // may connect is up to whoever serves it.
+//
+// A heartbeat says that events come as they happen. If the hub is stalled (HubHealth), a client
+// with ?v=2 gets none: it is not let in (503), and one that is in is closed with 1013 (try again
+// later) when its next heartbeat is due.
 func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
+	stalled := func() bool {
+		h, ok := hub.(HubHealth)
+		return ok && h.Stalled()
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		v2 := r.URL.Query().Get("v") == "2"
+		if v2 && stalled() {
+			w.Header().Set("Retry-After", "5")
+			writeServiceError(w, &ApiError{Msg: wsStalledReason, StatusCode: http.StatusServiceUnavailable})
+			return
+		}
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true, // see originGuard
 		})
@@ -90,7 +107,6 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 		}
 
 		// Write pump — forwards events from hub to WebSocket connection.
-		v2 := r.URL.Query().Get("v") == "2"
 		var heartbeat <-chan time.Time
 		if v2 {
 			ticker := time.NewTicker(wsHeartbeat)
@@ -114,6 +130,10 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 					return
 				}
 			case <-heartbeat:
+				if stalled() {
+					conn.Close(websocket.StatusTryAgainLater, wsStalledReason)
+					return
+				}
 				if !write(wsHeartbeatMsg) {
 					return
 				}

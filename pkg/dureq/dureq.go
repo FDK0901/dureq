@@ -90,6 +90,7 @@ type RedisStore = store.RedisStore
 
 type APIService = monitor.APIService
 type Hub = monitor.Hub
+type HubHealth = monitor.HubHealth
 
 type Dispatcher = monitor.Dispatcher
 

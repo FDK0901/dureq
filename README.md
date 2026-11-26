@@ -561,6 +561,8 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 
 With `/api/ws?v=2`, a client also gets `{"type":"ws.heartbeat"}` at once and every 15 seconds, so that it knows a dead connection from a quiet one, and `{"type":"ws.resync"}` if it has missed events, because it was too slow or Redis was away for longer than the event stream reaches back. Then it has to read again what it shows.
 
+A heartbeat says that events come as they happen. If Redis has not answered the reader of the events for longer than a read takes (10 seconds), as when a connection stays open and nothing comes back, the reader gives the connection up and goes on where it was on another one. Until it hears from Redis again, a client with `?v=2` gets no heartbeat: one that is in is closed with 1013 (try again later) when its next heartbeat is due, and one that comes is answered 503. A WebSocket of your own on `dureq.NewAPIService` can do the same: its hub is a `dureq.HubHealth`, whose `Stalled()` says so.
+
 An event comes after what it stands for: whoever reads the job on `job.completed`, or its runs on `job.failed`, finds the new state.
 
 ## Event Types

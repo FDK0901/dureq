@@ -26,6 +26,7 @@ func RunKey(prefix, runID string) string              { return fmt.Sprintf("%s:r
 func RunsActiveKey(prefix string) string              { return prefix + ":runs:active" }
 func RunsByJobKey(prefix, jobID string) string        { return fmt.Sprintf("%s:runs:by_job:%s", prefix, jobID) }
 func RunsActiveByJobKey(prefix, jobID string) string  { return fmt.Sprintf("%s:runs:active_by_job:%s", prefix, jobID) }
+func LostRunRecoveredKey(prefix, runID string) string { return fmt.Sprintf("%s:run:recovered:%s", prefix, runID) }
 
 // Overlap buffer (schedule overlap policy)
 func OverlapBufferedKey(prefix, jobID string) string   { return fmt.Sprintf("%s:overlap_buffered:%s", prefix, jobID) }

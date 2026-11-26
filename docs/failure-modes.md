@@ -48,7 +48,9 @@ operations. During rapid alternation, duplicate dispatches are possible.
 1. Worker stops heartbeating
 2. XAUTOCLAIM reclaims pending message after 5 minutes
 3. Another worker acquires the per-run lock and executes
-4. Orphan detection (leader, every 30s) marks the old run as failed
+4. Orphan detection (leader, every 30s) marks the old run as failed, and retries the job,
+   or ends it, if its retries are used up. If that fails half way, or the leader goes away,
+   the next check does it again, on whichever node leads then; the job is not left running
 
 **Impact**: Handler side effects from the original execution are NOT rolled back.
 

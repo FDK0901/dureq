@@ -771,6 +771,49 @@ func (s *RedisStore) GetRun(ctx context.Context, runID string) (*types.JobRun, u
 	return &run, parseVersion(result["_version"]), nil
 }
 
+// lostRunTTL is how long a lost run is known to have been recovered. Its recovery is finished
+// at the next check of orphaned runs, long before.
+const lostRunTTL = 24 * time.Hour
+
+type lostRunOutcome struct {
+	Event      *types.JobEvent `json:"event,omitempty"`
+	Standalone bool            `json:"standalone,omitempty"`
+}
+
+// MarkLostRunRecovered notes that what becomes of the job of a lost run is stored, and the event
+// that is to say so, if any, so that a recovery that is cut short is finished, not done again.
+func (s *RedisStore) MarkLostRunRecovered(ctx context.Context, runID string, ended *types.JobEvent) error {
+	outcome := lostRunOutcome{Event: ended}
+	if ended != nil {
+		outcome.Standalone = ended.Standalone
+	}
+	data, err := sonic.ConfigFastest.Marshal(outcome)
+	if err != nil {
+		return fmt.Errorf("marshal outcome of lost run: %w", err)
+	}
+	return s.rdb.Do(ctx, s.rdb.B().Set().Key(LostRunRecoveredKey(s.prefix, runID)).Value(string(data)).Ex(lostRunTTL).Build()).Error()
+}
+
+// LostRunRecovered reports whether the job of a lost run has been dealt with, and the event that
+// is to say so, if any.
+func (s *RedisStore) LostRunRecovered(ctx context.Context, runID string) (bool, *types.JobEvent, error) {
+	data, err := s.rdb.Do(ctx, s.rdb.B().Get().Key(LostRunRecoveredKey(s.prefix, runID)).Build()).ToString()
+	if rueidis.IsRedisNil(err) {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, fmt.Errorf("get outcome of lost run: %w", err)
+	}
+	var outcome lostRunOutcome
+	if err := sonic.ConfigFastest.Unmarshal([]byte(data), &outcome); err != nil {
+		return false, nil, fmt.Errorf("unmarshal outcome of lost run: %w", err)
+	}
+	if outcome.Event != nil {
+		outcome.Event.Standalone = outcome.Standalone
+	}
+	return true, outcome.Event, nil
+}
+
 // DeleteRun removes a run and cleans its indexes.
 func (s *RedisStore) DeleteRun(ctx context.Context, runID string) error {
 	dataStr, err := s.rdb.Do(ctx, s.rdb.B().Hget().Key(RunKey(s.prefix, runID)).Field("data").Build()).ToString()

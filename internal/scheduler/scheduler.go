@@ -561,200 +561,241 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 
 		// This run is orphaned.
 		deadNodes[run.NodeID] = struct{}{}
-		errMsg := "node " + run.NodeID + " crashed or became unresponsive"
 		s.logger.Warn().String("run_id", run.ID).String("job_id", run.JobID).String("node_id", run.NodeID).Msg("scheduler: detected orphaned run")
-
-		run.Status = types.RunStatusFailed
-		run.Error = &errMsg
-		run.FinishedAt = &now
-		run.Duration = now.Sub(run.StartedAt)
-		s.store.SaveRun(ctx, run)
-		// Record in run history before removing from active set.
-		s.store.SaveJobRun(ctx, run)
-
-		// Load the parent job.
-		job, rev, err := s.store.GetJob(ctx, run.JobID)
-		if err != nil {
-			s.store.DeleteRun(ctx, run.ID)
-			continue
-		}
-
-		// The events are published once the run is out of the active runs and the job is
-		// saved, so that whoever reads the job or its runs on one finds what it says.
-		crashed := types.JobEvent{
-			Type:           types.EventNodeCrashDetected,
-			JobID:          run.JobID,
-			RunID:          run.ID,
-			NodeID:         run.NodeID,
-			Error:          &errMsg,
-			Timestamp:      now,
-			AffectedRunIDs: []string{run.ID},
-		}
-		var ended *types.JobEvent
-		// endedAs is the event of what has become of the job; saved says whether the job was
-		// saved so, and the event carries its state then.
-		endedAs := func(e types.JobEvent, saved bool) {
-			if saved {
-				e.SetJob(job)
-			}
-			ended = &e
-		}
-
-		if job.WorkflowID != nil || job.BatchID != nil {
-			// Workflow/batch job: publish failure event so the orchestrator handles retry.
-			saved := true
-			if job.Status == types.JobStatusRunning {
-				job.Status = types.JobStatusFailed
-				job.LastError = &errMsg
-				job.UpdatedAt = now
-				_, err := s.store.UpdateJob(ctx, job, rev)
-				saved = err == nil
-			}
-
-			endedAs(types.JobEvent{
-				Type:      types.EventJobFailed,
-				JobID:     run.JobID,
-				RunID:     run.ID,
-				NodeID:    run.NodeID,
-				Error:     &errMsg,
-				Timestamp: now,
-			}, saved)
-		} else {
-			// Standalone job: check retry policy and auto-redispatch.
-			retryPolicy := job.RetryPolicy
-			if retryPolicy == nil {
-				retryPolicy = types.DefaultRetryPolicy()
-			}
-
-			recurring := job.Schedule.Type.IsRecurring()
-			maxAttempts := retryPolicy.MaxAttempts
-			if recurring && job.DLQAfter != nil && *job.DLQAfter < maxAttempts {
-				maxAttempts = *job.DLQAfter
-			}
-			attempt := lostAttempt(job, run, maxAttempts)
-			switch {
-			case job.Status == types.JobStatusDead || job.Status == types.JobStatusCancelled:
-				// The job ended while this run was still going and gave up its unique
-				// key, so the run is dropped rather than redispatched.
-
-			case attempt < maxAttempts:
-				// Auto-recover: redispatch.
-				prevStatus, prevAttempt := job.Status, job.Attempt
-				if recurring {
-					// The lost run has used up an attempt, or else a firing that takes
-					// its worker down would be redispatched forever.
-					attempt++
-				}
-				job.Attempt = attempt
-				job.Status = types.JobStatusPending
-				job.LastError = &errMsg
-				job.UpdatedAt = now
-				newRev, updateErr := s.store.UpdateJob(ctx, job, rev)
-				if updateErr != nil {
-					s.logger.Error().String("job_id", run.JobID).Err(updateErr).Msg("scheduler: failed to update orphaned job for auto-recovery")
-					s.dispatcher.PublishEvent(crashed)
-					continue
-				}
-				// It is the same operation as the lost run, whose message may yet be
-				// reclaimed: the ledger lets only one of them complete.
-				recovered := *job
-				if run.OperationKey != "" {
-					recovered.Headers = make(map[string]string, len(job.Headers)+1)
-					maps.Copy(recovered.Headers, job.Headers)
-					recovered.Headers[headerOperationKey] = run.OperationKey
-				}
-				if dispErr := s.dispatcher.Dispatch(ctx, &recovered, job.Attempt); dispErr != nil {
-					s.logger.Error().String("job_id", run.JobID).Err(dispErr).Msg("scheduler: dispatch failed for orphan recovery, rolling back")
-					job.Status = prevStatus
-					job.Attempt = prevAttempt
-					job.UpdatedAt = time.Now()
-					s.store.UpdateJob(ctx, job, newRev)
-					s.dispatcher.PublishEvent(crashed)
-					continue
-				}
-
-				// It does not carry the job's state: by the time it is published, the job
-				// may be running again.
-				endedAs(types.JobEvent{
-					Type:      types.EventJobAutoRecovered,
-					JobID:     run.JobID,
-					RunID:     run.ID,
-					NodeID:    run.NodeID,
-					Error:     &errMsg,
-					Attempt:   job.Attempt,
-					Timestamp: now,
-				}, false)
-
-				s.logger.Info().String("job_id", run.JobID).Int("attempt", job.Attempt).Msg("scheduler: auto-recovered orphaned job")
-
-			case s.keepsSchedule(ctx, job):
-				// Retries exhausted, but the job goes on with its next firing.
-				failed := *job
-				failed.Attempt = attempt
-				job.Status = types.JobStatusScheduled
-				job.Attempt = 0
-				job.LastError = &errMsg
-				job.UpdatedAt = now
-				_, err := s.store.UpdateJob(ctx, job, rev)
-				if err != nil {
-					s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to put job with exhausted firing back on its schedule")
-				}
-				s.dispatcher.DispatchToDLQ(ctx, &failed, errMsg)
-
-				endedAs(types.JobEvent{
-					Type:      types.EventJobFailed,
-					JobID:     run.JobID,
-					RunID:     run.ID,
-					NodeID:    run.NodeID,
-					TaskType:  job.TaskType,
-					Attempt:   attempt,
-					Error:     &errMsg,
-					Timestamp: now,
-				}, err == nil)
-
-			default:
-				// Retries exhausted.
-				job.Status = types.JobStatusDead
-				job.LastError = &errMsg
-				job.UpdatedAt = now
-				_, err := s.store.UpdateJob(ctx, job, rev)
-				if err == nil {
-					s.releaseEndedJobUniqueKey(ctx, job.ID)
-				}
-
-				endedAs(types.JobEvent{
-					Type:      types.EventJobDead,
-					JobID:     run.JobID,
-					RunID:     run.ID,
-					NodeID:    run.NodeID,
-					Error:     &errMsg,
-					Timestamp: now,
-				}, err == nil)
-			}
-		}
-
-		// Release concurrency slots held by the orphaned run.
-		if len(job.ConcurrencyKeys) > 0 {
-			for _, ck := range job.ConcurrencyKeys {
-				if err := s.store.ReleaseConcurrencySlot(ctx, ck.Key, run.ID); err != nil {
-					s.logger.Warn().String("run_id", run.ID).String("conc_key", ck.Key).Err(err).Msg("scheduler: failed to release concurrency slot for orphaned run")
-				}
-			}
-		}
-
-		// Clean up the orphaned run entry.
-		s.store.DeleteRun(ctx, run.ID)
-
-		s.dispatcher.PublishEvent(crashed)
-		if ended != nil {
-			s.dispatcher.PublishEvent(*ended)
-		}
+		s.recoverLostRun(ctx, run, now)
 	}
 
 	// Clean up persistent drain keys for dead nodes.
 	for nodeID := range deadNodes {
 		s.store.SetNodeDrain(ctx, nodeID, false)
 	}
+}
+
+// recoverLostRun deals with a run whose node is gone. It settles what becomes of the job and
+// stores that, then moves the run to the history, and then announces it, so that whoever reads
+// the job or its runs on an event finds what it says.
+//
+// Until the job is settled, the run stays as it is: if anything fails on the way, or the
+// scheduler goes away, the next check does it again. Once the job is settled, that is noted
+// with the event to come, so that the next check only finishes what is left.
+func (s *Scheduler) recoverLostRun(ctx context.Context, run *types.JobRun, now time.Time) {
+	errMsg := "node " + run.NodeID + " crashed or became unresponsive"
+	job, rev, err := s.store.GetJob(ctx, run.JobID)
+	if errors.Is(err, types.ErrJobNotFound) {
+		s.finishLostRun(ctx, run, errMsg, now)
+		return
+	}
+	if err != nil {
+		s.logger.Warn().String("run_id", run.ID).String("job_id", run.JobID).Err(err).Msg("scheduler: failed to read the job of an orphaned run, trying again on the next check")
+		return
+	}
+
+	// The slots of the lost run are free, whatever becomes of the job.
+	for _, ck := range job.ConcurrencyKeys {
+		if err := s.store.ReleaseConcurrencySlot(ctx, ck.Key, run.ID); err != nil {
+			s.logger.Warn().String("run_id", run.ID).String("conc_key", ck.Key).Err(err).Msg("scheduler: failed to release concurrency slot for orphaned run")
+		}
+	}
+
+	settled, ended, err := s.store.LostRunRecovered(ctx, run.ID)
+	if err != nil {
+		s.logger.Warn().String("run_id", run.ID).Err(err).Msg("scheduler: failed to read whether an orphaned run was recovered, trying again on the next check")
+		return
+	}
+	if !settled {
+		var ok bool
+		if ended, ok = s.settleLostRunJob(ctx, job, rev, run, errMsg, now); !ok {
+			return
+		}
+		if err := s.store.MarkLostRunRecovered(ctx, run.ID, ended); err != nil {
+			s.logger.Warn().String("run_id", run.ID).Err(err).Msg("scheduler: failed to note that an orphaned run was recovered; the next check may recover it again")
+		}
+	}
+	if !s.finishLostRun(ctx, run, errMsg, now) {
+		return
+	}
+
+	s.dispatcher.PublishEvent(types.JobEvent{
+		Type:           types.EventNodeCrashDetected,
+		JobID:          run.JobID,
+		RunID:          run.ID,
+		NodeID:         run.NodeID,
+		Error:          &errMsg,
+		Timestamp:      now,
+		AffectedRunIDs: []string{run.ID},
+	})
+	if ended != nil {
+		s.dispatcher.PublishEvent(*ended)
+	}
+}
+
+// settleLostRunJob stores what becomes of the job of a lost run, and returns the event that is to
+// say so, if any. It reports false if that could not be stored, so that it is to be tried again.
+func (s *Scheduler) settleLostRunJob(ctx context.Context, job *types.Job, rev uint64, run *types.JobRun, errMsg string, now time.Time) (*types.JobEvent, bool) {
+	// event is what has become of the job; the event carries its state, unless it may be out of
+	// date by the time it is published.
+	event := func(e types.JobEvent, withState bool) *types.JobEvent {
+		if withState {
+			e.SetJob(job)
+		}
+		return &e
+	}
+
+	if job.WorkflowID != nil || job.BatchID != nil {
+		// Workflow/batch job: publish failure event so the orchestrator handles retry.
+		if job.Status == types.JobStatusRunning {
+			job.Status = types.JobStatusFailed
+			job.LastError = &errMsg
+			job.UpdatedAt = now
+			if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+				s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to fail the task of an orphaned run, trying again on the next check")
+				return nil, false
+			}
+		}
+		return event(types.JobEvent{
+			Type:      types.EventJobFailed,
+			JobID:     run.JobID,
+			RunID:     run.ID,
+			NodeID:    run.NodeID,
+			Error:     &errMsg,
+			Timestamp: now,
+		}, true), true
+	}
+
+	// Standalone job: check retry policy and auto-redispatch. Its events are not for the
+	// orchestrator.
+	retryPolicy := job.RetryPolicy
+	if retryPolicy == nil {
+		retryPolicy = types.DefaultRetryPolicy()
+	}
+
+	recurring := job.Schedule.Type.IsRecurring()
+	maxAttempts := retryPolicy.MaxAttempts
+	if recurring && job.DLQAfter != nil && *job.DLQAfter < maxAttempts {
+		maxAttempts = *job.DLQAfter
+	}
+	attempt := lostAttempt(job, run, maxAttempts)
+	switch {
+	case job.Status == types.JobStatusDead || job.Status == types.JobStatusCancelled:
+		// The job ended while this run was still going and gave up its unique
+		// key, so the run is dropped rather than redispatched.
+		return nil, true
+
+	case attempt < maxAttempts:
+		// Auto-recover: redispatch.
+		prevStatus, prevAttempt := job.Status, job.Attempt
+		if recurring {
+			// The lost run has used up an attempt, or else a firing that takes
+			// its worker down would be redispatched forever.
+			attempt++
+		}
+		job.Attempt = attempt
+		job.Status = types.JobStatusPending
+		job.LastError = &errMsg
+		job.UpdatedAt = now
+		newRev, err := s.store.UpdateJob(ctx, job, rev)
+		if err != nil {
+			s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to update orphaned job for auto-recovery, trying again on the next check")
+			return nil, false
+		}
+		// It is the same operation as the lost run, whose message may yet be
+		// reclaimed: the ledger lets only one of them complete.
+		recovered := *job
+		if run.OperationKey != "" {
+			recovered.Headers = make(map[string]string, len(job.Headers)+1)
+			maps.Copy(recovered.Headers, job.Headers)
+			recovered.Headers[headerOperationKey] = run.OperationKey
+		}
+		if err := s.dispatcher.Dispatch(ctx, &recovered, job.Attempt); err != nil {
+			s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: dispatch failed for orphan recovery, rolling back and trying again on the next check")
+			job.Status = prevStatus
+			job.Attempt = prevAttempt
+			job.UpdatedAt = time.Now()
+			s.store.UpdateJob(ctx, job, newRev)
+			return nil, false
+		}
+		s.logger.Info().String("job_id", run.JobID).Int("attempt", job.Attempt).Msg("scheduler: auto-recovered orphaned job")
+
+		// It does not carry the job's state: by the time it is published, the job
+		// may be running again.
+		return event(types.JobEvent{
+			Type:       types.EventJobAutoRecovered,
+			JobID:      run.JobID,
+			RunID:      run.ID,
+			NodeID:     run.NodeID,
+			Error:      &errMsg,
+			Attempt:    job.Attempt,
+			Timestamp:  now,
+			Standalone: true,
+		}, false), true
+
+	case s.keepsSchedule(ctx, job):
+		// Retries exhausted, but the job goes on with its next firing.
+		failed := *job
+		failed.Attempt = attempt
+		job.Status = types.JobStatusScheduled
+		job.Attempt = 0
+		job.LastError = &errMsg
+		job.UpdatedAt = now
+		if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+			s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to put job with exhausted firing back on its schedule, trying again on the next check")
+			return nil, false
+		}
+		if err := s.dispatcher.DispatchToDLQ(ctx, &failed, errMsg); err != nil {
+			s.logger.Warn().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to put the exhausted firing of an orphaned run in the DLQ")
+		}
+		return event(types.JobEvent{
+			Type:       types.EventJobFailed,
+			JobID:      run.JobID,
+			RunID:      run.ID,
+			NodeID:     run.NodeID,
+			TaskType:   job.TaskType,
+			Attempt:    attempt,
+			Error:      &errMsg,
+			Timestamp:  now,
+			Standalone: true,
+		}, true), true
+
+	default:
+		// Retries exhausted.
+		job.Status = types.JobStatusDead
+		job.LastError = &errMsg
+		job.UpdatedAt = now
+		if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+			s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to end the job of an orphaned run, trying again on the next check")
+			return nil, false
+		}
+		s.releaseEndedJobUniqueKey(ctx, job.ID)
+		return event(types.JobEvent{
+			Type:       types.EventJobDead,
+			JobID:      run.JobID,
+			RunID:      run.ID,
+			NodeID:     run.NodeID,
+			Error:      &errMsg,
+			Timestamp:  now,
+			Standalone: true,
+		}, true), true
+	}
+}
+
+// finishLostRun moves a lost run to the history as failed, and out of the active runs. It reports
+// false if that could not be done, so that it is to be tried again.
+func (s *Scheduler) finishLostRun(ctx context.Context, run *types.JobRun, errMsg string, now time.Time) bool {
+	failed := *run
+	failed.Status = types.RunStatusFailed
+	failed.Error = &errMsg
+	failed.FinishedAt = &now
+	failed.Duration = now.Sub(run.StartedAt)
+	// In the history before it leaves the active runs.
+	if err := s.store.SaveJobRun(ctx, &failed); err != nil {
+		s.logger.Warn().String("run_id", run.ID).Err(err).Msg("scheduler: failed to put an orphaned run in the history, trying again on the next check")
+		return false
+	}
+	if err := s.store.DeleteRun(ctx, run.ID); err != nil {
+		s.logger.Warn().String("run_id", run.ID).Err(err).Msg("scheduler: failed to remove an orphaned run, trying again on the next check")
+		return false
+	}
+	return true
 }
 
 // lostAttempt returns the attempt an orphaned run of a standalone job was on.

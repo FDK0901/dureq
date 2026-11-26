@@ -2,14 +2,18 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/dispatcher"
 	"github.com/FDK0901/dureq/internal/store"
 	"github.com/FDK0901/dureq/pkg/types"
+	"github.com/redis/rueidis"
 	"github.com/rs/xid"
 )
 
@@ -248,4 +252,183 @@ func TestCheckOrphanedRuns_EventsComeAfterTheirEffects(t *testing.T) {
 			t.Error(p)
 		}
 	})
+}
+
+// faultyRedis fails commands of the scheduler on cue.
+type faultyRedis struct {
+	rueidis.Client
+	dead     atomic.Bool  // every command fails, as if the process had died
+	failCAS  atomic.Int32 // so many updates of failJob fail
+	failJob  string       // the key of the job whose updates fail
+	dieAfter string       // a key after whose first write the process dies
+	prefix   string
+}
+
+func (f *faultyRedis) fail(ctx context.Context, cmd rueidis.Completed) rueidis.RedisResult {
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	return f.Client.Do(cancelled, cmd)
+}
+
+func (f *faultyRedis) Do(ctx context.Context, cmd rueidis.Completed) rueidis.RedisResult {
+	if f.dead.Load() {
+		return f.fail(ctx, cmd)
+	}
+	c := cmd.Commands()
+	if (c[0] == "EVALSHA" || c[0] == "EVAL") && len(c) > 3 && c[3] == f.failJob && f.failCAS.Load() > 0 {
+		f.failCAS.Add(-1)
+		return f.fail(ctx, cmd)
+	}
+	r := f.Client.Do(ctx, cmd)
+	if c[0] == "SET" && f.dieAfter != "" && c[1] == f.dieAfter {
+		f.dead.Store(true)
+	}
+	return r
+}
+
+func (f *faultyRedis) DoMulti(ctx context.Context, cmds ...rueidis.Completed) []rueidis.RedisResult {
+	if f.dead.Load() {
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		return f.Client.DoMulti(cancelled, cmds...)
+	}
+	return f.Client.DoMulti(ctx, cmds...)
+}
+
+func newFaultyStore(t *testing.T) (*store.RedisStore, *faultyRedis) {
+	t.Helper()
+	healthy := newTestStore(t)
+	f := &faultyRedis{Client: healthy.Client()}
+	st, err := store.NewRedisStore(f, store.RedisStoreConfig{
+		KeyPrefix: healthy.Prefix(),
+		Tiers:     []store.TierConfig{{Name: "normal", Weight: 1, FetchBatch: 10}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st, f
+}
+
+// failingDispatcher does something else instead of the first dispatch.
+type failingDispatcher struct {
+	*dispatcher.Dispatcher
+	instead func(ctx context.Context, job *types.Job, attempt int) error
+}
+
+func (d *failingDispatcher) Dispatch(ctx context.Context, job *types.Job, attempt int) error {
+	if f := d.instead; f != nil {
+		d.instead = nil
+		return f(ctx, job, attempt)
+	}
+	return d.Dispatcher.Dispatch(ctx, job, attempt)
+}
+
+// eventsOf counts the events of a job in the event stream, by type.
+func eventsOf(t *testing.T, st *store.RedisStore, jobID string) map[types.EventType]int {
+	t.Helper()
+	rdb := st.Client()
+	entries, err := rdb.Do(context.Background(), rdb.B().Xrange().Key(store.EventsStreamKey(st.Prefix())).Start("-").End("+").Build()).AsXRange()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := map[types.EventType]int{}
+	for _, e := range entries {
+		var ev types.JobEvent
+		if json.Unmarshal([]byte(e.FieldValues["data"]), &ev) == nil && ev.JobID == jobID {
+			n[ev.Type]++
+		}
+	}
+	return n
+}
+
+// Recovering a lost run can fail half way: Redis does not take the update of the job, the
+// dispatch fails, or the scheduler goes away in the middle. The next check finishes it, and
+// what is done is done once.
+func TestCheckOrphanedRuns_RecoversAfterFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		dead  bool // the job has used up its retries
+		twice bool // it may be dispatched again, under the same operation
+		fault func(f *faultyRedis, d *failingDispatcher, runID string)
+	}{
+		{"update of the job fails", false, false, func(f *faultyRedis, d *failingDispatcher, _ string) { f.failCAS.Store(1) }},
+		{"dispatch fails", false, false, func(f *faultyRedis, d *failingDispatcher, _ string) {
+			d.instead = func(context.Context, *types.Job, int) error { return errors.New("refused") }
+		}},
+		{"gone between update and dispatch", false, false, func(f *faultyRedis, d *failingDispatcher, _ string) {
+			d.instead = func(context.Context, *types.Job, int) error { f.dead.Store(true); return errors.New("gone") }
+		}},
+		// Before it has noted that the job is dealt with: the next check does it again.
+		{"gone right after dispatch", false, true, func(f *faultyRedis, d *failingDispatcher, _ string) {
+			d.instead = func(ctx context.Context, job *types.Job, attempt int) error {
+				err := d.Dispatcher.Dispatch(ctx, job, attempt)
+				f.dead.Store(true)
+				return err
+			}
+		}},
+		{"gone before the run is in the history", false, false, func(f *faultyRedis, d *failingDispatcher, runID string) {
+			f.dieAfter = store.LostRunRecoveredKey(f.prefix, runID)
+		}},
+		{"update of a dead job fails", true, false, func(f *faultyRedis, d *failingDispatcher, _ string) { f.failCAS.Store(1) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, f := newFaultyStore(t)
+			ctx := context.Background()
+			job := createOneOffJob(t, st, 0, "k-"+xid.New().String())
+			editJob(t, st, job.ID, func(j *types.Job) {
+				j.Status = types.JobStatusRunning
+				if tc.dead {
+					j.RetryPolicy = &types.RetryPolicy{MaxAttempts: 1}
+					j.Attempt = 1
+				}
+			})
+			run := &types.JobRun{ID: xid.New().String(), JobID: job.ID, NodeID: "gone-node", Status: types.RunStatusRunning, StartedAt: time.Now().Add(-time.Minute), OperationKey: job.ID}
+			if _, err := st.SaveRun(ctx, run); err != nil {
+				t.Fatal(err)
+			}
+			f.failJob = store.JobKey(st.Prefix(), job.ID)
+			d := &failingDispatcher{Dispatcher: dispatcher.New(st, nil)}
+			f.prefix = st.Prefix()
+			tc.fault(f, d, run.ID)
+			New(Config{Store: st, Dispatcher: d}).checkOrphanedRuns(ctx)
+			f.dead.Store(false)
+			f.failCAS.Store(0)
+
+			// The next check, by this scheduler or by one that has taken over.
+			New(Config{Store: st, Dispatcher: dispatcher.New(st, nil)}).checkOrphanedRuns(ctx)
+			New(Config{Store: st, Dispatcher: dispatcher.New(st, nil)}).checkOrphanedRuns(ctx)
+
+			got := getJob(t, st, job.ID)
+			want, wantEntries, wantEvent := types.JobStatusPending, 1, types.EventJobAutoRecovered
+			if tc.dead {
+				want, wantEntries, wantEvent = types.JobStatusDead, 0, types.EventJobDead
+			}
+			if got.Status != want {
+				t.Errorf("job is %s, want %s", got.Status, want)
+			}
+			entries := workEntries(t, st)
+			if n := len(entries); n != wantEntries && !(tc.twice && n == 2) {
+				t.Errorf("%d dispatches, want %d", n, wantEntries)
+			}
+			for _, e := range entries {
+				if got := e.FieldValues["operation_key"]; got != run.OperationKey {
+					t.Errorf("dispatched as operation %q, want %q", got, run.OperationKey)
+				}
+			}
+			if _, _, err := st.GetRun(ctx, run.ID); !errors.Is(err, types.ErrRunNotFound) {
+				t.Errorf("the lost run is still there (%v)", err)
+			}
+			if runs, _, _ := st.ListJobRuns(ctx, store.RunFilter{JobID: &job.ID, Limit: 5}); len(runs) != 1 || runs[0].Status != types.RunStatusFailed {
+				t.Errorf("history: %+v", runs)
+			}
+			if n := eventsOf(t, st, job.ID); n[types.EventNodeCrashDetected] != 1 || n[wantEvent] != 1 {
+				t.Errorf("events %v, want one %s and one %s", n, types.EventNodeCrashDetected, wantEvent)
+			}
+			// The job is not part of a workflow or batch: the orchestrator need not see them.
+			rdb := st.Client()
+			if n, err := rdb.Do(ctx, rdb.B().Xlen().Key(store.OrchestratorStreamKey(st.Prefix())).Build()).AsInt64(); err != nil || n != 0 {
+				t.Errorf("%d events for the orchestrator (%v), want none", n, err)
+			}
+		})
+	}
 }

@@ -246,6 +246,10 @@ func parseEventID(s string) eventID {
 	return id
 }
 
+// The commands of the hub are pinned, not given back to rueidis for reuse once they are done. A
+// read that is given up, or one that rueidis retries on another connection, may still be in the
+// writer of the connection that was given up; reused, it was written to while that was reading it.
+
 // readEvents waits for the events after last, as long as hubReadBlock. A connection can stay
 // open and not answer, such as one to a proxy whose own connection to Redis is gone. A read that
 // is not answered in time gives it up, and the next one is made on another.
@@ -255,7 +259,7 @@ func readEvents(ctx context.Context, rdb rueidis.Client, streamKey, last string)
 	defer cancel()
 	timer := time.AfterFunc(hubReadBlock+hubReadSlack, cancel)
 	defer timer.Stop()
-	cmd := rdb.B().Xread().Count(hubReadCount).Block(hubReadBlock.Milliseconds()).Streams().Key(streamKey).Id(last).Build()
+	cmd := rdb.B().Xread().Count(hubReadCount).Block(hubReadBlock.Milliseconds()).Streams().Key(streamKey).Id(last).Build().Pin()
 	streams, err := rdb.Do(readCtx, cmd).AsXRead()
 	if err != nil && ctx.Err() == nil && readCtx.Err() != nil && !rueidis.IsRedisNil(err) {
 		return nil, fmt.Errorf("read events: no answer in %v: %w", hubReadBlock+hubReadSlack, err)
@@ -266,7 +270,7 @@ func readEvents(ctx context.Context, rdb rueidis.Client, streamKey, last string)
 func lastEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, hubCallTimeout)
 	defer cancel()
-	entries, err := rdb.Do(ctx, rdb.B().Xrevrange().Key(streamKey).End("+").Start("-").Count(1).Build()).AsXRange()
+	entries, err := rdb.Do(ctx, rdb.B().Xrevrange().Key(streamKey).End("+").Start("-").Count(1).Build().Pin()).AsXRange()
 	if err != nil {
 		return "", fmt.Errorf("last event: %w", err)
 	}
@@ -279,7 +283,7 @@ func lastEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (str
 func firstEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (eventID, error) {
 	ctx, cancel := context.WithTimeout(ctx, hubCallTimeout)
 	defer cancel()
-	entries, err := rdb.Do(ctx, rdb.B().Xrange().Key(streamKey).Start("-").End("+").Count(1).Build()).AsXRange()
+	entries, err := rdb.Do(ctx, rdb.B().Xrange().Key(streamKey).Start("-").End("+").Count(1).Build().Pin()).AsXRange()
 	if err != nil {
 		return eventID{}, fmt.Errorf("first event: %w", err)
 	}

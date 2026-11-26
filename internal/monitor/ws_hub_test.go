@@ -549,12 +549,19 @@ func TestWebSocket_SlowClientIsToldInTime(t *testing.T) {
 	var wg sync.WaitGroup
 	t.Cleanup(func() { cancel(); wg.Wait() })
 	wg.Go(func() {
+		// About a thousand a second, appended in one round trip each 50 at a time, so that
+		// they come faster than the client reads also on a busy machine.
 		big := types.TaskType(strings.Repeat("x", 1000))
-		for i := 0; ctx.Err() == nil; i++ {
-			st.PublishEvent(ctx, types.JobEvent{Type: types.EventJobStarted, JobID: fmt.Sprint(i), TaskType: big, Timestamp: time.Now()})
-			if i%50 == 0 {
-				time.Sleep(50 * time.Millisecond) // about a thousand a second
+		rdb, key := st.Client(), store.EventsStreamKey(st.Prefix())
+		for i := 0; ctx.Err() == nil; {
+			cmds := make(rueidis.Commands, 0, 50)
+			for range 50 {
+				data, _ := json.Marshal(types.JobEvent{Type: types.EventJobStarted, JobID: fmt.Sprint(i), TaskType: big, Timestamp: time.Now()})
+				cmds = append(cmds, rdb.B().Xadd().Key(key).Id("*").FieldValue().FieldValue("type", string(types.EventJobStarted)).FieldValue("data", string(data)).Build())
+				i++
 			}
+			rdb.DoMulti(ctx, cmds...)
+			time.Sleep(50 * time.Millisecond)
 		}
 	})
 

@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 )
@@ -72,4 +73,63 @@ func (g *originGuard) allows(r *http.Request) bool {
 		return g.protection.Check(&check) == nil
 	}
 	return false
+}
+
+// hostGuard answers only requests for the hosts that it allows, if any are: with DNS rebinding,
+// a web page of another origin reaches the API under a name of its own, and to the browser the
+// page and the API are of the same origin.
+type hostGuard struct {
+	names map[string]bool // allowed with any port
+	hosts map[string]bool // allowed with this port
+}
+
+// newHostGuard allows hosts such as "dureq.internal" (with any port) or "localhost:8080". With
+// none, all are allowed.
+func newHostGuard(hosts []string) (*hostGuard, error) {
+	if len(hosts) == 0 {
+		return nil, nil
+	}
+	g := &hostGuard{names: make(map[string]bool), hosts: make(map[string]bool)}
+	for _, h := range hosts {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" || strings.ContainsAny(h, "/?#@ ") {
+			return nil, fmt.Errorf("allowed host %q: want a name, or a name and port", h)
+		}
+		if name, port, err := net.SplitHostPort(h); err == nil {
+			if name == "" || port == "" {
+				return nil, fmt.Errorf("allowed host %q: want a name, or a name and port", h)
+			}
+			g.hosts[net.JoinHostPort(name, port)] = true
+			continue
+		}
+		g.names[strings.TrimSuffix(strings.TrimPrefix(h, "["), "]")] = true
+	}
+	return g, nil
+}
+
+func (g *hostGuard) allows(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if name, port, err := net.SplitHostPort(host); err == nil {
+		return g.names[name] || g.hosts[net.JoinHostPort(name, port)]
+	}
+	return g.names[strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")]
+}
+
+func (g *hostGuard) middleware(next http.Handler) http.Handler {
+	if g == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ok := g.allows(r.Host)
+		// Behind a proxy, it is the host that the proxy was asked for.
+		if forwarded := r.Header.Get("X-Forwarded-Host"); ok && forwarded != "" {
+			forwarded, _, _ = strings.Cut(forwarded, ",")
+			ok = g.allows(forwarded)
+		}
+		if !ok {
+			writeServiceError(w, &ApiError{Msg: "requests for this host are not allowed; see allowedHosts", StatusCode: http.StatusForbidden})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

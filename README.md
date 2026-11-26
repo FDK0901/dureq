@@ -442,7 +442,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 [dureqd](docs/dureqd.md) serves it, over HTTP on `:8080` and gRPC on `:9090` by default. In a server of your own, build endpoints on `dureq.NewAPIService`, which has the same calls.
 
 > [!IMPORTANT]
-> The API has no authentication. Put it behind something that has, and do not let it be reached without it. Web pages of other origins are refused, unless they are in [`allowedOrigins`](docs/dureqd.md#who-may-use-the-api); that is no protection from anything but browsers.
+> The API has no authentication. Put it behind something that has, and do not let it be reached without it. Web pages of other origins are refused, unless they are in [`allowedOrigins`](docs/dureqd.md#who-may-use-the-api); that is no protection from anything but browsers, and a page that rebinds its own name to the API's address (DNS rebinding) gets past it. So list the hosts that the API is reached by in [`allowedHosts`](docs/dureqd.md#who-may-use-the-api).
 
 What jobs carry may be personal data: payloads, results, progress and the errors of handlers. Answers that may hold any of it, such as jobs, workflows, batches, runs, events, the DLQ and searches, come with `Cache-Control: private, no-store`, so that a browser does not keep them. The others (stats, nodes, queues, schedules, Redis info, sync retries, signal stats, health) have a weak `ETag`, and are answered 304 if they have not changed.
 

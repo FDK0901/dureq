@@ -22,6 +22,7 @@ type API struct {
 	svc   *APIService
 	mux   *http.ServeMux
 	guard *originGuard
+	hosts *hostGuard
 }
 
 // NewAPI creates a new monitoring API backed by Redis.
@@ -45,6 +46,20 @@ func (a *API) AllowOrigins(origins []string) error {
 	return nil
 }
 
+// AllowHosts answers only requests for these hosts, such as "dureq.internal" (with any port) or
+// "localhost:8080", and refuses others with 403. It keeps web pages out that reach the API
+// under a name of their own (DNS rebinding). Behind a proxy that passes X-Forwarded-Host on, the
+// host that the proxy was asked for has to be allowed, too. By default all hosts are answered. It
+// is called before Handler.
+func (a *API) AllowHosts(hosts []string) error {
+	guard, err := newHostGuard(hosts)
+	if err != nil {
+		return err
+	}
+	a.hosts = guard
+	return nil
+}
+
 // SetSyncRetryStatsFunc sets the function used to retrieve SyncRetrier stats.
 func (a *API) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
 	a.svc.SetSyncRetryStatsFunc(fn)
@@ -52,7 +67,7 @@ func (a *API) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
 
 // Handler returns the HTTP handler for mounting in a server.
 func (a *API) Handler() http.Handler {
-	return a.guard.middleware(withETag(a.mux))
+	return a.hosts.middleware(a.guard.middleware(withETag(a.mux)))
 }
 
 // Shutdown cancels the hub's Redis subscription.

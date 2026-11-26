@@ -147,3 +147,35 @@ func TestNameFilter_SaysWhatItHasNotLookedAt(t *testing.T) {
 		}
 	}
 }
+
+// A list that has looked at all there are, up to the last one, has no more, also when that is
+// as many as it may look at.
+func TestNameFilter_LooksAtAllThereAre(t *testing.T) {
+	addr, password := testRedis(t)
+	rdb, err := rueidis.NewClient(rueidis.ClientOption{InitAddress: []string{addr}, Password: password})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rdb.Close)
+	st, err := store.NewRedisStore(rdb, store.RedisStoreConfig{
+		KeyPrefix:   "test_" + xid.New().String(),
+		Tiers:       []store.TierConfig{{Name: "normal", Weight: 1, FetchBatch: 10}},
+		MaxNameScan: 50,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for i := range 50 {
+		if _, err := st.SaveWorkflow(ctx, &types.WorkflowInstance{ID: fmt.Sprintf("%03d", i), WorkflowName: "w", Status: types.WorkflowStatusRunning, CreatedAt: time.Now().Add(time.Duration(i) * time.Second)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	name := "w"
+	for _, skip := range []bool{false, true} {
+		wfs, total, more, err := st.ListWorkflowInstancesPage(ctx, store.WorkflowFilter{WorkflowName: &name, Limit: 100, SkipTotal: skip})
+		if err != nil || len(wfs) != 50 || total != 50 || more {
+			t.Errorf("skip total %v: %d, total %d, more %v (%v); want 50 and no more", skip, len(wfs), total, more, err)
+		}
+	}
+}

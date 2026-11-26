@@ -84,7 +84,7 @@ const (
 func scanMatches[T any](ctx context.Context, s *RedisStore, indexKey, sort string, offset, limit int, skipTotal bool, hydrate func(context.Context, []string) ([]T, error), match func(*T) bool) ([]T, int, bool, error) {
 	var page []T
 	total, scanned := 0, 0
-	stopped := false
+	stopped, capped := false, false
 	err := s.scanIndex(ctx, indexKey, sort, nameScanChunkSize, func(ids []string) (bool, error) {
 		ids = ids[:min(len(ids), s.cfg.MaxNameScan-scanned)]
 		values, err := hydrate(ctx, ids)
@@ -106,7 +106,7 @@ func scanMatches[T any](ctx context.Context, s *RedisStore, indexKey, sort strin
 		}
 		scanned += len(ids)
 		if scanned >= s.cfg.MaxNameScan {
-			stopped = true
+			stopped, capped = true, true
 			return false, ctx.Err()
 		}
 		return true, ctx.Err()
@@ -114,7 +114,7 @@ func scanMatches[T any](ctx context.Context, s *RedisStore, indexKey, sort strin
 	if err != nil {
 		return nil, 0, false, err
 	}
-	if stopped && !skipTotal {
+	if capped {
 		// It may have stopped at the end.
 		if n, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64(); err == nil && n <= int64(scanned) {
 			stopped = false

@@ -78,6 +78,41 @@ const (
 	maxJobSearchScan = 100_000
 )
 
+// scanMatches returns a page of what matches in an index, and how many there are.
+func scanMatches[T any](ctx context.Context, s *RedisStore, indexKey, sort string, offset, limit int, hydrate func(context.Context, []string) ([]T, error), match func(*T) bool) ([]T, int, error) {
+	var page []T
+	total, scanned := 0, 0
+	err := s.scanIndex(ctx, indexKey, sort, nameScanChunkSize, func(ids []string) (bool, error) {
+		values, err := hydrate(ctx, ids)
+		if err != nil {
+			return false, err
+		}
+		for i := range values {
+			if !match(&values[i]) {
+				continue
+			}
+			if total >= offset && len(page) < limit {
+				page = append(page, values[i])
+			}
+			total++
+		}
+		scanned += len(ids)
+		return scanned < maxNameScan, ctx.Err()
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return page, total, nil
+}
+
+const (
+	// nameScanChunkSize is how many workflows or batches are read at once to look for a
+	// name. They may be large.
+	nameScanChunkSize = 100
+	// maxNameScan is how many are looked at in all.
+	maxNameScan = 100_000
+)
+
 // searchJobs returns the page of the jobs whose ID or task type contains filter.Search,
 // and how many there are. It reads the jobs of the index one by one.
 func (s *RedisStore) searchJobs(ctx context.Context, indexKey string, filter JobFilter) ([]types.Job, int, error) {
@@ -323,6 +358,13 @@ func (s *RedisStore) ListWorkflowInstances(ctx context.Context, filter WorkflowF
 		indexKey = WorkflowsByStatusKey(s.prefix, string(*filter.Status))
 	}
 
+	if filter.WorkflowName != nil && *filter.WorkflowName != "" {
+		name := *filter.WorkflowName
+		return scanMatches(ctx, s, indexKey, filter.Sort, filter.Offset, filter.Limit, s.hydrateWorkflowValues, func(v *types.WorkflowInstance) bool {
+			return v.WorkflowName == name
+		})
+	}
+
 	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64()
 	if err != nil {
 		return nil, 0, fmt.Errorf("count workflows: %w", err)
@@ -350,21 +392,6 @@ func (s *RedisStore) ListWorkflowInstances(ctx context.Context, filter WorkflowF
 	if err != nil {
 		return nil, 0, err
 	}
-
-	// In-memory filter by workflow name if specified.
-	// When filtering is active, total from the index is inaccurate. Signal with -1.
-	if filter.WorkflowName != nil && *filter.WorkflowName != "" {
-		name := *filter.WorkflowName
-		filtered := wfs[:0]
-		for _, wf := range wfs {
-			if wf.WorkflowName == name {
-				filtered = append(filtered, wf)
-			}
-		}
-		wfs = filtered
-		total = -1
-	}
-
 	return wfs, int(total), nil
 }
 
@@ -390,6 +417,13 @@ func (s *RedisStore) ListBatchInstances(ctx context.Context, filter BatchFilter)
 	indexKey := BatchesByCreatedKey(s.prefix)
 	if filter.Status != nil {
 		indexKey = BatchesByStatusKey(s.prefix, string(*filter.Status))
+	}
+
+	if filter.Name != nil && *filter.Name != "" {
+		name := *filter.Name
+		return scanMatches(ctx, s, indexKey, filter.Sort, filter.Offset, filter.Limit, s.hydrateBatchValues, func(v *types.BatchInstance) bool {
+			return v.Name == name
+		})
 	}
 
 	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64()
@@ -419,21 +453,6 @@ func (s *RedisStore) ListBatchInstances(ctx context.Context, filter BatchFilter)
 	if err != nil {
 		return nil, 0, err
 	}
-
-	// In-memory filter by name if specified.
-	// When filtering is active, total from the index is inaccurate. Signal with -1.
-	if filter.Name != nil && *filter.Name != "" {
-		name := *filter.Name
-		filtered := batches[:0]
-		for _, b := range batches {
-			if b.Name == name {
-				filtered = append(filtered, b)
-			}
-		}
-		batches = filtered
-		total = -1
-	}
-
 	return batches, int(total), nil
 }
 

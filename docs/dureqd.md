@@ -191,4 +191,7 @@ comes to point at the address of the API, and to the browser the page and the AP
   ```
 
   The host is the `Host` header and, behind a proxy that sets it, `X-Forwarded-Host`; both have to be listed if they
-  differ. By default all hosts are answered, as before. In a server of your own it is `API.AllowHosts`.
+  differ. By default all hosts are answered, as before.
+
+  This is dureqd's. A server of your own, built on `dureq.NewAPIService`, has an HTTP layer of its own, and the
+  check of the host is up to it: answer only the names that the API is reached by.

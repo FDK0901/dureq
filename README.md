@@ -167,7 +167,7 @@ For full details including failure scenarios, see [docs/guarantees.md](docs/guar
 ### Prerequisites
 
 - Go 1.26.11+ (the go.mod minimum; older toolchains have known security vulnerabilities)
-- Redis 7+. Payload search needs RedisJSON, which Redis 8 comes with; everything else works without
+- Redis 7+. Payload search needs RedisJSON, which Redis 8 comes with, or valkey-json, which valkey-bundle comes with; everything else works without
 
 ### Quick Example
 

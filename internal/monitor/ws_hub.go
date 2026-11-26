@@ -63,8 +63,9 @@ type Hub interface {
 //
 //	if h, ok := svc.Hub().(dureq.HubHealth); ok && h.Stalled() { ... }
 type HubHealth interface {
-	// Stalled reports whether events are not being read, because Redis has not answered the
-	// hub for longer than a read takes. It is false once Redis answers again.
+	// Stalled reports whether events are not being read: Redis has not answered the hub for
+	// longer than a read takes, or the hub has been shut down. It is false once Redis answers
+	// again, and for a hub that has not begun to read.
 	Stalled() bool
 }
 
@@ -73,6 +74,7 @@ type hub struct {
 	clients map[*WSClient]struct{}
 	logger  chainedlog.Logger
 
+	started   atomic.Bool  // it has begun to follow the event stream
 	following atomic.Bool  // it follows the event stream
 	heard     atomic.Int64 // when Redis last answered it, in Unix nanoseconds
 }
@@ -127,10 +129,13 @@ func (h *hub) ClientCount() int {
 	return len(h.clients)
 }
 
-// Stalled reports whether the hub follows the event stream and Redis has not answered it for
-// longer than a read takes.
+// Stalled reports whether the hub has followed the event stream and does not any more, or Redis
+// has not answered it for longer than a read takes.
 func (h *hub) Stalled() bool {
-	return h.following.Load() && time.Since(time.Unix(0, h.heard.Load())) > hubReadBlock+hubReadSlack
+	if !h.started.Load() {
+		return false
+	}
+	return !h.following.Load() || time.Since(time.Unix(0, h.heard.Load())) > hubReadBlock+hubReadSlack
 }
 
 // answered notes that Redis has answered.
@@ -153,6 +158,7 @@ func (h *hub) SubscribeRedis(ctx context.Context, rdb rueidis.Client, channel st
 func (h *hub) follow(ctx context.Context, rdb rueidis.Client, streamKey string) {
 	h.answered()
 	h.following.Store(true)
+	h.started.Store(true)
 	defer h.following.Store(false)
 	last := "" // the last event that was read
 	h.retry(ctx, "reader", func() error {

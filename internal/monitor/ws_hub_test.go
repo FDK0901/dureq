@@ -576,3 +576,16 @@ func TestWebSocket_SlowClientIsToldInTime(t *testing.T) {
 	}
 	t.Fatalf("not told in 15 seconds, after %d events", events)
 }
+
+// A hub that has been shut down reads no events any more, and says so.
+func TestHub_StalledOnceShutDown(t *testing.T) {
+	st, _ := newTestAPI(t, nil)
+	api := NewAPI(st, nil, nil)
+	h := api.svc.hub.(*hub)
+	time.Sleep(200 * time.Millisecond)
+	if h.Stalled() {
+		t.Fatal("stalled while it reads")
+	}
+	api.Shutdown()
+	waitUntil(t, h.Stalled)
+}

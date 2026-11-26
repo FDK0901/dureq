@@ -40,7 +40,7 @@ type APIService struct {
 	syncRetryStats SyncRetryStatsFunc
 }
 
-// NewAPIService creates a new APIService, starting the hub's Redis subscription.
+// NewAPIService creates a new APIService, and has its hub follow the events.
 func NewAPIService(s *store.RedisStore, disp Dispatcher, logger chainedlog.Logger) *APIService {
 	if logger == nil {
 		logger = chainedslog.NewSlog(chainedslog.NewSlogBase())
@@ -48,7 +48,7 @@ func NewAPIService(s *store.RedisStore, disp Dispatcher, logger chainedlog.Logge
 
 	h := newHub(logger)
 	hubCtx, hubCancel := context.WithCancel(context.Background())
-	go h.SubscribeRedis(hubCtx, s.Client(), store.EventsPubSubChannel(s.Prefix()))
+	go h.follow(hubCtx, s.Client(), store.EventsStreamKey(s.Prefix()))
 
 	return &APIService{
 		store:      s,

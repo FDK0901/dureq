@@ -2,17 +2,33 @@ package monitor
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/FDK0901/go-chainedlog"
 	"github.com/redis/rueidis"
 )
 
-const wsSendBufferSize = 64
+const (
+	wsSendBufferSize = 256
+
+	hubReadCount   = 500
+	hubReadBlock   = 5 * time.Second
+	hubMinBackoff  = 100 * time.Millisecond
+	hubMaxBackoff  = 10 * time.Second
+	hubCallTimeout = 10 * time.Second
+)
 
 // WSClient represents a single WebSocket connection registered with the Hub.
 type WSClient struct {
 	Send chan []byte
+
+	missed atomic.Bool // events that it did not get
 }
 
 // NewWSClient creates a new WebSocket client with a buffered send channel.
@@ -20,8 +36,12 @@ func NewWSClient() *WSClient {
 	return &WSClient{Send: make(chan []byte, wsSendBufferSize)}
 }
 
-// Hub manages WebSocket client connections and broadcasts Redis Pub/Sub events.
-// A single Redis subscription feeds all connected WebSocket clients (fan-out).
+// Missed reports whether there have been events since the last call that the client did not
+// get: it was too slow, or the hub itself missed some.
+func (c *WSClient) Missed() bool { return c.missed.Swap(false) }
+
+// Hub manages WebSocket client connections and broadcasts events to them.
+// A single reader of Redis feeds all connected WebSocket clients (fan-out).
 type Hub interface {
 	Register(c *WSClient)
 	Unregister(c *WSClient)
@@ -37,7 +57,7 @@ type hub struct {
 	logger  chainedlog.Logger
 }
 
-func newHub(logger chainedlog.Logger) Hub {
+func newHub(logger chainedlog.Logger) *hub {
 	return &hub{
 		clients: make(map[*WSClient]struct{}),
 		logger:  logger,
@@ -58,7 +78,8 @@ func (h *hub) Unregister(c *WSClient) {
 }
 
 // Broadcast sends a message to all connected clients.
-// Drops the message for any client whose send buffer is full (slow consumer protection).
+// Drops the message for any client whose send buffer is full (slow consumer protection),
+// which its Missed tells.
 func (h *hub) Broadcast(data []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -66,7 +87,17 @@ func (h *hub) Broadcast(data []byte) {
 		select {
 		case c.Send <- data:
 		default:
+			c.missed.Store(true)
 		}
+	}
+}
+
+// missed notes for all clients that there have been events which the hub did not get.
+func (h *hub) missed() {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for c := range h.clients {
+		c.missed.Store(true)
 	}
 }
 
@@ -77,13 +108,125 @@ func (h *hub) ClientCount() int {
 }
 
 // SubscribeRedis subscribes to the Redis Pub/Sub events channel and
-// broadcasts every received message to all connected WebSocket clients.
+// broadcasts every received message to all connected WebSocket clients, until ctx ends.
 func (h *hub) SubscribeRedis(ctx context.Context, rdb rueidis.Client, channel string) {
-	err := rdb.Receive(ctx, rdb.B().Subscribe().Channel(channel).Build(),
-		func(msg rueidis.PubSubMessage) {
-			h.Broadcast([]byte(msg.Message))
-		})
-	if err != nil && ctx.Err() == nil {
-		h.logger.Warn().Err(err).Msg("ws hub: redis subscribe loop ended")
+	h.retry(ctx, "subscription", func() error {
+		defer h.missed() // what is published until it is back
+		return rdb.Receive(ctx, rdb.B().Subscribe().Channel(channel).Build(),
+			func(msg rueidis.PubSubMessage) {
+				h.Broadcast([]byte(msg.Message))
+			})
+	})
+}
+
+// follow broadcasts every event that is appended to the event stream, until ctx ends. If Redis
+// fails it goes on where it was. Unlike Pub/Sub, a stream has a memory.
+func (h *hub) follow(ctx context.Context, rdb rueidis.Client, streamKey string) {
+	last := "" // the last event that was read
+	h.retry(ctx, "reader", func() error {
+		if last == "" {
+			id, err := lastEventID(ctx, rdb, streamKey)
+			if err != nil {
+				return err
+			}
+			last = id
+		}
+		// What has been trimmed in the meantime was not read.
+		if first, err := firstEventID(ctx, rdb, streamKey); err != nil {
+			return err
+		} else if first.after(parseEventID(last)) && last != "0-0" {
+			h.missed()
+		}
+		for ctx.Err() == nil {
+			cmd := rdb.B().Xread().Count(hubReadCount).Block(hubReadBlock.Milliseconds()).Streams().Key(streamKey).Id(last).Build()
+			streams, err := rdb.Do(ctx, cmd).AsXRead()
+			if rueidis.IsRedisNil(err) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			for _, entry := range streams[streamKey] {
+				if data := entry.FieldValues["data"]; data != "" {
+					h.Broadcast([]byte(data))
+				}
+				last = entry.ID
+			}
+			if len(streams[streamKey]) == hubReadCount {
+				// Behind: see whether what comes next is still there.
+				first, err := firstEventID(ctx, rdb, streamKey)
+				if err != nil {
+					return err
+				}
+				if first.after(parseEventID(last)) {
+					h.missed()
+				}
+			}
+		}
+		return nil
+	})
+}
+
+// retry runs f until ctx ends, and waits longer the more often it fails in a row.
+func (h *hub) retry(ctx context.Context, what string, f func() error) {
+	backoff := hubMinBackoff
+	for ctx.Err() == nil {
+		began := time.Now()
+		err := f()
+		if ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			err = errors.New("ended")
+		}
+		h.logger.Warn().Err(err).String("what", what).Msg("ws hub: lost Redis, trying again")
+		if time.Since(began) > hubMaxBackoff {
+			backoff = hubMinBackoff
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		backoff = min(2*backoff, hubMaxBackoff)
 	}
+}
+
+// eventID is the ID of an entry of the event stream.
+type eventID struct{ ms, seq uint64 }
+
+func (a eventID) after(b eventID) bool { return a.ms > b.ms || a.ms == b.ms && a.seq > b.seq }
+
+func parseEventID(s string) eventID {
+	ms, seq, _ := strings.Cut(s, "-")
+	var id eventID
+	id.ms, _ = strconv.ParseUint(ms, 10, 64)
+	id.seq, _ = strconv.ParseUint(seq, 10, 64)
+	return id
+}
+
+func lastEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, hubCallTimeout)
+	defer cancel()
+	entries, err := rdb.Do(ctx, rdb.B().Xrevrange().Key(streamKey).End("+").Start("-").Count(1).Build()).AsXRange()
+	if err != nil {
+		return "", fmt.Errorf("last event: %w", err)
+	}
+	if len(entries) == 0 {
+		return "0-0", nil
+	}
+	return entries[0].ID, nil
+}
+
+func firstEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (eventID, error) {
+	ctx, cancel := context.WithTimeout(ctx, hubCallTimeout)
+	defer cancel()
+	entries, err := rdb.Do(ctx, rdb.B().Xrange().Key(streamKey).Start("-").End("+").Count(1).Build()).AsXRange()
+	if err != nil {
+		return eventID{}, fmt.Errorf("first event: %w", err)
+	}
+	if len(entries) == 0 {
+		return eventID{}, nil
+	}
+	return parseEventID(entries[0].ID), nil
 }

@@ -224,7 +224,7 @@ func TestWebSocket_Versions(t *testing.T) {
 	srv := httptest.NewServer(api.Handler())
 	t.Cleanup(srv.Close)
 	v1, v2 := dial(t, srv, ""), dial(t, srv, "?v=2")
-	if got := v2(); got != string(wsHeartbeatMsg) {
+	if got := v2(); frameType(got) != wsHeartbeatType {
 		t.Fatalf("first message %s, want a heartbeat", got)
 	}
 	h := api.svc.hub.(*hub)
@@ -239,7 +239,7 @@ func TestWebSocket_Versions(t *testing.T) {
 	if got := jobIDOf(t, v2()); got != "b" {
 		t.Fatalf("got %q", got)
 	}
-	if got := v2(); got != string(wsResyncMsg) {
+	if got := v2(); frameType(got) != wsResyncType {
 		t.Fatalf("got %s, want to be told", got)
 	}
 	publish(t, st, types.JobEvent{Type: types.EventJobStarted, JobID: "c", Timestamp: time.Now()})
@@ -444,7 +444,7 @@ func TestWebSocket_NoHeartbeatWhileTheHubHearsNothing(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		_, msg, err := conn.Read(ctx)
-		if err == nil && string(msg) != string(wsHeartbeatMsg) {
+		if err == nil && frameType(string(msg)) != wsHeartbeatType {
 			err = fmt.Errorf("got %s", msg)
 		}
 		return time.Now(), err
@@ -487,7 +487,7 @@ func TestWebSocket_NoHeartbeatWhileTheHubHearsNothing(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_, msg, err := conn.Read(ctx)
 			cancel()
-			if err != nil || string(msg) != string(wsHeartbeatMsg) {
+			if err != nil || frameType(string(msg)) != wsHeartbeatType {
 				t.Fatalf("first message %s (%v), want a heartbeat", msg, err)
 			}
 			break
@@ -497,6 +497,15 @@ func TestWebSocket_NoHeartbeatWhileTheHubHearsNothing(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// frameType returns the type of a frame of the WebSocket.
+func frameType(msg string) string {
+	var f struct {
+		Type string `json:"type"`
+	}
+	json.Unmarshal([]byte(msg), &f)
+	return f.Type
 }
 
 // shorten sets *d to v for a test, and returns what sets it back.
@@ -574,7 +583,7 @@ func TestWebSocket_SlowClientIsToldInTime(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(msg) == string(wsResyncMsg) {
+		if frameType(string(msg)) == wsResyncType {
 			t.Logf("told after %v and %d events", time.Since(start).Round(time.Millisecond), events)
 			return
 		}
@@ -595,4 +604,84 @@ func TestHub_StalledOnceShutDown(t *testing.T) {
 	}
 	api.Shutdown()
 	waitUntil(t, h.Stalled)
+}
+
+// A heartbeat says when the server wrote it, so that a client that gets it late can tell by how
+// much: behind a slow connection, events come late, and the connection is still open.
+func TestWebSocket_HeartbeatSaysWhenItWasWritten(t *testing.T) {
+	defer shorten(&wsHeartbeat, 200*time.Millisecond)()
+	st, _ := newTestAPI(t, nil)
+	api := NewAPI(st, nil, nil)
+	t.Cleanup(api.Shutdown)
+	srv := httptest.NewUnstartedServer(api.Handler())
+	srv.Listener = smallBuffers{srv.Listener}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	dialer := &net.Dialer{}
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/ws?v=2", &websocket.DialOptions{
+		HTTPClient: &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := dialer.DialContext(ctx, network, addr)
+			if tc, ok := c.(*net.TCPConn); ok {
+				tc.SetReadBuffer(8 << 10)
+			}
+			return c, err
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(1 << 20)
+	type beat struct {
+		Type         string `json:"type"`
+		ServerTimeMs *int64 `json:"server_time_ms"`
+	}
+	read := func() (beat, time.Time) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, msg, err := conn.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var b beat
+		json.Unmarshal(msg, &b)
+		return b, time.Now()
+	}
+	first, at := read()
+	if first.Type != wsHeartbeatType || first.ServerTimeMs == nil {
+		t.Fatalf("first frame %+v, want a heartbeat with server_time_ms", first)
+	}
+	if d := at.Sub(time.UnixMilli(*first.ServerTimeMs)); d < -time.Second || d > time.Second {
+		t.Fatalf("server_time_ms is %v off", d)
+	}
+
+	// Events that the client reads slowly hold the heartbeats up behind them.
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	t.Cleanup(func() { cancel(); wg.Wait() })
+	wg.Go(func() {
+		big := types.TaskType(strings.Repeat("x", 1000))
+		rdb, key := st.Client(), store.EventsStreamKey(st.Prefix())
+		for i := 0; ctx.Err() == nil; {
+			cmds := make(rueidis.Commands, 0, 50)
+			for range 50 {
+				data, _ := json.Marshal(types.JobEvent{Type: types.EventJobStarted, JobID: fmt.Sprint(i), TaskType: big, Timestamp: time.Now()})
+				cmds = append(cmds, rdb.B().Xadd().Key(key).Id("*").FieldValue().FieldValue("type", string(types.EventJobStarted)).FieldValue("data", string(data)).Build())
+				i++
+			}
+			rdb.DoMulti(ctx, cmds...)
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	var late time.Duration
+	for start := time.Now(); time.Since(start) < 10*time.Second && late < time.Second; time.Sleep(20 * time.Millisecond) {
+		if b, at := read(); b.Type == wsHeartbeatType && b.ServerTimeMs != nil {
+			late = max(late, at.Sub(time.UnixMilli(*b.ServerTimeMs)))
+		}
+	}
+	if late < time.Second {
+		t.Errorf("heartbeats came at most %v late, want one that tells of a second or more", late)
+	}
+	t.Logf("a heartbeat came %v after it was written", late.Round(time.Millisecond))
 }

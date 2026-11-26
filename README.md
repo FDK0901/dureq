@@ -475,7 +475,7 @@ What jobs carry may be personal data: payloads, results, progress and the errors
 | `POST` | `/api/workflows/{id}/retry`  | Retry from failure point |
 | `POST` | `/api/workflows/{id}/suspend` | Suspend workflow        |
 | `POST` | `/api/workflows/{id}/resume` | Resume a suspended workflow |
-| `GET`  | `/api/workflows/{id}/tasks/{task}/result` | Result of a task |
+| `GET`  | `/api/workflows/{id}/tasks/{task}/result` | Result of a task; 404 if it is not there, not yet or not any more |
 | `GET`  | `/api/workflows/{id}/signals/stats` | Signals of a workflow |
 | `POST` | `/api/workflows/validate`    | Check a definition       |
 

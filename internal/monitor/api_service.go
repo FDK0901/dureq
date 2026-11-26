@@ -544,6 +544,10 @@ func (a *APIService) GetWorkflowTaskResult(ctx context.Context, wfID, taskName s
 	if err != nil {
 		return nil, &ApiError{Msg: "result not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
+	if result == nil {
+		// Not yet, or no longer: results are kept for ResultTTL, or WorkflowResultTTL.
+		return nil, &ApiError{Msg: "result not found: " + taskName, StatusCode: http.StatusNotFound}
+	}
 	return result.Output, nil
 }
 

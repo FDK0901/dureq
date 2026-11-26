@@ -200,3 +200,43 @@ func TestHistoryEvents_WithoutTotal(t *testing.T) {
 		}
 	}
 }
+
+// A task whose result is not there, not yet or not any more, has none: 404, as with what else
+// is not found.
+func TestWorkflowTaskResult_NotThere(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	ctx := context.Background()
+	wf := &types.WorkflowInstance{ID: "wf1", WorkflowName: "w", Status: types.WorkflowStatusRunning, CreatedAt: time.Now(),
+		Tasks: map[string]types.WorkflowTaskState{
+			"done": {Name: "done", JobID: "job-done", Status: types.JobStatusCompleted},
+			"gone": {Name: "gone", JobID: "job-gone", Status: types.JobStatusCompleted},
+		}}
+	if _, err := st.SaveWorkflow(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PublishResult(ctx, types.WorkResult{JobID: "job-done", Success: true, Output: json.RawMessage(`{"n":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	fetch := func(path string) (int, string) {
+		t.Helper()
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+	if code, body := fetch("/api/workflows/wf1/tasks/done/result"); code != 200 || body != `{"output":{"n":1}}`+"\n" {
+		t.Errorf("a result that is there: %d %s", code, body)
+	}
+	for _, path := range []string{"/api/workflows/wf1/tasks/gone/result", "/api/workflows/wf1/tasks/none/result", "/api/workflows/none/tasks/done/result"} {
+		code, body := fetch(path)
+		var e struct {
+			Error string `json:"error"`
+		}
+		if code != 404 || json.Unmarshal([]byte(body), &e) != nil || e.Error == "" {
+			t.Errorf("GET %s: %d %s", path, code, body)
+		}
+	}
+}

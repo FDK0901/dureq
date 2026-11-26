@@ -17,6 +17,8 @@ const (
 	EventJobCancelled  EventType = "job.cancelled"
 	EventJobPaused     EventType = "job.paused"
 	EventJobResumed    EventType = "job.resumed"
+	EventJobUpdated    EventType = "job.updated"
+	EventJobDeleted    EventType = "job.deleted"
 
 	EventNodeJoined    EventType = "node.joined"
 	EventNodeLeft      EventType = "node.left"
@@ -78,7 +80,23 @@ type JobEvent struct {
 	// WorkflowID is set for task-level workflow events so they can be indexed
 	// under the parent workflow rather than the task's job ID.
 	WorkflowID string `json:"workflow_id,omitempty"`
+
+	// What has become of the job, if the event says so.
+	Status    JobStatus     `json:"status,omitempty"`
+	RunCount  int           `json:"run_count,omitempty"`
+	NextRunAt *time.Time    `json:"next_run_at,omitempty"`
+	Duration  time.Duration `json:"duration,omitempty"` // of the run, in ns
+	BatchID   string        `json:"batch_id,omitempty"`
+
 	// Standalone says that the job is known not to be part of a workflow or batch, so that
 	// the orchestrator need not see the event. It is not stored.
 	Standalone bool `json:"-"`
+}
+
+// SetJob sets what has become of a job.
+func (e *JobEvent) SetJob(job *Job) {
+	e.Status, e.RunCount, e.NextRunAt = job.Status, job.RunCount, job.NextRunAt
+	if job.BatchID != nil {
+		e.BatchID = *job.BatchID
+	}
 }

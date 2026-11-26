@@ -268,10 +268,15 @@ func (a *APIService) DeleteJob(ctx context.Context, jobID string) error {
 	if !job.Status.IsTerminal() {
 		return &ApiError{Msg: "cannot delete: job is " + string(job.Status) + " (cancel it first)", StatusCode: http.StatusConflict}
 	}
-	if err := a.store.DeleteJob(ctx, jobID); err != nil {
+	return a.deleteJob(ctx, job)
+}
+
+func (a *APIService) deleteJob(ctx context.Context, job *types.Job) error {
+	if err := a.store.DeleteJob(ctx, job.ID); err != nil {
 		return err
 	}
-	a.store.DeleteSchedule(ctx, jobID)
+	a.store.DeleteSchedule(ctx, job.ID)
+	a.dispatcher.PublishEvent(types.JobEvent{Type: types.EventJobDeleted, JobID: job.ID, TaskType: job.TaskType, Timestamp: time.Now()})
 	return nil
 }
 
@@ -311,6 +316,9 @@ func (a *APIService) UpdateJobPayload(ctx context.Context, jobID string, payload
 	if _, err := a.store.UpdateJob(ctx, job, rev); err != nil {
 		return err
 	}
+	event := types.JobEvent{Type: types.EventJobUpdated, JobID: job.ID, TaskType: job.TaskType, Timestamp: job.UpdatedAt}
+	event.SetJob(job)
+	a.dispatcher.PublishEvent(event)
 	return nil
 }
 
@@ -1142,8 +1150,7 @@ func (a *APIService) BulkDeleteJobs(ctx context.Context, req BulkRequest) (*Bulk
 		if err != nil || !job.Status.IsTerminal() {
 			continue
 		}
-		if err := a.store.DeleteJob(ctx, id); err == nil {
-			a.store.DeleteSchedule(ctx, id)
+		if err := a.deleteJob(ctx, job); err == nil {
 			affected++
 		}
 	}

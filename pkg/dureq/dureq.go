@@ -40,6 +40,7 @@ var (
 	WithLockTTL               = server.WithLockTTL
 	WithLogger                = server.WithLogger
 	WithKeyPrefix             = server.WithKeyPrefix
+	WithMaxNameScan           = server.WithMaxNameScan
 	WithPriorityTiers         = server.WithPriorityTiers
 	WithRedisSentinel         = server.WithRedisSentinel
 	WithRedisCluster          = server.WithRedisCluster
@@ -77,6 +78,7 @@ var (
 	WithClientTiers         = client.WithPriorityTiers
 	WithClientClusterAddrs  = client.WithClusterAddrs
 	WithClientRedisStore    = client.WithStore
+	WithClientMaxNameScan   = client.WithMaxNameScan
 )
 
 type Client = client.Client

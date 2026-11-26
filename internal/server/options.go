@@ -203,6 +203,14 @@ func WithKeyPrefix(prefix string) Option {
 	return func(c *Config) { c.StoreConfig.KeyPrefix = prefix }
 }
 
+// WithMaxNameScan sets how many workflows or batches a list that is filtered by name looks at,
+// at most, such as GET /api/workflows?name= of the monitoring API. There is no index of names,
+// so each of them is read. Past it, what matches is not found, and the list says that its total
+// is a lower bound. Default: 100000.
+func WithMaxNameScan(n int) Option {
+	return func(c *Config) { c.StoreConfig.MaxNameScan = n }
+}
+
 // WithMode sets which subsystems are active on this node.
 // Default: ModeFull. Example: WithMode(ModeQueue | ModeScheduler).
 func WithMode(m Mode) Option {

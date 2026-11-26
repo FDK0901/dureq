@@ -38,6 +38,7 @@ type clientConfig struct {
 	tlsConfig     interface{} // *tls.Config
 	keyPrefix     string
 	tiers         []store.TierConfig
+	maxNameScan   int
 	rdb           rueidis.Client    // pre-existing client
 	clusterAddrs  []string          // Redis Cluster addresses
 	redisStore    *store.RedisStore // pre-existing store
@@ -76,6 +77,13 @@ func WithKeyPrefix(prefix string) Option {
 // WithPriorityTiers sets the priority tier configuration.
 func WithPriorityTiers(tiers []store.TierConfig) Option {
 	return func(c *clientConfig) { c.tiers = tiers }
+}
+
+// WithMaxNameScan sets how many workflows or batches a list of the client's store that is
+// filtered by name looks at, at most, as the server's option of that name does. It has no effect
+// with WithStore. Default: 100000.
+func WithMaxNameScan(n int) Option {
+	return func(c *clientConfig) { c.maxNameScan = n }
 }
 
 // WithRedisClient uses a pre-existing rueidis client.
@@ -175,8 +183,9 @@ func New(opts ...Option) (*Client, error) {
 
 	// Create store.
 	storeCfg := store.RedisStoreConfig{
-		KeyPrefix: cfg.keyPrefix,
-		Tiers:     cfg.tiers,
+		KeyPrefix:   cfg.keyPrefix,
+		Tiers:       cfg.tiers,
+		MaxNameScan: cfg.maxNameScan,
 	}
 
 	s, err := store.NewRedisStore(rdb, storeCfg, nil)

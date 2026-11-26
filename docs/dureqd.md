@@ -51,6 +51,7 @@ See [configs/config.yaml](../configs/config.yaml) for a fully annotated sample.
 | `dureqd.handlers` | []string | all | Handler filter list |
 | `dureqd.drainTimeoutMs` | int | `30000` | Shutdown drain timeout (ms) |
 | `dureqd.runHistoryRetentionHours` | int | `0` | Remove finished runs from the run history after so many hours; 0 = only by hand |
+| `dureqd.maxNameScan` | int | `100000` | How many workflows or batches a list filtered by name (`?name=`) looks at, at most; each is read |
 
 ### Modes
 

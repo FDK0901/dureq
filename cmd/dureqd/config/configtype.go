@@ -19,6 +19,9 @@ type DureqdConfig struct {
 
 	// RunHistoryRetentionHours is how long (h) finished runs are kept in the run history; 0 = until removed by hand
 	RunHistoryRetentionHours int `koanf:"runHistoryRetentionHours"`
+
+	// MaxNameScan is how many workflows or batches a list filtered by name looks at; 0 = 100000
+	MaxNameScan int `koanf:"maxNameScan"`
 }
 
 type RedisConfig struct {

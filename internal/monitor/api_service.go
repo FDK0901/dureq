@@ -395,21 +395,20 @@ func (a *APIService) ListHistoryEvents(ctx context.Context, filter store.EventFi
 
 // ===================== DLQ =====================
 
+// maxDLQMessages is how many messages are returned if no limit is given.
+const maxDLQMessages = 1000
+
+// ListDLQ returns a page of the dead letter queue, newest first, and how many messages it has.
 func (a *APIService) ListDLQ(ctx context.Context, limit, offset int) ([]*types.WorkMessage, int, error) {
-	msgs, err := a.store.ListDLQ(ctx, 1000)
-	if err != nil {
-		return nil, 0, err
+	total, err := a.store.CountDLQ(ctx)
+	if err != nil || offset >= total {
+		return nil, total, err
 	}
-	total := len(msgs)
-	if offset < len(msgs) {
-		msgs = msgs[offset:]
-	} else {
-		msgs = nil
+	if limit <= 0 {
+		limit = maxDLQMessages
 	}
-	if limit > 0 && len(msgs) > limit {
-		msgs = msgs[:limit]
-	}
-	return msgs, total, nil
+	msgs, err := a.store.ListDLQPage(ctx, limit, offset)
+	return msgs, total, err
 }
 
 // ===================== Workflows =====================

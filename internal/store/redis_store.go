@@ -1523,23 +1523,50 @@ func (s *RedisStore) ListBatchItemResults(ctx context.Context, batchID string) (
 // DLQ operations
 // ============================================================
 
-// ListDLQ reads recent messages from the DLQ stream.
-func (s *RedisStore) ListDLQ(ctx context.Context, limit int) ([]*types.WorkMessage, error) {
+// CountDLQ returns how many messages are in the DLQ stream.
+func (s *RedisStore) CountDLQ(ctx context.Context) (int, error) {
+	n, err := s.rdb.Do(ctx, s.rdb.B().Xlen().Key(DLQStreamKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return 0, fmt.Errorf("count DLQ: %w", err)
+	}
+	return int(n), nil
+}
+
+// dlqChunkSize is how many messages are read at once to get to a page of the DLQ.
+const dlqChunkSize = 500
+
+// ListDLQPage reads a page of the DLQ stream, newest first.
+func (s *RedisStore) ListDLQPage(ctx context.Context, limit, offset int) ([]*types.WorkMessage, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-
-	msgs, err := s.rdb.Do(ctx, s.rdb.B().Xrevrange().Key(DLQStreamKey(s.prefix)).End("+").Start("-").Count(int64(limit)).Build()).AsXRange()
-	if err != nil {
-		return nil, fmt.Errorf("list DLQ: %w", err)
-	}
-
 	var result []*types.WorkMessage
-	for _, msg := range msgs {
-		wm := WorkMessageFromStreamValues(msg.FieldValues)
-		result = append(result, &wm)
+	end := "+"
+	for skip := offset; len(result) < limit; {
+		count := min(skip+limit-len(result), dlqChunkSize)
+		msgs, err := s.rdb.Do(ctx, s.rdb.B().Xrevrange().Key(DLQStreamKey(s.prefix)).End(end).Start("-").Count(int64(count)).Build()).AsXRange()
+		if err != nil {
+			return nil, fmt.Errorf("list DLQ: %w", err)
+		}
+		for _, msg := range msgs {
+			if skip > 0 {
+				skip--
+				continue
+			}
+			wm := WorkMessageFromStreamValues(msg.FieldValues)
+			result = append(result, &wm)
+		}
+		if len(msgs) < count {
+			break
+		}
+		end = "(" + msgs[len(msgs)-1].ID
 	}
 	return result, nil
+}
+
+// ListDLQ reads recent messages from the DLQ stream.
+func (s *RedisStore) ListDLQ(ctx context.Context, limit int) ([]*types.WorkMessage, error) {
+	return s.ListDLQPage(ctx, limit, 0)
 }
 
 // ============================================================

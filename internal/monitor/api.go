@@ -17,16 +17,30 @@ type SyncRetryStatsFunc func() any
 
 // API serves the monitoring HTTP endpoints for the React UI.
 type API struct {
-	svc *APIService
-	mux *http.ServeMux
+	svc   *APIService
+	mux   *http.ServeMux
+	guard *originGuard
 }
 
 // NewAPI creates a new monitoring API backed by Redis.
 func NewAPI(s *store.RedisStore, disp Dispatcher, logger chainedlog.Logger) *API {
+	guard, _ := newOriginGuard(nil)
 	svc := NewAPIService(s, disp, logger)
-	api := &API{svc: svc, mux: http.NewServeMux()}
+	api := &API{svc: svc, mux: http.NewServeMux(), guard: guard}
 	api.registerRoutes()
 	return api
+}
+
+// AllowOrigins lets web pages of other origins use the API, such as
+// "https://durequi.example.com"; "*" lets all. By default none but those of the same origin
+// can. It is called before Handler.
+func (a *API) AllowOrigins(origins []string) error {
+	guard, err := newOriginGuard(origins)
+	if err != nil {
+		return err
+	}
+	a.guard = guard
+	return nil
 }
 
 // SetSyncRetryStatsFunc sets the function used to retrieve SyncRetrier stats.
@@ -36,7 +50,7 @@ func (a *API) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
 
 // Handler returns the HTTP handler for mounting in a server.
 func (a *API) Handler() http.Handler {
-	return corsMiddleware(a.mux)
+	return a.guard.middleware(a.mux)
 }
 
 // Shutdown cancels the hub's Redis subscription.
@@ -1043,21 +1057,6 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-}
-
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
 }
 
 // --- Filter helpers (used by both api_service.go and grpc) ---

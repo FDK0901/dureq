@@ -43,6 +43,38 @@ func TestETag(t *testing.T) {
 	}
 }
 
+// What may hold payloads, results or what handlers report, such as personal data, is not to be
+// kept by a browser. The rest is still checked by its ETag.
+func TestETag_NotWherePayloadsAre(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	job := &types.Job{ID: "j1", TaskType: "send", Payload: json.RawMessage(`{"to":"someone"}`), Status: types.JobStatusPending, CreatedAt: time.Now()}
+	if _, err := st.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	head := func(path string) (int, http.Header) {
+		t.Helper()
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, resp.Header
+	}
+	for _, path := range []string{"/api/jobs", "/api/jobs/j1", "/api/dlq", "/api/workflows", "/api/batches", "/api/runs", "/api/history/runs", "/api/history/events", "/api/jobs/j1/events", "/api/groups", "/api/jobs/none"} {
+		code, h := head(path)
+		if h.Get("ETag") != "" || h.Get("Cache-Control") != "private, no-store" {
+			t.Errorf("GET %s (%d): ETag %q, Cache-Control %q", path, code, h.Get("ETag"), h.Get("Cache-Control"))
+		}
+	}
+	for _, path := range []string{"/api/stats", "/api/nodes", "/api/queues", "/api/schedules", "/api/health"} {
+		code, h := head(path)
+		if code != 200 || h.Get("ETag") == "" || h.Get("Cache-Control") != "no-cache" {
+			t.Errorf("GET %s (%d): ETag %q, Cache-Control %q", path, code, h.Get("ETag"), h.Get("Cache-Control"))
+		}
+	}
+}
+
 // What a list has to look up for its rows takes one request.
 func TestByIDs(t *testing.T) {
 	st, srv := newTestAPI(t, nil)

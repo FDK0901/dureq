@@ -359,6 +359,21 @@ func (a *APIService) ListActiveRuns(ctx context.Context) ([]*types.JobRun, error
 	return a.store.ListRuns(ctx)
 }
 
+// ListActiveRunsOfJobs returns the active runs of jobs.
+func (a *APIService) ListActiveRunsOfJobs(ctx context.Context, jobIDs []string) ([]*types.JobRun, error) {
+	return a.store.ListActiveRunsOfJobs(ctx, jobIDs)
+}
+
+// GetJobs returns jobs by their IDs. Those that do not exist are left out.
+func (a *APIService) GetJobs(ctx context.Context, ids []string) ([]types.Job, error) {
+	return a.store.GetJobs(ctx, ids)
+}
+
+// ListRunsOfJobs returns the last finished runs of jobs, newest first, by job ID.
+func (a *APIService) ListRunsOfJobs(ctx context.Context, jobIDs []string, limit int) (map[string][]types.JobRun, error) {
+	return a.store.ListRunsOfJobs(ctx, jobIDs, limit)
+}
+
 func (a *APIService) GetRun(ctx context.Context, runID string) (*types.JobRun, error) {
 	// An active run first: one that is retried is also in the history, as it was before.
 	run, _, err := a.store.GetRun(ctx, runID)
@@ -821,47 +836,24 @@ func (a *APIService) GetStats(ctx context.Context) (*StatsResponse, error) {
 		return nil, err
 	}
 
-	schedules, _ := a.store.ListSchedules(ctx)
-	runs, _ := a.store.ListRuns(ctx)
-	nodes, _ := a.store.ListNodes(ctx)
-
-	// Count workflows by status.
-	workflowCounts := make(map[types.WorkflowStatus]int)
-	activeWorkflows := 0
-	for _, status := range []types.WorkflowStatus{types.WorkflowStatusPending, types.WorkflowStatusRunning, types.WorkflowStatusCompleted, types.WorkflowStatusFailed, types.WorkflowStatusCancelled, types.WorkflowStatusSuspended} {
-		s := status
-		_, total, _ := a.store.ListWorkflowInstances(ctx, store.WorkflowFilter{Status: &s, Limit: 0})
-		if total > 0 {
-			workflowCounts[status] = total
-		}
-		if status == types.WorkflowStatusRunning {
-			activeWorkflows = total
-		}
+	counts, err := a.store.Counts(ctx)
+	if err != nil {
+		return nil, err
 	}
-
-	// Count batches by status.
-	batchCounts := make(map[types.WorkflowStatus]int)
-	activeBatches := 0
-	for _, status := range []types.WorkflowStatus{types.WorkflowStatusPending, types.WorkflowStatusRunning, types.WorkflowStatusCompleted, types.WorkflowStatusFailed, types.WorkflowStatusCancelled} {
-		s := status
-		_, total, _ := a.store.ListBatchInstances(ctx, store.BatchFilter{Status: &s, Limit: 0})
-		if total > 0 {
-			batchCounts[status] = total
-		}
-		if status == types.WorkflowStatusRunning {
-			activeBatches = total
-		}
+	nodes, err := a.store.ListNodes(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	return &StatsResponse{
 		JobCounts:       jobCounts,
-		ActiveSchedules: len(schedules),
-		ActiveRuns:      len(runs),
+		ActiveSchedules: counts.Schedules,
+		ActiveRuns:      counts.ActiveRuns,
 		ActiveNodes:     len(nodes),
-		WorkflowCounts:  workflowCounts,
-		BatchCounts:     batchCounts,
-		ActiveWorkflows: activeWorkflows,
-		ActiveBatches:   activeBatches,
+		WorkflowCounts:  counts.Workflows,
+		BatchCounts:     counts.Batches,
+		ActiveWorkflows: counts.Workflows[types.WorkflowStatusRunning],
+		ActiveBatches:   counts.Batches[types.WorkflowStatusRunning],
 	}, nil
 }
 

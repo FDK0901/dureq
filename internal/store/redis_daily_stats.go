@@ -33,23 +33,24 @@ func (s *RedisStore) GetDailyStats(ctx context.Context, days int) ([]DailyStats,
 	result := make([]DailyStats, 0, days)
 	now := time.Now()
 
+	cmds := make(rueidis.Commands, 0, days)
 	for i := days - 1; i >= 0; i-- {
 		date := now.AddDate(0, 0, -i).Format("2006-01-02")
-		key := DailyStatsKey(s.prefix, date)
-
-		vals, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(key).Build()).AsStrMap()
+		result = append(result, DailyStats{Date: date})
+		cmds = append(cmds, s.rdb.B().Hgetall().Key(DailyStatsKey(s.prefix, date)).Build())
+	}
+	for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+		entry := &result[i]
+		vals, err := r.AsStrMap()
 		if err != nil {
-			return nil, fmt.Errorf("get daily stats for %s: %w", date, err)
+			return nil, fmt.Errorf("get daily stats for %s: %w", entry.Date, err)
 		}
-
-		entry := DailyStats{Date: date}
 		if v, ok := vals["processed"]; ok {
 			entry.Processed, _ = strconv.ParseInt(v, 10, 64)
 		}
 		if v, ok := vals["failed"]; ok {
 			entry.Failed, _ = strconv.ParseInt(v, 10, 64)
 		}
-		result = append(result, entry)
 	}
 	return result, nil
 }

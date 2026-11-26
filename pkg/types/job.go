@@ -484,6 +484,9 @@ type NodeInfo struct {
 	ActiveRunIDs  []string          `json:"active_run_ids,omitempty"`
 	// HandlerVersions maps task type → handler version for safe deployment routing.
 	HandlerVersions map[string]string `json:"handler_versions,omitempty"`
+
+	// Draining says that the node takes no new jobs. It is set when nodes are listed.
+	Draining bool `json:"draining"`
 }
 
 // Pause puts the job on hold. It resumes by itself after retryAfter, or only when it is

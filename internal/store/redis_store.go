@@ -77,15 +77,17 @@ type WorkflowFilter struct {
 	Sort         string // "newest" or "oldest"
 	Limit        int
 	Offset       int
+	SkipTotal    bool // with a name, do not look for what matches past the page
 }
 
 // BatchFilter specifies criteria for listing batch instances.
 type BatchFilter struct {
-	Name   *string
-	Status *types.WorkflowStatus
-	Sort   string // "newest" or "oldest"
-	Limit  int
-	Offset int
+	Name      *string
+	Status    *types.WorkflowStatus
+	Sort      string // "newest" or "oldest"
+	Limit     int
+	Offset    int
+	SkipTotal bool // with a name, do not look for what matches past the page
 }
 
 // JobFilter specifies criteria for listing active jobs.

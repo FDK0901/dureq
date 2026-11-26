@@ -617,10 +617,19 @@ func (a *API) listWorkflows(w http.ResponseWriter, r *http.Request) {
 	if name := r.URL.Query().Get("name"); name != "" {
 		filter.WorkflowName = &name
 	}
-	workflows, total, err := a.svc.ListWorkflows(r.Context(), filter)
+	skipTotal := skipsTotal(r)
+	if skipTotal {
+		filter.SkipTotal = true
+		filter.Limit++
+	}
+	workflows, total, more, err := a.svc.ListWorkflowsPage(r.Context(), filter)
 	if err != nil {
 		writeServiceError(w, err)
 		return
+	}
+	if skipTotal {
+		more = more || len(workflows) > pp.Limit
+		workflows = workflows[:min(len(workflows), pp.Limit)]
 	}
 	if wantsSummary(r) {
 		for i := range workflows {
@@ -629,7 +638,7 @@ func (a *API) listWorkflows(w http.ResponseWriter, r *http.Request) {
 			wf.Input, wf.Output = nil, nil
 		}
 	}
-	jsonOK(w, paginatedResponse{Data: workflows, Total: total})
+	writePage(w, workflows, total, more, skipTotal)
 }
 
 func (a *API) getWorkflow(w http.ResponseWriter, r *http.Request) {
@@ -722,10 +731,19 @@ func (a *API) listBatches(w http.ResponseWriter, r *http.Request) {
 	if name := r.URL.Query().Get("name"); name != "" {
 		filter.Name = &name
 	}
-	batches, total, err := a.svc.ListBatches(r.Context(), filter)
+	skipTotal := skipsTotal(r)
+	if skipTotal {
+		filter.SkipTotal = true
+		filter.Limit++
+	}
+	batches, total, more, err := a.svc.ListBatchesPage(r.Context(), filter)
 	if err != nil {
 		writeServiceError(w, err)
 		return
+	}
+	if skipTotal {
+		more = more || len(batches) > pp.Limit
+		batches = batches[:min(len(batches), pp.Limit)]
 	}
 	if wantsSummary(r) {
 		for i := range batches {
@@ -733,7 +751,7 @@ func (a *API) listBatches(w http.ResponseWriter, r *http.Request) {
 			b.Definition.Items, b.Definition.OnetimePayload, b.ItemStates = nil, nil, nil
 		}
 	}
-	jsonOK(w, paginatedResponse{Data: batches, Total: total})
+	writePage(w, batches, total, more, skipTotal)
 }
 
 func (a *API) getBatch(w http.ResponseWriter, r *http.Request) {
@@ -1147,6 +1165,22 @@ func wantsSummary(r *http.Request) bool { return r.URL.Query().Get("view") == "s
 type paginatedResponse struct {
 	Data  any `json:"data"`
 	Total int `json:"total"`
+	// TotalIsLowerBound says that not all were looked at, so that more may match.
+	TotalIsLowerBound bool `json:"total_is_lower_bound,omitempty"`
+}
+
+// skipsTotal reports whether a list is not to count what matches past the page (total=false):
+// it says has_more instead.
+func skipsTotal(r *http.Request) bool { return r.URL.Query().Get("total") == "false" }
+
+// writePage writes a page of a list of workflows or batches: with its total and whether that is
+// a lower bound, or, if skipTotal, whether there are more.
+func writePage[T any](w http.ResponseWriter, data []T, total int, more, skipTotal bool) {
+	if skipTotal {
+		jsonOK(w, map[string]any{"data": data, "has_more": more})
+		return
+	}
+	jsonOK(w, paginatedResponse{Data: data, Total: total, TotalIsLowerBound: more})
 }
 
 // --- Helpers ---

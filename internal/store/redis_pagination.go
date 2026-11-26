@@ -78,11 +78,15 @@ const (
 	maxJobSearchScan = 100_000
 )
 
-// scanMatches returns a page of what matches in an index, and how many there are.
-func scanMatches[T any](ctx context.Context, s *RedisStore, indexKey, sort string, offset, limit int, hydrate func(context.Context, []string) ([]T, error), match func(*T) bool) ([]T, int, error) {
+// scanMatches returns a page of what matches in an index, how many match, and whether some of
+// the index were not looked at: then there may be more. It looks at MaxNameScan at most, and,
+// if skipTotal, at no more than it takes to fill the page.
+func scanMatches[T any](ctx context.Context, s *RedisStore, indexKey, sort string, offset, limit int, skipTotal bool, hydrate func(context.Context, []string) ([]T, error), match func(*T) bool) ([]T, int, bool, error) {
 	var page []T
 	total, scanned := 0, 0
+	stopped := false
 	err := s.scanIndex(ctx, indexKey, sort, nameScanChunkSize, func(ids []string) (bool, error) {
+		ids = ids[:min(len(ids), s.cfg.MaxNameScan-scanned)]
 		values, err := hydrate(ctx, ids)
 		if err != nil {
 			return false, err
@@ -95,23 +99,33 @@ func scanMatches[T any](ctx context.Context, s *RedisStore, indexKey, sort strin
 				page = append(page, values[i])
 			}
 			total++
+			if skipTotal && total >= offset+limit {
+				stopped = true
+				return false, nil
+			}
 		}
 		scanned += len(ids)
-		return scanned < maxNameScan, ctx.Err()
+		if scanned >= s.cfg.MaxNameScan {
+			stopped = true
+			return false, ctx.Err()
+		}
+		return true, ctx.Err()
 	})
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
-	return page, total, nil
+	if stopped && !skipTotal {
+		// It may have stopped at the end.
+		if n, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64(); err == nil && n <= int64(scanned) {
+			stopped = false
+		}
+	}
+	return page, total, stopped, nil
 }
 
-const (
-	// nameScanChunkSize is how many workflows or batches are read at once to look for a
-	// name. They may be large.
-	nameScanChunkSize = 100
-	// maxNameScan is how many are looked at in all.
-	maxNameScan = 100_000
-)
+// nameScanChunkSize is how many workflows or batches are read at once to look for a name. They
+// may be large.
+const nameScanChunkSize = 100
 
 // searchJobs returns the page of the jobs whose ID or task type contains filter.Search,
 // and how many there are. It reads the jobs of the index one by one.
@@ -347,8 +361,17 @@ func (s *RedisStore) ListJobEvents(ctx context.Context, filter EventFilter) ([]t
 // Paginated Workflow listing
 // ============================================================
 
-// ListWorkflowInstances returns paginated workflow instances.
+// ListWorkflowInstances returns paginated workflow instances. With a name, total is how many
+// match among those that were looked at; ListWorkflowInstancesPage says whether that is all.
 func (s *RedisStore) ListWorkflowInstances(ctx context.Context, filter WorkflowFilter) ([]types.WorkflowInstance, int, error) {
+	wfs, total, _, err := s.ListWorkflowInstancesPage(ctx, filter)
+	return wfs, total, err
+}
+
+// ListWorkflowInstancesPage is ListWorkflowInstances, and also reports whether some workflows
+// were not looked at, so that there may be more that match than total: with a name, it looks
+// at MaxNameScan at most, and with SkipTotal at what fills the page.
+func (s *RedisStore) ListWorkflowInstancesPage(ctx context.Context, filter WorkflowFilter) ([]types.WorkflowInstance, int, bool, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = 20
 	}
@@ -360,17 +383,17 @@ func (s *RedisStore) ListWorkflowInstances(ctx context.Context, filter WorkflowF
 
 	if filter.WorkflowName != nil && *filter.WorkflowName != "" {
 		name := *filter.WorkflowName
-		return scanMatches(ctx, s, indexKey, filter.Sort, filter.Offset, filter.Limit, s.hydrateWorkflowValues, func(v *types.WorkflowInstance) bool {
+		return scanMatches(ctx, s, indexKey, filter.Sort, filter.Offset, filter.Limit, filter.SkipTotal, s.hydrateWorkflowValues, func(v *types.WorkflowInstance) bool {
 			return v.WorkflowName == name
 		})
 	}
 
 	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64()
 	if err != nil {
-		return nil, 0, fmt.Errorf("count workflows: %w", err)
+		return nil, 0, false, fmt.Errorf("count workflows: %w", err)
 	}
 	if total == 0 {
-		return nil, 0, nil
+		return nil, 0, false, nil
 	}
 
 	var ids []string
@@ -382,17 +405,17 @@ func (s *RedisStore) ListWorkflowInstances(ctx context.Context, filter WorkflowF
 		ids, err = s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(indexKey).Start(start).Stop(stop).Build()).AsStrSlice()
 	}
 	if err != nil {
-		return nil, 0, fmt.Errorf("paginate workflows: %w", err)
+		return nil, 0, false, fmt.Errorf("paginate workflows: %w", err)
 	}
 	if len(ids) == 0 {
-		return nil, int(total), nil
+		return nil, int(total), false, nil
 	}
 
 	wfs, err := s.hydrateWorkflowValues(ctx, ids)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
-	return wfs, int(total), nil
+	return wfs, int(total), false, nil
 }
 
 // GetWorkflowByID retrieves a workflow instance by ID (convenience for monitor API).
@@ -408,8 +431,17 @@ func (s *RedisStore) GetWorkflowByID(ctx context.Context, id string) (*types.Wor
 // Paginated Batch listing
 // ============================================================
 
-// ListBatchInstances returns paginated batch instances.
+// ListBatchInstances returns paginated batch instances. With a name, total is how many match
+// among those that were looked at; ListBatchInstancesPage says whether that is all.
 func (s *RedisStore) ListBatchInstances(ctx context.Context, filter BatchFilter) ([]types.BatchInstance, int, error) {
+	batches, total, _, err := s.ListBatchInstancesPage(ctx, filter)
+	return batches, total, err
+}
+
+// ListBatchInstancesPage is ListBatchInstances, and also reports whether some batches were not
+// looked at, so that there may be more that match than total: with a name, it looks at
+// MaxNameScan at most, and with SkipTotal at what fills the page.
+func (s *RedisStore) ListBatchInstancesPage(ctx context.Context, filter BatchFilter) ([]types.BatchInstance, int, bool, error) {
 	if filter.Limit <= 0 {
 		filter.Limit = 20
 	}
@@ -421,17 +453,17 @@ func (s *RedisStore) ListBatchInstances(ctx context.Context, filter BatchFilter)
 
 	if filter.Name != nil && *filter.Name != "" {
 		name := *filter.Name
-		return scanMatches(ctx, s, indexKey, filter.Sort, filter.Offset, filter.Limit, s.hydrateBatchValues, func(v *types.BatchInstance) bool {
+		return scanMatches(ctx, s, indexKey, filter.Sort, filter.Offset, filter.Limit, filter.SkipTotal, s.hydrateBatchValues, func(v *types.BatchInstance) bool {
 			return v.Name == name
 		})
 	}
 
 	total, err := s.rdb.Do(ctx, s.rdb.B().Zcard().Key(indexKey).Build()).AsInt64()
 	if err != nil {
-		return nil, 0, fmt.Errorf("count batches: %w", err)
+		return nil, 0, false, fmt.Errorf("count batches: %w", err)
 	}
 	if total == 0 {
-		return nil, 0, nil
+		return nil, 0, false, nil
 	}
 
 	var ids []string
@@ -443,17 +475,17 @@ func (s *RedisStore) ListBatchInstances(ctx context.Context, filter BatchFilter)
 		ids, err = s.rdb.Do(ctx, s.rdb.B().Zrevrange().Key(indexKey).Start(start).Stop(stop).Build()).AsStrSlice()
 	}
 	if err != nil {
-		return nil, 0, fmt.Errorf("paginate batches: %w", err)
+		return nil, 0, false, fmt.Errorf("paginate batches: %w", err)
 	}
 	if len(ids) == 0 {
-		return nil, int(total), nil
+		return nil, int(total), false, nil
 	}
 
 	batches, err := s.hydrateBatchValues(ctx, ids)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
-	return batches, int(total), nil
+	return batches, int(total), false, nil
 }
 
 // GetBatchByID retrieves a batch instance by ID (convenience for monitor API).

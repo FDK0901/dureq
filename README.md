@@ -490,6 +490,8 @@ What jobs carry may be personal data: payloads, results, progress and the errors
 | `POST` | `/api/batches/{id}/cancel`           | Cancel batch           |
 | `POST` | `/api/batches/{id}/retry`            | Retry batch            |
 
+The lists of workflows and batches take `?name=`. There is no index of names, so that a name is looked for among the newest (or, with `sort=oldest`, the oldest) 100,000 of them at most (`MaxNameScan` of the store); each of them is read, items and all, which takes about half a second for 10,000 batches of 50 items. If some were not looked at, the answer says `"total_is_lower_bound": true`: more may match. With `?total=false` it stops looking once the page is full, and says `"has_more"` instead of a total; that is true, too, if it stopped at `MaxNameScan`.
+
 **Bulk Operations:**
 
 | Method | Path                         | Description               |

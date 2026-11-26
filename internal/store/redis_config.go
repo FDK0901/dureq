@@ -64,6 +64,11 @@ type RedisStoreConfig struct {
 	// DurabilityTimeout is the maximum time to wait for replication/AOF ack. Default: 500ms.
 	DurabilityTimeout time.Duration
 
+	// MaxNameScan is how many workflows or batches a list that is filtered by name looks at, at
+	// most, from the newest (or oldest) on: there is no index of names. Past it, what matches
+	// is not found, and the total is a lower bound. Default: 100000.
+	MaxNameScan int
+
 	// Tiers is the list of user-defined priority tiers. Default: [normal].
 	Tiers []TierConfig
 }
@@ -126,6 +131,9 @@ func (c *RedisStoreConfig) defaults() {
 	}
 	if c.DurabilityTimeout == 0 {
 		c.DurabilityTimeout = 500 * time.Millisecond
+	}
+	if c.MaxNameScan <= 0 {
+		c.MaxNameScan = 100_000
 	}
 	if len(c.Tiers) == 0 {
 		c.Tiers = []TierConfig{

@@ -432,6 +432,13 @@ func (a *APIService) ListWorkflows(ctx context.Context, filter store.WorkflowFil
 	return a.store.ListWorkflowInstances(ctx, filter)
 }
 
+// ListWorkflowsPage is ListWorkflows, and also reports whether some workflows were not looked
+// at, so that there may be more that match than total (see store.WorkflowFilter.SkipTotal and
+// store.RedisStoreConfig.MaxNameScan).
+func (a *APIService) ListWorkflowsPage(ctx context.Context, filter store.WorkflowFilter) ([]types.WorkflowInstance, int, bool, error) {
+	return a.store.ListWorkflowInstancesPage(ctx, filter)
+}
+
 func (a *APIService) GetWorkflow(ctx context.Context, wfID string) (*types.WorkflowInstance, error) {
 	wf, _, err := a.store.GetWorkflow(ctx, wfID)
 	if err != nil {
@@ -624,6 +631,13 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 
 func (a *APIService) ListBatches(ctx context.Context, filter store.BatchFilter) ([]types.BatchInstance, int, error) {
 	return a.store.ListBatchInstances(ctx, filter)
+}
+
+// ListBatchesPage is ListBatches, and also reports whether some batches were not looked at, so
+// that there may be more that match than total (see store.BatchFilter.SkipTotal and
+// store.RedisStoreConfig.MaxNameScan).
+func (a *APIService) ListBatchesPage(ctx context.Context, filter store.BatchFilter) ([]types.BatchInstance, int, bool, error) {
+	return a.store.ListBatchInstancesPage(ctx, filter)
 }
 
 func (a *APIService) GetBatch(ctx context.Context, batchID string) (*types.BatchInstance, error) {

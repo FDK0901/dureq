@@ -952,9 +952,13 @@ func (s *RedisStore) SaveNode(ctx context.Context, node *types.NodeInfo) (uint64
 	return 1, nil
 }
 
-// GetNode retrieves a node by ID, returns nil if not found or TTL expired.
+// GetNode retrieves a node by ID, and whether it is draining, as ListNodes does. It returns
+// nil if not found or TTL expired.
 func (s *RedisStore) GetNode(ctx context.Context, nodeID string) (*types.NodeInfo, error) {
-	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(NodeKey(s.prefix, nodeID)).Build()).AsStrMap()
+	results := s.rdb.DoMulti(ctx,
+		s.rdb.B().Hgetall().Key(NodeKey(s.prefix, nodeID)).Build(),
+		s.rdb.B().Get().Key(NodeDrainKey(s.prefix, nodeID)).Build())
+	result, err := results[0].AsStrMap()
 	if err != nil || len(result) == 0 {
 		return nil, nil
 	}
@@ -963,6 +967,8 @@ func (s *RedisStore) GetNode(ctx context.Context, nodeID string) (*types.NodeInf
 	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &node); err != nil {
 		return nil, fmt.Errorf("unmarshal node: %w", err)
 	}
+	drain, _ := results[1].ToString()
+	node.Draining = drain == "1"
 	return &node, nil
 }
 

@@ -525,7 +525,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`    | `/api/stats`                | Cluster stats                      |
 | `GET`    | `/api/stats/daily`          | Daily aggregated statistics        |
 | `GET`    | `/api/nodes`                | Worker nodes, and whether they are `draining` |
-| `GET`    | `/api/nodes/{id}`           | A worker node                      |
+| `GET`    | `/api/nodes/{id}`           | A worker node, and whether it is `draining` |
 | `GET`    | `/api/schedules`            | Active schedules                   |
 | `GET`    | `/api/schedules/{jobId}`    | The schedule of a job              |
 | `GET`    | `/api/queues`               | Queue tiers (weight, paused, and how many jobs are `waiting`, `in_flight` and `delayed`) |

@@ -135,6 +135,14 @@ func TestNodes_Draining(t *testing.T) {
 			t.Errorf("node %s draining: %v", n.NodeID, n.Draining)
 		}
 	}
+	// One node says so, too.
+	for _, id := range []string{"a", "b"} {
+		var n types.NodeInfo
+		get(t, srv, "/api/nodes/"+id, &n)
+		if n.Draining != (id == "b") {
+			t.Errorf("GET /api/nodes/%s: draining %v", id, n.Draining)
+		}
+	}
 }
 
 // Events of one job can be listed without counting them all.

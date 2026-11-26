@@ -1,9 +1,11 @@
 package monitor
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/FDK0901/dureq/internal/store"
@@ -17,16 +19,30 @@ type SyncRetryStatsFunc func() any
 
 // API serves the monitoring HTTP endpoints for the React UI.
 type API struct {
-	svc *APIService
-	mux *http.ServeMux
+	svc   *APIService
+	mux   *http.ServeMux
+	guard *originGuard
 }
 
 // NewAPI creates a new monitoring API backed by Redis.
 func NewAPI(s *store.RedisStore, disp Dispatcher, logger chainedlog.Logger) *API {
+	guard, _ := newOriginGuard(nil)
 	svc := NewAPIService(s, disp, logger)
-	api := &API{svc: svc, mux: http.NewServeMux()}
+	api := &API{svc: svc, mux: http.NewServeMux(), guard: guard}
 	api.registerRoutes()
 	return api
+}
+
+// AllowOrigins lets web pages of other origins use the API, such as
+// "https://durequi.example.com"; "*" lets all. By default none but those of the same origin
+// can. It is called before Handler.
+func (a *API) AllowOrigins(origins []string) error {
+	guard, err := newOriginGuard(origins)
+	if err != nil {
+		return err
+	}
+	a.guard = guard
+	return nil
 }
 
 // SetSyncRetryStatsFunc sets the function used to retrieve SyncRetrier stats.
@@ -36,7 +52,7 @@ func (a *API) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
 
 // Handler returns the HTTP handler for mounting in a server.
 func (a *API) Handler() http.Handler {
-	return corsMiddleware(a.mux)
+	return a.guard.middleware(withETag(a.mux))
 }
 
 // Shutdown cancels the hub's Redis subscription.
@@ -72,6 +88,8 @@ func (a *API) registerRoutes() {
 
 	// Runs (active)
 	a.mux.HandleFunc("GET /api/runs", a.listRuns)
+	a.mux.HandleFunc("POST /api/jobs/by-ids", a.getJobsByIDs)
+	a.mux.HandleFunc("POST /api/runs/by-jobs", a.listRunsOfJobs)
 	a.mux.HandleFunc("GET /api/runs/{runID}", a.getRun)
 	a.mux.HandleFunc("GET /api/runs/{runID}/progress", a.getRunProgress)
 	a.mux.HandleFunc("GET /api/jobs/{jobID}/progress", a.getJobProgress)
@@ -351,12 +369,67 @@ func (a *API) getNode(w http.ResponseWriter, r *http.Request) {
 // --- Runs ---
 
 func (a *API) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := a.svc.ListActiveRuns(r.Context())
+	list := a.svc.ListActiveRuns
+	if ids := r.URL.Query().Get("job_ids"); ids != "" {
+		list = func(ctx context.Context) ([]*types.JobRun, error) {
+			return a.svc.ListActiveRunsOfJobs(ctx, firstIDs(strings.Split(ids, ",")))
+		}
+	}
+	runs, err := list(r.Context())
 	if err != nil {
 		writeServiceError(w, err)
 		return
 	}
+	if limit, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && limit > 0 && limit < len(runs) {
+		runs = runs[:limit]
+	}
 	jsonOK(w, runs)
+}
+
+// firstIDs returns as many IDs as can be asked for at once.
+func firstIDs(ids []string) []string { return ids[:min(len(ids), maxPageLimit)] }
+
+// readBody reads a body into v and reports whether it was well-formed.
+func readBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		writeServiceError(w, &ApiError{Msg: err.Error(), StatusCode: http.StatusBadRequest})
+		return false
+	}
+	return true
+}
+
+func (a *API) getJobsByIDs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		IDs []string `json:"ids"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	jobs, err := a.svc.GetJobs(r.Context(), firstIDs(body.IDs))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]any{"data": jobs})
+}
+
+func (a *API) listRunsOfJobs(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		JobIDs []string `json:"job_ids"`
+		Limit  int      `json:"limit"`
+	}
+	if !readBody(w, r, &body) {
+		return
+	}
+	if body.Limit <= 0 || body.Limit > maxPageLimit {
+		body.Limit = maxPageLimit
+	}
+	runs, err := a.svc.ListRunsOfJobs(r.Context(), firstIDs(body.JobIDs), body.Limit)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	jsonOK(w, map[string]any{"data": runs})
 }
 
 func (a *API) getRun(w http.ResponseWriter, r *http.Request) {
@@ -476,6 +549,22 @@ func (a *API) listHistoryEvents(w http.ResponseWriter, r *http.Request) {
 	if jid := r.URL.Query().Get("job_id"); jid != "" {
 		filter.JobID = &jid
 	}
+	// To count what matches, all events have to be looked at.
+	if r.URL.Query().Get("total") == "false" {
+		filter.SkipTotal = true
+		filter.Limit++
+		events, _, err := a.svc.ListHistoryEvents(r.Context(), filter)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		more := len(events) > limit
+		if more {
+			events = events[:limit]
+		}
+		jsonOK(w, map[string]any{"data": events, "has_more": more})
+		return
+	}
 	events, total, err := a.svc.ListHistoryEvents(r.Context(), filter)
 	if err != nil {
 		writeServiceError(w, err)
@@ -517,6 +606,13 @@ func (a *API) listWorkflows(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeServiceError(w, err)
 		return
+	}
+	if wantsSummary(r) {
+		for i := range workflows {
+			wf := &workflows[i]
+			wf.Definition = types.WorkflowDefinition{Name: wf.Definition.Name}
+			wf.Input, wf.Output = nil, nil
+		}
 	}
 	jsonOK(w, paginatedResponse{Data: workflows, Total: total})
 }
@@ -615,6 +711,12 @@ func (a *API) listBatches(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeServiceError(w, err)
 		return
+	}
+	if wantsSummary(r) {
+		for i := range batches {
+			b := &batches[i]
+			b.Definition.Items, b.Definition.OnetimePayload, b.ItemStates = nil, nil, nil
+		}
 	}
 	jsonOK(w, paginatedResponse{Data: batches, Total: total})
 }
@@ -1023,6 +1125,10 @@ func parsePageParams(r *http.Request) pageParams {
 	return p
 }
 
+// wantsSummary reports whether a list is to leave out what may be large: the items of batches
+// and their states, and the definitions, inputs and outputs of workflows.
+func wantsSummary(r *http.Request) bool { return r.URL.Query().Get("view") == "summary" }
+
 type paginatedResponse struct {
 	Data  any `json:"data"`
 	Total int `json:"total"`
@@ -1043,21 +1149,6 @@ func writeServiceError(w http.ResponseWriter, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-}
-
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
 }
 
 // --- Filter helpers (used by both api_service.go and grpc) ---

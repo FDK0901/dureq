@@ -406,8 +406,11 @@ type CompletionBatch struct {
 	OperationKey string
 
 	// How far CompleteRun got, if it fails and is called again.
-	committed bool // this batch has marked the ledger, or may have
-	stored    bool // nothing but the acknowledgement is missing
+	marked     bool // the ledger has answered
+	committed  bool // this batch has marked the ledger, or may have
+	first      bool // it was the first to do so for the operation
+	firstOfJob bool // or for the job
+	stored     bool // nothing but the acknowledgement is missing
 }
 
 // CompleteRun performs a two-phase completion:
@@ -422,6 +425,9 @@ type CompletionBatch struct {
 // commands are sent separately for Redis Cluster compatibility.
 func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) error {
 	var publish rueidis.Commands
+	if err := s.CommitRun(ctx, batch); err != nil {
+		return err
+	}
 	if !batch.stored {
 		var err error
 		if publish, err = s.storeCompletion(ctx, batch); err != nil {
@@ -438,36 +444,45 @@ func (s *RedisStore) CompleteRun(ctx context.Context, batch *CompletionBatch) er
 	return nil
 }
 
-// storeCompletion is the first two phases of CompleteRun. It returns the commands that
-// publish the notifications.
+// CommitRun is the first phase of CompleteRun, the operation ledger commit (exactly-once gate).
+// The ledger CAS is the atomic commit point. What has to be stored before the completion is
+// announced is stored between the two.
+func (s *RedisStore) CommitRun(ctx context.Context, batch *CompletionBatch) error {
+	if batch.marked {
+		return nil
+	}
+	if batch.OperationKey == "" {
+		batch.marked, batch.first, batch.firstOfJob = true, true, true
+		return nil
+	}
+	resultData, err := sonic.ConfigFastest.Marshal(batch.Result)
+	if err != nil {
+		return fmt.Errorf("marshal result: %w", err)
+	}
+	isNew, err := s.CompleteOperation(ctx, batch.OperationKey, batch.Run.ID, string(resultData))
+	if err != nil {
+		batch.committed = true // perhaps; an event too many does no harm
+		return fmt.Errorf("operation ledger commit: %w", err)
+	}
+	batch.marked, batch.first = true, isNew
+	batch.committed = batch.committed || isNew
+	batch.firstOfJob = batch.committed || s.completedByOtherJob(ctx, batch.OperationKey, batch.Run.JobID)
+	if isNew {
+		if durErr := s.waitDurability(ctx); durErr != nil {
+			s.logger.Warn().Err(durErr).Msg("durability wait failed after ledger commit")
+		}
+	}
+	return nil
+}
+
+// storeCompletion is the second phase of CompleteRun. It returns the commands that publish
+// the notifications. The idempotent ops (result, history, cleanup) always run. The others
+// (stats increment, event stream append) only run on first completion (of the operation, and
+// of the job); otherwise this is a replay.
 func (s *RedisStore) storeCompletion(ctx context.Context, batch *CompletionBatch) (publish rueidis.Commands, err error) {
 	resultData, err := sonic.ConfigFastest.Marshal(batch.Result)
 	if err != nil {
 		return nil, fmt.Errorf("marshal result: %w", err)
-	}
-
-	// Phase 1: Operation ledger commit (exactly-once gate).
-	// The ledger CAS is the atomic commit point. Phase 2 always runs for
-	// idempotent ops (result, history, cleanup). Non-idempotent ops
-	// (stats increment, event stream append) only run on first completion (of the
-	// operation, and of the job).
-	firstCompletion := true
-	firstOfJob := true
-	if batch.OperationKey != "" {
-		isNew, err := s.CompleteOperation(ctx, batch.OperationKey, batch.Run.ID, string(resultData))
-		if err != nil {
-			batch.committed = true // perhaps; an event too many does no harm
-			return nil, fmt.Errorf("operation ledger commit: %w", err)
-		}
-		firstCompletion = isNew
-		batch.committed = batch.committed || isNew
-		firstOfJob = batch.committed || s.completedByOtherJob(ctx, batch.OperationKey, batch.Run.JobID)
-		if isNew {
-			if durErr := s.waitDurability(ctx); durErr != nil {
-				s.logger.Warn().Err(durErr).Msg("durability wait failed after ledger commit")
-			}
-		}
-		// isNew=false → replay: run idempotent Phase 2 ops only (result, history, cleanup).
 	}
 
 	// Phase 2: Bookkeeping pipeline.
@@ -491,7 +506,7 @@ func (s *RedisStore) storeCompletion(ctx context.Context, batch *CompletionBatch
 	cmds = append(cmds, s.rdb.B().Del().Key(CancelFlagKey(s.prefix, batch.Run.ID)).Build())
 
 	// 3. IncrDailyStat — non-idempotent, skip on replay to avoid double-count.
-	if firstCompletion {
+	if batch.first {
 		date := time.Now().Format("2006-01-02")
 		statsKey := DailyStatsKey(s.prefix, date)
 		cmds = append(cmds, s.rdb.B().Hincrby().Key(statsKey).Field(batch.DailyStatField).Increment(1).Build())
@@ -502,7 +517,7 @@ func (s *RedisStore) storeCompletion(ctx context.Context, batch *CompletionBatch
 	// job: whoever waits for this one does not see the event of the other.
 	// Crash recovery (different worker via XAUTOCLAIM) is handled by
 	// RepairCompletedOperation which has its own XADD.
-	if firstOfJob {
+	if batch.firstOfJob {
 		eventCmds, publishCmds, err := s.eventCmds(batch.Event)
 		if err != nil {
 			return nil, err

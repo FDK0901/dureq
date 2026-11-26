@@ -107,6 +107,9 @@ func main() {
 
 	// Start monitoring API — HTTP (wired to server's store and dispatcher).
 	api := monitor.NewAPI(srv.Store(), srv.Dispatcher(), logger)
+	if err := api.AllowOrigins(cfg.DureqdConfig.AllowedOrigins); err != nil {
+		logger.Fatal().Err(err).Msg("invalid allowedOrigins")
+	}
 	if w := srv.Worker(); w != nil {
 		api.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
 	}

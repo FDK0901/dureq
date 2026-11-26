@@ -8,6 +8,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 	"time"
 
@@ -147,11 +148,16 @@ func TestPR2_DurableCancel_FlagBeforeHandlerStart(t *testing.T) {
 	srv := newServer(t, "pr2-cancel-flag-node", 10)
 
 	handlerStarted := make(chan struct{})
+	// The flag goes with the run, so the run must not end before the flag has been looked at.
+	checked := make(chan struct{})
+	release := sync.OnceFunc(func() { close(checked) })
+	defer release()
 	srv.RegisterHandler(types.HandlerDefinition{
 		TaskType: "pr2.slow",
 		Handler: func(ctx context.Context, _ json.RawMessage) error {
 			close(handlerStarted)
 			<-ctx.Done()
+			<-checked
 			return nil
 		},
 	})
@@ -183,16 +189,18 @@ func TestPR2_DurableCancel_FlagBeforeHandlerStart(t *testing.T) {
 
 	// Verify: the cancel flag was set.
 	runs, _ := srv.Store().ListActiveRunsByJobID(ctx, job.ID)
-	if len(runs) > 0 {
-		cancelled, err := srv.Store().IsCancelRequested(ctx, runs[0].ID)
-		if err != nil {
-			t.Fatalf("IsCancelRequested: %v", err)
-		}
-		if !cancelled {
-			t.Fatal("expected cancel flag to be set after Cancel()")
-		}
-		t.Logf("PASS: cancel flag set for run %s", runs[0].ID)
+	if len(runs) != 1 {
+		t.Fatalf("%d active runs, want 1", len(runs))
 	}
+	cancelled, err := srv.Store().IsCancelRequested(ctx, runs[0].ID)
+	if err != nil {
+		t.Fatalf("IsCancelRequested: %v", err)
+	}
+	if !cancelled {
+		t.Fatal("expected cancel flag to be set after Cancel()")
+	}
+	t.Logf("PASS: cancel flag set for run %s", runs[0].ID)
+	release()
 
 	// Wait for the job to reach terminal state (handler context cancelled via polling or Pub/Sub).
 	completedJob := waitJobTerminal(t, cli, job.ID, 30*time.Second)

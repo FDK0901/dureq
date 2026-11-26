@@ -79,7 +79,8 @@ Use before rolling deployments.
 ## Monitoring API Endpoints
 
 `dureqd` serves the monitoring API, in every mode. A server of your own does not; build endpoints on
-`dureq.NewAPIService`, which has the same calls. Key route groups:
+`dureq.NewAPIService`, which has the same calls. It has no authentication: see
+[Who may use the API](dureqd.md#who-may-use-the-api). Key route groups:
 
 ### Jobs
 
@@ -125,7 +126,7 @@ Use before rolling deployments.
 | `GET` | `/api/queues` | Queue tiers: weight, paused, `waiting` (no worker has it yet), `in_flight`, `delayed` (due later, such as retries). `size` is the length of the stream, which includes what has been processed but not trimmed yet |
 | `GET` | `/api/dlq` | Dead letter queue entries |
 | `GET` | `/api/redis/info` | Redis server info |
-| `GET` | `/api/ws` | WebSocket real-time event stream |
+| `GET` | `/api/ws` | WebSocket real-time event stream (`?v=2` with heartbeats, and a message if events were missed) |
 
 ### Bulk and Search
 
@@ -141,6 +142,8 @@ and cancelled jobs), `status` (repeatable) and `limit` (10 by default, 100 at mo
 100,000 of them, so narrow it down with `status`, `task_type` or `tag` if there are many.
 
 `GET /api/history/events` reads the event stream, which keeps about the last `EventStreamMaxLen` events (50,000).
+With `?job_id=` it goes through all of them to count those of the job; `&total=false` stops at the page, and says
+`has_more` instead.
 
 ## Repair Operations
 

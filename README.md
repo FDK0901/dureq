@@ -441,6 +441,9 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 
 [dureqd](docs/dureqd.md) serves it, over HTTP on `:8080` and gRPC on `:9090` by default. In a server of your own, build endpoints on `dureq.NewAPIService`, which has the same calls.
 
+> [!IMPORTANT]
+> The API has no authentication. Put it behind something that has, and do not let it be reached without it. Web pages of other origins are refused, unless they are in [`allowedOrigins`](docs/dureqd.md#who-may-use-the-api); that is no protection from anything but browsers.
+
 ### Endpoints
 
 **Jobs:**
@@ -457,12 +460,14 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`    | `/api/jobs/{id}/events`  | Job event history                 |
 | `GET`    | `/api/jobs/{id}/runs`    | Job run history                   |
 | `GET`    | `/api/jobs/{id}/progress` | Progress of the job's active runs |
+| `POST`   | `/api/jobs/by-ids`       | Several jobs (`{"ids": [...]}`, up to 100) |
+| `POST`   | `/api/runs/by-jobs`      | The last runs of several jobs (`{"job_ids": [...], "limit": 20}`) |
 
 **Workflows:**
 
 | Method | Path                         | Description              |
 | ------ | ---------------------------- | ------------------------ |
-| `GET`  | `/api/workflows`             | List workflows           |
+| `GET`  | `/api/workflows`             | List workflows (`?view=summary` without definitions, inputs and outputs) |
 | `GET`  | `/api/workflows/{id}`        | Get workflow details     |
 | `POST` | `/api/workflows/{id}/cancel` | Cancel workflow          |
 | `POST` | `/api/workflows/{id}/retry`  | Retry from failure point |
@@ -476,7 +481,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 
 | Method | Path                                 | Description            |
 | ------ | ------------------------------------ | ---------------------- |
-| `GET`  | `/api/batches`                       | List batches           |
+| `GET`  | `/api/batches`                       | List batches (`?view=summary` without their items) |
 | `GET`  | `/api/batches/{id}`                  | Get batch details      |
 | `GET`  | `/api/batches/{id}/results`          | List item results      |
 | `GET`  | `/api/batches/{id}/results/{itemId}` | Get single item result |
@@ -519,7 +524,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | -------- | --------------------------- | ---------------------------------- |
 | `GET`    | `/api/stats`                | Cluster stats                      |
 | `GET`    | `/api/stats/daily`          | Daily aggregated statistics        |
-| `GET`    | `/api/nodes`                | Worker nodes                       |
+| `GET`    | `/api/nodes`                | Worker nodes, and whether they are `draining` |
 | `GET`    | `/api/nodes/{id}`           | A worker node                      |
 | `GET`    | `/api/schedules`            | Active schedules                   |
 | `GET`    | `/api/schedules/{jobId}`    | The schedule of a job              |
@@ -529,8 +534,8 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`    | `/api/dlq`                  | Dead letter queue                  |
 | `GET`    | `/api/history/runs`         | Historical runs (filterable)       |
 | `DELETE` | `/api/history/runs`         | Remove runs (`?older_than=720h`)   |
-| `GET`    | `/api/history/events`       | Historical events                  |
-| `GET`    | `/api/runs`                 | Active runs                        |
+| `GET`    | `/api/history/events`       | Historical events (`?job_id=` of one job; `?total=false` does not count them all) |
+| `GET`    | `/api/runs`                 | Active runs (`?job_ids=a,b` and `?limit=`) |
 | `GET`    | `/api/runs/{id}`            | A run, active or finished          |
 | `GET`    | `/api/runs/{id}/progress`   | Progress of a run                  |
 | `POST`   | `/api/runs/{id}/requeue`    | Queue a stuck run again            |
@@ -554,15 +559,21 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | --------- | -------------------------------------------------- |
 | `/api/ws` | Real-time event stream (all domain events as JSON) |
 
+With `/api/ws?v=2`, a client also gets `{"type":"ws.heartbeat"}` at once and every 15 seconds, so that it knows a dead connection from a quiet one, and `{"type":"ws.resync"}` if it has missed events, because it was too slow or Redis was away for longer than the event stream reaches back. Then it has to read again what it shows.
+
+An event comes after what it stands for: whoever reads the job on `job.completed`, or its runs on `job.failed`, finds the new state.
+
 ## Event Types
 
 | Category     | Events |
 | ------------ | ------ |
-| **Job**      | `dispatched`, `started`, `completed`, `failed`, `retrying`, `dead`, `cancelled`, `paused`, `resumed`, `auto_recovered`, `schedule_to_start_timeout` |
+| **Job**      | `dispatched`, `started`, `completed`, `failed`, `retrying`, `dead`, `cancelled`, `paused`, `resumed`, `updated`, `deleted`, `auto_recovered`, `schedule_to_start_timeout` |
 | **Schedule** | `created`, `removed` |
 | **Workflow** | `started`, `completed`, `failed`, `cancelled`, `timed_out`, `retrying`, `suspended`, `resumed`, `signal.received`, `task.dispatched`, `task.completed`, `task.failed`, `hook.dispatched`, `hook.completed`, `hook.failed` |
 | **Batch**    | `started`, `completed`, `failed`, `cancelled`, `timed_out`, `retrying`, `progress`, `item.completed`, `item.failed`, `onetime.completed`, `onetime.failed` |
 | **Node**     | `crash_detected` |
+
+`job.completed`, `job.failed`, `job.paused` and `job.updated` carry the new `status`, `run_count` and `next_run_at` of the job, and the first three the `duration` of the run.
 
 ## Configuration
 

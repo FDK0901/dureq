@@ -42,6 +42,7 @@ See [configs/config.yaml](../configs/config.yaml) for a fully annotated sample.
 |-------|------|---------|-------------|
 | `dureqd.nodeId` | string | auto | Unique node identifier |
 | `dureqd.apiAddress` | string | `:8080` | HTTP API listen address |
+| `dureqd.allowedOrigins` | []string | none | Origins whose web pages may use the HTTP API beside its own, such as `https://durequi.example.com`; `*` allows all |
 | `dureqd.grpcAddress` | string | `:9090` | gRPC API listen address |
 | `dureqd.concurrency` | int | `100` | Max concurrent handlers |
 | `dureqd.prefix` | string | `dureq` | Redis key prefix |
@@ -140,3 +141,35 @@ gRPC reflection is enabled for tools like `grpcurl`:
 ```bash
 grpcurl -plaintext localhost:9090 list
 ```
+
+### Who may use the API
+
+Neither API has authentication, and both can change state: cancel and delete jobs, pause queues, remove history.
+Authentication is up to what is in front of them. Do not let them be reached without it.
+
+What the HTTP API does by itself is to keep web pages of other origins out, for a browser reaches whatever its user
+reaches. Requests and WebSockets of another origin are answered with 403. Those without an origin, such as of `curl`
+or a server, are not affected.
+
+- **The UI is served by another host, port or scheme than the API:** list its origin.
+
+  ```yaml
+  dureqd:
+    allowedOrigins:
+      - "https://durequi.example.com"
+  ```
+
+- **A proxy serves both as one origin:** it has to pass the host on that it was asked for, as `Host` or
+  `X-Forwarded-Host`. With nginx:
+
+  ```nginx
+  location /api/ {
+      proxy_pass http://dureqd:8080;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;   # $http_host if the port is not the default one
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+  }
+  ```
+
+`"*"` allows every origin, so that any web page can control the cluster through the browser of who looks at it.

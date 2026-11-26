@@ -509,6 +509,99 @@ func (s *RedisStore) JobStatusCounts(ctx context.Context) (map[types.JobStatus]i
 	return counts, nil
 }
 
+// Counts says how many there are of what is not jobs.
+type Counts struct {
+	Schedules  int
+	ActiveRuns int
+	Workflows  map[types.WorkflowStatus]int // by status, without those of which there are none
+	Batches    map[types.WorkflowStatus]int
+}
+
+// Counts returns how many there are, without reading them.
+func (s *RedisStore) Counts(ctx context.Context) (*Counts, error) {
+	statuses := []types.WorkflowStatus{
+		types.WorkflowStatusPending, types.WorkflowStatusRunning, types.WorkflowStatusCompleted,
+		types.WorkflowStatusFailed, types.WorkflowStatusCancelled, types.WorkflowStatusSuspended,
+	}
+	cmds := rueidis.Commands{
+		s.rdb.B().Zcard().Key(SchedulesDueKey(s.prefix)).Build(),
+		s.rdb.B().Scard().Key(RunsActiveKey(s.prefix)).Build(),
+	}
+	for _, st := range statuses {
+		cmds = append(cmds,
+			s.rdb.B().Zcard().Key(WorkflowsByStatusKey(s.prefix, string(st))).Build(),
+			s.rdb.B().Zcard().Key(BatchesByStatusKey(s.prefix, string(st))).Build())
+	}
+	counts := make([]int, len(cmds))
+	for i, r := range s.rdb.DoMulti(ctx, cmds...) {
+		n, err := r.AsInt64()
+		if err != nil {
+			return nil, fmt.Errorf("counts: %w", err)
+		}
+		counts[i] = int(n)
+	}
+	c := &Counts{
+		Schedules: counts[0], ActiveRuns: counts[1],
+		Workflows: make(map[types.WorkflowStatus]int), Batches: make(map[types.WorkflowStatus]int),
+	}
+	for i, st := range statuses {
+		if n := counts[2+2*i]; n > 0 {
+			c.Workflows[st] = n
+		}
+		if n := counts[3+2*i]; n > 0 {
+			c.Batches[st] = n
+		}
+	}
+	return c, nil
+}
+
+// GetJobs returns jobs by their IDs. Those that do not exist are left out.
+func (s *RedisStore) GetJobs(ctx context.Context, ids []string) ([]types.Job, error) {
+	return s.hydrateJobValues(ctx, ids)
+}
+
+// ListActiveRunsOfJobs returns the active runs of jobs.
+func (s *RedisStore) ListActiveRunsOfJobs(ctx context.Context, jobIDs []string) ([]*types.JobRun, error) {
+	cmds := make(rueidis.Commands, 0, len(jobIDs))
+	for _, id := range jobIDs {
+		cmds = append(cmds, s.rdb.B().Smembers().Key(RunsActiveByJobKey(s.prefix, id)).Build())
+	}
+	var runIDs []string
+	for _, r := range s.rdb.DoMulti(ctx, cmds...) {
+		ids, err := r.AsStrSlice()
+		if err != nil {
+			return nil, fmt.Errorf("active runs of jobs: %w", err)
+		}
+		runIDs = append(runIDs, ids...)
+	}
+	return s.hydrateRuns(ctx, runIDs)
+}
+
+// ListRunsOfJobs returns the last finished runs of jobs, newest first, by job ID.
+func (s *RedisStore) ListRunsOfJobs(ctx context.Context, jobIDs []string, limit int) (map[string][]types.JobRun, error) {
+	cmds := make(rueidis.Commands, 0, len(jobIDs))
+	for _, id := range jobIDs {
+		cmds = append(cmds, s.rdb.B().Zrevrange().Key(HistoryRunsByJobKey(s.prefix, id)).Start(0).Stop(int64(limit)-1).Build())
+	}
+	var runIDs []string
+	for _, r := range s.rdb.DoMulti(ctx, cmds...) {
+		ids, err := r.AsStrSlice()
+		if err != nil {
+			return nil, fmt.Errorf("runs of jobs: %w", err)
+		}
+		runIDs = append(runIDs, ids...)
+	}
+	runs, err := s.hydrateRunValues(ctx, runIDs)
+	if err != nil {
+		return nil, err
+	}
+	byJob := make(map[string][]types.JobRun, len(jobIDs))
+	for _, run := range runs {
+		byJob[run.JobID] = append(byJob[run.JobID], run)
+	}
+	return byJob, nil
+}
+
 // GetActiveJobStats returns aggregated counts by job status (alias for monitor API).
 func (s *RedisStore) GetActiveJobStats(ctx context.Context) (map[types.JobStatus]int, error) {
 	return s.JobStatusCounts(ctx)
@@ -880,12 +973,22 @@ func (s *RedisStore) ListNodes(ctx context.Context) ([]*types.NodeInfo, error) {
 		return nil, fmt.Errorf("list node IDs: %w", err)
 	}
 
+	cmds := make(rueidis.Commands, 0, 2*len(ids))
+	for _, id := range ids {
+		cmds = append(cmds,
+			s.rdb.B().Hgetall().Key(NodeKey(s.prefix, id)).Build(),
+			s.rdb.B().Get().Key(NodeDrainKey(s.prefix, id)).Build())
+	}
+	results := s.rdb.DoMulti(ctx, cmds...)
+
 	var nodes []*types.NodeInfo
 	var staleIDs []string
-
-	for _, id := range ids {
-		result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(NodeKey(s.prefix, id)).Build()).AsStrMap()
-		if err != nil || len(result) == 0 {
+	for i, id := range ids {
+		result, err := results[2*i].AsStrMap()
+		if err != nil {
+			continue
+		}
+		if len(result) == 0 {
 			staleIDs = append(staleIDs, id)
 			continue
 		}
@@ -893,6 +996,8 @@ func (s *RedisStore) ListNodes(ctx context.Context) ([]*types.NodeInfo, error) {
 		if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &node); err != nil {
 			continue
 		}
+		drain, _ := results[2*i+1].ToString()
+		node.Draining = drain == "1"
 		nodes = append(nodes, &node)
 	}
 
@@ -1523,23 +1628,50 @@ func (s *RedisStore) ListBatchItemResults(ctx context.Context, batchID string) (
 // DLQ operations
 // ============================================================
 
-// ListDLQ reads recent messages from the DLQ stream.
-func (s *RedisStore) ListDLQ(ctx context.Context, limit int) ([]*types.WorkMessage, error) {
+// CountDLQ returns how many messages are in the DLQ stream.
+func (s *RedisStore) CountDLQ(ctx context.Context) (int, error) {
+	n, err := s.rdb.Do(ctx, s.rdb.B().Xlen().Key(DLQStreamKey(s.prefix)).Build()).AsInt64()
+	if err != nil {
+		return 0, fmt.Errorf("count DLQ: %w", err)
+	}
+	return int(n), nil
+}
+
+// dlqChunkSize is how many messages are read at once to get to a page of the DLQ.
+const dlqChunkSize = 500
+
+// ListDLQPage reads a page of the DLQ stream, newest first.
+func (s *RedisStore) ListDLQPage(ctx context.Context, limit, offset int) ([]*types.WorkMessage, error) {
 	if limit <= 0 {
 		limit = 50
 	}
-
-	msgs, err := s.rdb.Do(ctx, s.rdb.B().Xrevrange().Key(DLQStreamKey(s.prefix)).End("+").Start("-").Count(int64(limit)).Build()).AsXRange()
-	if err != nil {
-		return nil, fmt.Errorf("list DLQ: %w", err)
-	}
-
 	var result []*types.WorkMessage
-	for _, msg := range msgs {
-		wm := WorkMessageFromStreamValues(msg.FieldValues)
-		result = append(result, &wm)
+	end := "+"
+	for skip := offset; len(result) < limit; {
+		count := min(skip+limit-len(result), dlqChunkSize)
+		msgs, err := s.rdb.Do(ctx, s.rdb.B().Xrevrange().Key(DLQStreamKey(s.prefix)).End(end).Start("-").Count(int64(count)).Build()).AsXRange()
+		if err != nil {
+			return nil, fmt.Errorf("list DLQ: %w", err)
+		}
+		for _, msg := range msgs {
+			if skip > 0 {
+				skip--
+				continue
+			}
+			wm := WorkMessageFromStreamValues(msg.FieldValues)
+			result = append(result, &wm)
+		}
+		if len(msgs) < count {
+			break
+		}
+		end = "(" + msgs[len(msgs)-1].ID
 	}
 	return result, nil
+}
+
+// ListDLQ reads recent messages from the DLQ stream.
+func (s *RedisStore) ListDLQ(ctx context.Context, limit int) ([]*types.WorkMessage, error) {
+	return s.ListDLQPage(ctx, limit, 0)
 }
 
 // ============================================================

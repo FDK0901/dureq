@@ -8,6 +8,7 @@ type Config struct {
 type DureqdConfig struct {
 	NodeID         string   `koanf:"nodeId"`
 	ApiAddress     string   `koanf:"apiAddress"`
+	AllowedOrigins []string `koanf:"allowedOrigins"`
 	GrpcAddress    string   `koanf:"grpcAddress"`
 	Concurrency    int      `koanf:"concurrency"`
 	Prefix         string   `koanf:"prefix"`

@@ -80,7 +80,12 @@ Use before rolling deployments.
 
 `dureqd` serves the monitoring API, in every mode. A server of your own does not; build endpoints on
 `dureq.NewAPIService`, which has the same calls. It has no authentication: see
-[Who may use the API](dureqd.md#who-may-use-the-api). Key route groups:
+[Who may use the API](dureqd.md#who-may-use-the-api).
+
+The gRPC API has fewer calls than the HTTP API. It has no payload search, no result of a workflow task and no name
+filter of workflows and batches, and its nodes do not say whether they are draining.
+
+Key route groups:
 
 ### Jobs
 
@@ -139,8 +144,8 @@ Search by payload JSONPath: `GET /api/search/{jobs,workflows,batches}?path=field
 and cancelled jobs), `status` (repeatable) and `limit` (10 by default, 100 at most).
 
 Payload search needs RedisJSON (`JSON.GET`). Without it, all four searches answer 501 with
-`{"error": "payload search needs RedisJSON (JSON.GET), which this Redis does not have"}`, and gRPC `Unimplemented`;
-no match is 404 for one, and an empty page for all.
+`{"error": "payload search needs RedisJSON (JSON.GET), which this Redis does not have"}`. With it, no match is 404
+for the searches of the newest one, and an empty page for `/api/search/jobs/all`.
 
 `GET /api/jobs?search=text` finds jobs by a part of their ID or task type. It reads the jobs one by one, up to
 100,000 of them, so narrow it down with `status`, `task_type` or `tag` if there are many.

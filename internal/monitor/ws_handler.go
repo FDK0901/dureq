@@ -14,7 +14,12 @@ const (
 	wsWriteTimeout = 10 * time.Second
 )
 
-var wsHeartbeat = 15 * time.Second
+var (
+	wsHeartbeat = 15 * time.Second
+	// wsResyncAfter is how long a client that has missed events may take to catch up before it
+	// is told so all the same.
+	wsResyncAfter = 5 * time.Second
+)
 
 // Messages that a client gets beside events if it asks for them, with ?v=2.
 var (
@@ -107,6 +112,7 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 		}
 
 		// Write pump — forwards events from hub to WebSocket connection.
+		var behind time.Time // since when it has missed events and not caught up
 		var heartbeat <-chan time.Time
 		if v2 {
 			ticker := time.NewTicker(wsHeartbeat)
@@ -138,9 +144,26 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 					return
 				}
 			}
-			// Once it has caught up, it is told that it has missed some.
-			if v2 && len(client.Send) == 0 && client.Missed() && !write(wsResyncMsg) {
-				return
+			// Once it has caught up, it is told that it has missed some. One that does not
+			// catch up in wsResyncAfter is told all the same, and what is queued for it is
+			// dropped: it is to read everything again anyway.
+			if v2 && client.missed.Load() {
+				caughtUp := len(client.Send) == 0
+				if !caughtUp && behind.IsZero() {
+					behind = time.Now()
+				}
+				if !caughtUp && time.Since(behind) >= wsResyncAfter {
+					for n := len(client.Send); n > 0; n-- {
+						<-client.Send
+					}
+					caughtUp = true
+				}
+				if caughtUp {
+					behind = time.Time{}
+					if client.Missed() && !write(wsResyncMsg) {
+						return
+					}
+				}
 			}
 		}
 	}

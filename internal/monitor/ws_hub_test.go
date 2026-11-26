@@ -505,3 +505,74 @@ func shorten(d *time.Duration, v time.Duration) func() {
 	*d = v
 	return func() { *d = old }
 }
+
+// smallBuffers keeps little of what is sent on the connections that it accepts, so that a
+// client that does not read soon holds the writer up.
+type smallBuffers struct{ net.Listener }
+
+func (l smallBuffers) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetWriteBuffer(8 << 10)
+	}
+	return c, err
+}
+
+// A client that has missed events and does not catch up, as events keep coming faster than it
+// reads, is told so all the same.
+func TestWebSocket_SlowClientIsToldInTime(t *testing.T) {
+	defer shorten(&wsResyncAfter, 300*time.Millisecond)()
+	st, _ := newTestAPI(t, nil)
+	api := NewAPI(st, nil, nil)
+	t.Cleanup(api.Shutdown)
+	srv := httptest.NewUnstartedServer(api.Handler())
+	srv.Listener = smallBuffers{srv.Listener}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	dialer := &net.Dialer{}
+	conn, _, err := websocket.Dial(context.Background(), "ws"+strings.TrimPrefix(srv.URL, "http")+"/api/ws?v=2", &websocket.DialOptions{
+		HTTPClient: &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := dialer.DialContext(ctx, network, addr)
+			if tc, ok := c.(*net.TCPConn); ok {
+				tc.SetReadBuffer(8 << 10)
+			}
+			return c, err
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	conn.SetReadLimit(1 << 20)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	t.Cleanup(func() { cancel(); wg.Wait() })
+	wg.Go(func() {
+		big := types.TaskType(strings.Repeat("x", 1000))
+		for i := 0; ctx.Err() == nil; i++ {
+			st.PublishEvent(ctx, types.JobEvent{Type: types.EventJobStarted, JobID: fmt.Sprint(i), TaskType: big, Timestamp: time.Now()})
+			if i%50 == 0 {
+				time.Sleep(50 * time.Millisecond) // about a thousand a second
+			}
+		}
+	})
+
+	start := time.Now()
+	events := 0
+	for time.Since(start) < 15*time.Second {
+		rctx, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, msg, err := conn.Read(rctx)
+		rcancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(msg) == string(wsResyncMsg) {
+			t.Logf("told after %v and %d events", time.Since(start).Round(time.Millisecond), events)
+			return
+		}
+		events++
+		time.Sleep(20 * time.Millisecond) // reads fifty a second
+	}
+	t.Fatalf("not told in 15 seconds, after %d events", events)
+}

@@ -18,10 +18,16 @@ const (
 	wsSendBufferSize = 256
 
 	hubReadCount   = 500
-	hubReadBlock   = 5 * time.Second
 	hubMinBackoff  = 100 * time.Millisecond
 	hubMaxBackoff  = 10 * time.Second
 	hubCallTimeout = 10 * time.Second
+)
+
+var (
+	hubReadBlock = 5 * time.Second
+	// hubReadSlack is how much longer than hubReadBlock Redis may take to answer a read. If it
+	// takes longer, the connection is given up, and the hub is taken not to hear from Redis.
+	hubReadSlack = 5 * time.Second
 )
 
 // WSClient represents a single WebSocket connection registered with the Hub.
@@ -51,10 +57,24 @@ type Hub interface {
 	SubscribeRedis(ctx context.Context, rdb rueidis.Client, channel string)
 }
 
+// HubHealth is what the hub of NewAPIService tells beside Hub, of how it reads the events.
+// A handler that sends its clients heartbeats is to stop when the hub is stalled, for they would
+// say that events come when none do:
+//
+//	if h, ok := svc.Hub().(dureq.HubHealth); ok && h.Stalled() { ... }
+type HubHealth interface {
+	// Stalled reports whether events are not being read, because Redis has not answered the
+	// hub for longer than a read takes. It is false once Redis answers again.
+	Stalled() bool
+}
+
 type hub struct {
 	mu      sync.RWMutex
 	clients map[*WSClient]struct{}
 	logger  chainedlog.Logger
+
+	following atomic.Bool  // it follows the event stream
+	heard     atomic.Int64 // when Redis last answered it, in Unix nanoseconds
 }
 
 func newHub(logger chainedlog.Logger) *hub {
@@ -107,6 +127,15 @@ func (h *hub) ClientCount() int {
 	return len(h.clients)
 }
 
+// Stalled reports whether the hub follows the event stream and Redis has not answered it for
+// longer than a read takes.
+func (h *hub) Stalled() bool {
+	return h.following.Load() && time.Since(time.Unix(0, h.heard.Load())) > hubReadBlock+hubReadSlack
+}
+
+// answered notes that Redis has answered.
+func (h *hub) answered() { h.heard.Store(time.Now().UnixNano()) }
+
 // SubscribeRedis subscribes to the Redis Pub/Sub events channel and
 // broadcasts every received message to all connected WebSocket clients, until ctx ends.
 func (h *hub) SubscribeRedis(ctx context.Context, rdb rueidis.Client, channel string) {
@@ -120,8 +149,11 @@ func (h *hub) SubscribeRedis(ctx context.Context, rdb rueidis.Client, channel st
 }
 
 // follow broadcasts every event that is appended to the event stream, until ctx ends. If Redis
-// fails it goes on where it was. Unlike Pub/Sub, a stream has a memory.
+// fails, or does not answer, it goes on where it was. Unlike Pub/Sub, a stream has a memory.
 func (h *hub) follow(ctx context.Context, rdb rueidis.Client, streamKey string) {
+	h.answered()
+	h.following.Store(true)
+	defer h.following.Store(false)
 	last := "" // the last event that was read
 	h.retry(ctx, "reader", func() error {
 		if last == "" {
@@ -129,6 +161,7 @@ func (h *hub) follow(ctx context.Context, rdb rueidis.Client, streamKey string) 
 			if err != nil {
 				return err
 			}
+			h.answered()
 			last = id
 		}
 		// What has been trimmed in the meantime was not read.
@@ -137,15 +170,17 @@ func (h *hub) follow(ctx context.Context, rdb rueidis.Client, streamKey string) 
 		} else if first.after(parseEventID(last)) && last != "0-0" {
 			h.missed()
 		}
+		h.answered()
 		for ctx.Err() == nil {
-			cmd := rdb.B().Xread().Count(hubReadCount).Block(hubReadBlock.Milliseconds()).Streams().Key(streamKey).Id(last).Build()
-			streams, err := rdb.Do(ctx, cmd).AsXRead()
+			streams, err := readEvents(ctx, rdb, streamKey, last)
 			if rueidis.IsRedisNil(err) {
+				h.answered()
 				continue
 			}
 			if err != nil {
 				return err
 			}
+			h.answered()
 			for _, entry := range streams[streamKey] {
 				if data := entry.FieldValues["data"]; data != "" {
 					h.Broadcast([]byte(data))
@@ -203,6 +238,23 @@ func parseEventID(s string) eventID {
 	id.ms, _ = strconv.ParseUint(ms, 10, 64)
 	id.seq, _ = strconv.ParseUint(seq, 10, 64)
 	return id
+}
+
+// readEvents waits for the events after last, as long as hubReadBlock. A connection can stay
+// open and not answer, such as one to a proxy whose own connection to Redis is gone. A read that
+// is not answered in time gives it up, and the next one is made on another.
+func readEvents(ctx context.Context, rdb rueidis.Client, streamKey, last string) (map[string][]rueidis.XRangeEntry, error) {
+	// Not a deadline: with one, rueidis waits for the connection's deadline even if ctx ends.
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	timer := time.AfterFunc(hubReadBlock+hubReadSlack, cancel)
+	defer timer.Stop()
+	cmd := rdb.B().Xread().Count(hubReadCount).Block(hubReadBlock.Milliseconds()).Streams().Key(streamKey).Id(last).Build()
+	streams, err := rdb.Do(readCtx, cmd).AsXRead()
+	if err != nil && ctx.Err() == nil && readCtx.Err() != nil && !rueidis.IsRedisNil(err) {
+		return nil, fmt.Errorf("read events: no answer in %v: %w", hubReadBlock+hubReadSlack, err)
+	}
+	return streams, err
 }
 
 func lastEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (string, error) {

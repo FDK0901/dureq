@@ -12,7 +12,13 @@ import (
 const (
 	wsPingInterval = 30 * time.Second
 	wsWriteTimeout = 10 * time.Second
-	wsHeartbeat    = 15 * time.Second
+)
+
+var (
+	wsHeartbeat = 15 * time.Second
+	// wsResyncAfter is how long a client that has missed events may take to catch up before it
+	// is told so all the same.
+	wsResyncAfter = 5 * time.Second
 )
 
 // Messages that a client gets beside events if it asks for them, with ?v=2.
@@ -24,11 +30,27 @@ var (
 	wsResyncMsg = []byte(`{"type":"ws.resync"}`)
 )
 
+const wsStalledReason = "events are not being read: Redis does not answer"
+
 // HandleWebSocket returns an http.HandlerFunc that upgrades connections to
 // WebSocket and streams real-time events from the Hub. Whether a web page of another origin
 // may connect is up to whoever serves it.
+//
+// A heartbeat says that events come as they happen. If the hub is stalled (HubHealth), a client
+// with ?v=2 gets none: it is not let in (503), and one that is in is closed with 1013 (try again
+// later) when its next heartbeat is due.
 func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
+	stalled := func() bool {
+		h, ok := hub.(HubHealth)
+		return ok && h.Stalled()
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		v2 := r.URL.Query().Get("v") == "2"
+		if v2 && stalled() {
+			w.Header().Set("Retry-After", "5")
+			writeServiceError(w, &ApiError{Msg: wsStalledReason, StatusCode: http.StatusServiceUnavailable})
+			return
+		}
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
 			InsecureSkipVerify: true, // see originGuard
 		})
@@ -90,7 +112,7 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 		}
 
 		// Write pump — forwards events from hub to WebSocket connection.
-		v2 := r.URL.Query().Get("v") == "2"
+		var behind time.Time // since when it has missed events and not caught up
 		var heartbeat <-chan time.Time
 		if v2 {
 			ticker := time.NewTicker(wsHeartbeat)
@@ -114,13 +136,34 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 					return
 				}
 			case <-heartbeat:
+				if stalled() {
+					conn.Close(websocket.StatusTryAgainLater, wsStalledReason)
+					return
+				}
 				if !write(wsHeartbeatMsg) {
 					return
 				}
 			}
-			// Once it has caught up, it is told that it has missed some.
-			if v2 && len(client.Send) == 0 && client.Missed() && !write(wsResyncMsg) {
-				return
+			// Once it has caught up, it is told that it has missed some. One that does not
+			// catch up in wsResyncAfter is told all the same, and what is queued for it is
+			// dropped: it is to read everything again anyway.
+			if v2 && client.missed.Load() {
+				caughtUp := len(client.Send) == 0
+				if !caughtUp && behind.IsZero() {
+					behind = time.Now()
+				}
+				if !caughtUp && time.Since(behind) >= wsResyncAfter {
+					for n := len(client.Send); n > 0; n-- {
+						<-client.Send
+					}
+					caughtUp = true
+				}
+				if caughtUp {
+					behind = time.Time{}
+					if client.Missed() && !write(wsResyncMsg) {
+						return
+					}
+				}
 			}
 		}
 	}

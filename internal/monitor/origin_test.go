@@ -62,3 +62,55 @@ func TestOrigins(t *testing.T) {
 		}
 	}
 }
+
+// With DNS rebinding a web page reaches the API under a name of its own, and its requests are of
+// the same origin. Only the hosts that are allowed are answered, if any are.
+func TestHosts(t *testing.T) {
+	st, _ := newTestAPI(t, nil)
+	serve := func(hosts ...string) http.Handler {
+		api := NewAPI(st, nil, nil)
+		t.Cleanup(api.Shutdown)
+		if err := api.AllowHosts(hosts); err != nil {
+			t.Fatal(err)
+		}
+		return api.Handler()
+	}
+	rebound := map[string]string{"Origin": "http://rebind.evil.example:8080", "Sec-Fetch-Site": "same-origin"}
+	all, some := serve(), serve("localhost", "dureq.internal:8080", "[::1]", "Proxy.Example.com")
+	for _, tc := range []struct {
+		name    string
+		h       http.Handler
+		host    string
+		headers map[string]string
+		want    int
+	}{
+		{"rebound, no hosts listed", all, "rebind.evil.example:8080", rebound, 200},
+		{"rebound", some, "rebind.evil.example:8080", rebound, 403},
+		{"rebound websocket", some, "rebind.evil.example:8080", map[string]string{"Upgrade": "websocket", "Connection": "Upgrade", "Sec-Fetch-Site": "same-origin"}, 403},
+		{"name with any port", some, "localhost:8080", nil, 200},
+		{"name without a port", some, "localhost", nil, 200},
+		{"name and port", some, "dureq.internal:8080", nil, 200},
+		{"name and another port", some, "dureq.internal:9999", nil, 403},
+		{"IPv6", some, "[::1]:8080", nil, 200},
+		{"case", some, "PROXY.example.COM", nil, 200},
+		{"behind a proxy", some, "localhost:8080", map[string]string{"X-Forwarded-Host": "proxy.example.com"}, 200},
+		{"behind a proxy, asked for another host", some, "localhost:8080", map[string]string{"X-Forwarded-Host": "rebind.evil.example, localhost"}, 403},
+		{"proxy that does not pass the host on", some, "dureqd:8080", map[string]string{"X-Forwarded-Host": "proxy.example.com"}, 403},
+	} {
+		r := httptest.NewRequest("POST", "http://placeholder/api/queues/normal/pause", nil)
+		r.Host = tc.host
+		for k, v := range tc.headers {
+			r.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		tc.h.ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Errorf("%s: %d, want %d", tc.name, w.Code, tc.want)
+		}
+	}
+	for _, bad := range []string{"http://dureq.internal", "dureq.internal/api", "", ":8080", "a b"} {
+		if _, err := newHostGuard([]string{bad}); err == nil {
+			t.Errorf("host %q is accepted", bad)
+		}
+	}
+}

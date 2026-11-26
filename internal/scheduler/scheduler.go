@@ -579,8 +579,9 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 			continue
 		}
 
-		// Publish crash detection event.
-		s.dispatcher.PublishEvent(types.JobEvent{
+		// The events are published once the run is out of the active runs and the job is
+		// saved, so that whoever reads the job or its runs on one finds what it says.
+		crashed := types.JobEvent{
 			Type:           types.EventNodeCrashDetected,
 			JobID:          run.JobID,
 			RunID:          run.ID,
@@ -588,25 +589,36 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 			Error:          &errMsg,
 			Timestamp:      now,
 			AffectedRunIDs: []string{run.ID},
-		})
+		}
+		var ended *types.JobEvent
+		// endedAs is the event of what has become of the job; saved says whether the job was
+		// saved so, and the event carries its state then.
+		endedAs := func(e types.JobEvent, saved bool) {
+			if saved {
+				e.SetJob(job)
+			}
+			ended = &e
+		}
 
 		if job.WorkflowID != nil || job.BatchID != nil {
 			// Workflow/batch job: publish failure event so the orchestrator handles retry.
+			saved := true
 			if job.Status == types.JobStatusRunning {
 				job.Status = types.JobStatusFailed
 				job.LastError = &errMsg
 				job.UpdatedAt = now
-				s.store.UpdateJob(ctx, job, rev)
+				_, err := s.store.UpdateJob(ctx, job, rev)
+				saved = err == nil
 			}
 
-			s.dispatcher.PublishEvent(types.JobEvent{
+			endedAs(types.JobEvent{
 				Type:      types.EventJobFailed,
 				JobID:     run.JobID,
 				RunID:     run.ID,
 				NodeID:    run.NodeID,
 				Error:     &errMsg,
 				Timestamp: now,
-			})
+			}, saved)
 		} else {
 			// Standalone job: check retry policy and auto-redispatch.
 			retryPolicy := job.RetryPolicy
@@ -640,6 +652,7 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 				newRev, updateErr := s.store.UpdateJob(ctx, job, rev)
 				if updateErr != nil {
 					s.logger.Error().String("job_id", run.JobID).Err(updateErr).Msg("scheduler: failed to update orphaned job for auto-recovery")
+					s.dispatcher.PublishEvent(crashed)
 					continue
 				}
 				// It is the same operation as the lost run, whose message may yet be
@@ -656,10 +669,13 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 					job.Attempt = prevAttempt
 					job.UpdatedAt = time.Now()
 					s.store.UpdateJob(ctx, job, newRev)
+					s.dispatcher.PublishEvent(crashed)
 					continue
 				}
 
-				s.dispatcher.PublishEvent(types.JobEvent{
+				// It does not carry the job's state: by the time it is published, the job
+				// may be running again.
+				endedAs(types.JobEvent{
 					Type:      types.EventJobAutoRecovered,
 					JobID:     run.JobID,
 					RunID:     run.ID,
@@ -667,7 +683,7 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 					Error:     &errMsg,
 					Attempt:   job.Attempt,
 					Timestamp: now,
-				})
+				}, false)
 
 				s.logger.Info().String("job_id", run.JobID).Int("attempt", job.Attempt).Msg("scheduler: auto-recovered orphaned job")
 
@@ -679,12 +695,13 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 				job.Attempt = 0
 				job.LastError = &errMsg
 				job.UpdatedAt = now
-				if _, err := s.store.UpdateJob(ctx, job, rev); err != nil {
+				_, err := s.store.UpdateJob(ctx, job, rev)
+				if err != nil {
 					s.logger.Error().String("job_id", run.JobID).Err(err).Msg("scheduler: failed to put job with exhausted firing back on its schedule")
 				}
 				s.dispatcher.DispatchToDLQ(ctx, &failed, errMsg)
 
-				s.dispatcher.PublishEvent(types.JobEvent{
+				endedAs(types.JobEvent{
 					Type:      types.EventJobFailed,
 					JobID:     run.JobID,
 					RunID:     run.ID,
@@ -693,25 +710,26 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 					Attempt:   attempt,
 					Error:     &errMsg,
 					Timestamp: now,
-				})
+				}, err == nil)
 
 			default:
 				// Retries exhausted.
 				job.Status = types.JobStatusDead
 				job.LastError = &errMsg
 				job.UpdatedAt = now
-				if _, err := s.store.UpdateJob(ctx, job, rev); err == nil {
+				_, err := s.store.UpdateJob(ctx, job, rev)
+				if err == nil {
 					s.releaseEndedJobUniqueKey(ctx, job.ID)
 				}
 
-				s.dispatcher.PublishEvent(types.JobEvent{
+				endedAs(types.JobEvent{
 					Type:      types.EventJobDead,
 					JobID:     run.JobID,
 					RunID:     run.ID,
 					NodeID:    run.NodeID,
 					Error:     &errMsg,
 					Timestamp: now,
-				})
+				}, err == nil)
 			}
 		}
 
@@ -726,6 +744,11 @@ func (s *Scheduler) checkOrphanedRuns(ctx context.Context) {
 
 		// Clean up the orphaned run entry.
 		s.store.DeleteRun(ctx, run.ID)
+
+		s.dispatcher.PublishEvent(crashed)
+		if ended != nil {
+			s.dispatcher.PublishEvent(*ended)
+		}
 	}
 
 	// Clean up persistent drain keys for dead nodes.

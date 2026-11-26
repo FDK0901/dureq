@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -101,5 +102,87 @@ func TestEvents_ComeAfterTheirEffects(t *testing.T) {
 	}
 	for msg, n := range count {
 		t.Errorf("%d x %s", n, msg)
+	}
+}
+
+// The same for whoever reads the event stream, as the hub of the monitor does: on job.completed
+// and job.failed the job, its result and its runs are as the event says.
+func TestEvents_ComeAfterTheirEffects_InTheStream(t *testing.T) {
+	const n = 300
+	_, cli := startTiered(t, 20, nil,
+		types.HandlerDefinition{TaskType: "works", Handler: func(context.Context, json.RawMessage) error { return nil }},
+		types.HandlerDefinition{TaskType: "fails", Handler: func(context.Context, json.RawMessage) error { return errors.New("no") }})
+	st := cli.Store()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	key := store.EventsStreamKey(st.Prefix())
+	var mu sync.Mutex
+	problems := map[string]int{}
+	var seen atomic.Int64
+	note := func(s string) { mu.Lock(); problems[s]++; mu.Unlock() }
+	read := make(chan struct{})
+	go func() {
+		defer close(read)
+		last := "$"
+		for ctx.Err() == nil {
+			streams, err := st.Client().Do(ctx, st.Client().B().Xread().Count(500).Block(1000).Streams().Key(key).Id(last).Build()).AsXRead()
+			if err != nil {
+				continue
+			}
+			for _, e := range streams[key] {
+				last = e.ID
+				var ev types.JobEvent
+				if json.Unmarshal([]byte(e.FieldValues["data"]), &ev) != nil {
+					continue
+				}
+				if ev.Type != types.EventJobCompleted && ev.Type != types.EventJobFailed {
+					continue
+				}
+				// read at once, as a UI that patches by ID would
+				job, _, err := st.GetJob(ctx, ev.JobID)
+				if err != nil {
+					note("get job: " + err.Error())
+				} else {
+					want := types.JobStatusCompleted
+					if ev.Type == types.EventJobFailed {
+						want = types.JobStatusDead
+					}
+					if job.Status != want || job.RunCount == 0 && ev.Type == types.EventJobCompleted {
+						note(fmt.Sprintf("%s: job is %s after %d runs", ev.Type, job.Status, job.RunCount))
+					}
+				}
+				if active, _ := st.HasActiveRunForJob(ctx, ev.JobID); active {
+					note(string(ev.Type) + ": run still active")
+				}
+				if runs, _, _ := st.ListJobRuns(ctx, store.RunFilter{JobID: &ev.JobID, Limit: 5}); len(runs) == 0 {
+					note(string(ev.Type) + ": no run in the history")
+				}
+				if ev.Type == types.EventJobCompleted {
+					if r, err := st.GetResult(ctx, ev.JobID); err != nil || r == nil {
+						note("job.completed: no result yet")
+					}
+				}
+				seen.Add(1)
+			}
+		}
+	}()
+	time.Sleep(300 * time.Millisecond)
+	for range n {
+		for taskType, policy := range map[types.TaskType]*types.RetryPolicy{
+			"works": nil,
+			"fails": {MaxAttempts: 1, InitialDelay: time.Second, MaxDelay: time.Second, Multiplier: 1},
+		} {
+			if _, err := cli.EnqueueScheduled(ctx, &client.EnqueueRequest{TaskType: taskType, Payload: json.RawMessage(`{}`), RetryPolicy: policy, Schedule: types.Schedule{Type: types.ScheduleImmediate}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	waitFor(t, 60*time.Second, "events", func() bool { return seen.Load() >= 2*n })
+	cancel()
+	<-read
+	mu.Lock()
+	defer mu.Unlock()
+	for p, c := range problems {
+		t.Errorf("%d x %s", c, p)
 	}
 }

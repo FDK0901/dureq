@@ -43,6 +43,7 @@ See [configs/config.yaml](../configs/config.yaml) for a fully annotated sample.
 | `dureqd.nodeId` | string | auto | Unique node identifier |
 | `dureqd.apiAddress` | string | `:8080` | HTTP API listen address |
 | `dureqd.allowedOrigins` | []string | none | Origins whose web pages may use the HTTP API beside its own, such as `https://durequi.example.com`; `*` allows all |
+| `dureqd.allowedHosts` | []string | all | Hosts that the HTTP API answers, such as `dureq.internal` (any port) or `localhost:8080`; others get 403 |
 | `dureqd.grpcAddress` | string | `:9090` | gRPC API listen address |
 | `dureqd.concurrency` | int | `100` | Max concurrent handlers |
 | `dureqd.prefix` | string | `dureq` | Redis key prefix |
@@ -173,3 +174,20 @@ or a server, are not affected.
   ```
 
 `"*"` allows every origin, so that any web page can control the cluster through the browser of who looks at it.
+
+A web page can also get around the origin check by DNS rebinding: its own name, such as `rebind.attacker.example`,
+comes to point at the address of the API, and to the browser the page and the API are then of the same origin. So:
+
+- **Authentication in front of the API is required**, not only the origin check. A page that rebinds does not have
+  the credentials of the API's own name.
+- **List the hosts that the API is reached by**, so that it answers no other name:
+
+  ```yaml
+  dureqd:
+    allowedHosts:
+      - "dureq.internal"     # any port
+      - "localhost:8080"     # this port only
+  ```
+
+  The host is the `Host` header and, behind a proxy that sets it, `X-Forwarded-Host`; both have to be listed if they
+  differ. By default all hosts are answered, as before. In a server of your own it is `API.AllowHosts`.

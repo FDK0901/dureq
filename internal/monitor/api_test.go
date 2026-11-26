@@ -24,14 +24,7 @@ import (
 // REDIS_PASSWORD) under a unique key prefix. Skips if Redis is unavailable.
 func newTestAPI(t *testing.T, disp Dispatcher) (*store.RedisStore, *httptest.Server) {
 	t.Helper()
-	addr := strings.TrimPrefix(os.Getenv("REDIS_URL"), "redis://")
-	if addr == "" {
-		t.Skip("REDIS_URL not set")
-	}
-	password := os.Getenv("REDIS_PASSWORD")
-	if password == "" {
-		password = "your-password"
-	}
+	addr, password := testRedis(t)
 	rdb, err := rueidis.NewClient(rueidis.ClientOption{InitAddress: []string{addr}, Password: password})
 	if err != nil {
 		t.Skipf("redis unavailable: %v", err)
@@ -52,6 +45,20 @@ func newTestAPI(t *testing.T, disp Dispatcher) (*store.RedisStore, *httptest.Ser
 	srv := httptest.NewServer(api.Handler())
 	t.Cleanup(srv.Close)
 	return st, srv
+}
+
+// testRedis returns the address and password of the test Redis, or skips.
+func testRedis(t *testing.T) (addr, password string) {
+	t.Helper()
+	addr = strings.TrimPrefix(os.Getenv("REDIS_URL"), "redis://")
+	if addr == "" {
+		t.Skip("REDIS_URL not set")
+	}
+	password = os.Getenv("REDIS_PASSWORD")
+	if password == "" {
+		password = "your-password"
+	}
+	return addr, password
 }
 
 // call requests path and decodes the response into out, if it is one of a 2xx.
@@ -837,4 +844,41 @@ func TestWorkflow_TaskNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(*all[0])
+}
+
+// Without RedisJSON payloads cannot be searched, and all searches say so in the same way.
+func TestPayloadSearch_WithoutJSONModule(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	ctx := context.Background()
+	rdb := st.Client()
+	if err := rdb.Do(ctx, rdb.B().JsonSet().Key(st.Prefix()+":probe").Path("$").Value("{}").Build()).Error(); err == nil {
+		t.Skip("this Redis has RedisJSON")
+	}
+	if _, err := st.CreateJob(ctx, &types.Job{ID: "j1", TaskType: "t", Payload: json.RawMessage(`{"a":"b"}`), Status: types.JobStatusPending, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveWorkflow(ctx, &types.WorkflowInstance{ID: "w1", WorkflowName: "w", Status: types.WorkflowStatusRunning, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SaveBatch(ctx, &types.BatchInstance{ID: "b1", Name: "b", Status: types.WorkflowStatusRunning, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/search/jobs", "/api/search/jobs/all", "/api/search/workflows", "/api/search/batches"} {
+		resp, err := http.Get(srv.URL + path + "?path=a&value=b")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var e struct {
+			Error string `json:"error"`
+		}
+		json.NewDecoder(resp.Body).Decode(&e)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotImplemented || !strings.Contains(e.Error, "RedisJSON") {
+			t.Errorf("GET %s: %d %q", path, resp.StatusCode, e.Error)
+		}
+	}
+	// Without path or value it is the request that is wrong.
+	if code := call(t, srv, "GET", "/api/search/jobs/all", nil); code != http.StatusBadRequest {
+		t.Errorf("without path: %d", code)
+	}
 }

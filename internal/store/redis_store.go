@@ -77,15 +77,17 @@ type WorkflowFilter struct {
 	Sort         string // "newest" or "oldest"
 	Limit        int
 	Offset       int
+	SkipTotal    bool // with a name, do not look for what matches past the page
 }
 
 // BatchFilter specifies criteria for listing batch instances.
 type BatchFilter struct {
-	Name   *string
-	Status *types.WorkflowStatus
-	Sort   string // "newest" or "oldest"
-	Limit  int
-	Offset int
+	Name      *string
+	Status    *types.WorkflowStatus
+	Sort      string // "newest" or "oldest"
+	Limit     int
+	Offset    int
+	SkipTotal bool // with a name, do not look for what matches past the page
 }
 
 // JobFilter specifies criteria for listing active jobs.
@@ -952,9 +954,13 @@ func (s *RedisStore) SaveNode(ctx context.Context, node *types.NodeInfo) (uint64
 	return 1, nil
 }
 
-// GetNode retrieves a node by ID, returns nil if not found or TTL expired.
+// GetNode retrieves a node by ID, and whether it is draining, as ListNodes does. It returns
+// nil if not found or TTL expired.
 func (s *RedisStore) GetNode(ctx context.Context, nodeID string) (*types.NodeInfo, error) {
-	result, err := s.rdb.Do(ctx, s.rdb.B().Hgetall().Key(NodeKey(s.prefix, nodeID)).Build()).AsStrMap()
+	results := s.rdb.DoMulti(ctx,
+		s.rdb.B().Hgetall().Key(NodeKey(s.prefix, nodeID)).Build(),
+		s.rdb.B().Get().Key(NodeDrainKey(s.prefix, nodeID)).Build())
+	result, err := results[0].AsStrMap()
 	if err != nil || len(result) == 0 {
 		return nil, nil
 	}
@@ -963,6 +969,8 @@ func (s *RedisStore) GetNode(ctx context.Context, nodeID string) (*types.NodeInf
 	if err := sonic.ConfigFastest.Unmarshal([]byte(result["data"]), &node); err != nil {
 		return nil, fmt.Errorf("unmarshal node: %w", err)
 	}
+	drain, _ := results[1].ToString()
+	node.Draining = drain == "1"
 	return &node, nil
 }
 
@@ -2308,6 +2316,20 @@ func (s *RedisStore) scanIndex(ctx context.Context, indexKey, sort string, chunk
 
 // isUnknownCommandErr reports whether the server does not know the command, e.g.
 // because the module that provides it is not loaded.
+// HasPayloadSearch reports whether Redis can search payloads, which takes JSON.GET of RedisJSON
+// (or of a module like it, such as valkey-json).
+func (s *RedisStore) HasPayloadSearch(ctx context.Context) (bool, error) {
+	err := s.rdb.Do(ctx, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, "")).Path("$").Build()).Error()
+	switch {
+	case err == nil || rueidis.IsRedisNil(err):
+		return true, nil
+	case isUnknownCommandErr(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 func isUnknownCommandErr(err error) bool {
 	var redisErr *rueidis.RedisError
 	return errors.As(err, &redisErr) && strings.Contains(strings.ToLower(redisErr.Error()), "unknown command")

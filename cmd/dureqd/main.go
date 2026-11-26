@@ -110,6 +110,9 @@ func main() {
 	if err := api.AllowOrigins(cfg.DureqdConfig.AllowedOrigins); err != nil {
 		logger.Fatal().Err(err).Msg("invalid allowedOrigins")
 	}
+	if err := api.AllowHosts(cfg.DureqdConfig.AllowedHosts); err != nil {
+		logger.Fatal().Err(err).Msg("invalid allowedHosts")
+	}
 	if w := srv.Worker(); w != nil {
 		api.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
 	}

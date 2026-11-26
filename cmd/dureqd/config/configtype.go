@@ -9,6 +9,7 @@ type DureqdConfig struct {
 	NodeID         string   `koanf:"nodeId"`
 	ApiAddress     string   `koanf:"apiAddress"`
 	AllowedOrigins []string `koanf:"allowedOrigins"`
+	AllowedHosts   []string `koanf:"allowedHosts"` // hosts that the HTTP API answers; empty = all
 	GrpcAddress    string   `koanf:"grpcAddress"`
 	Concurrency    int      `koanf:"concurrency"`
 	Prefix         string   `koanf:"prefix"`

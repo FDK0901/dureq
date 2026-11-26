@@ -138,6 +138,10 @@ Search by payload JSONPath: `GET /api/search/{jobs,workflows,batches}?path=field
 `{"data": [...], "has_more": false}`. Narrow it down with `task_type`, `live=true` (leaves out completed, dead
 and cancelled jobs), `status` (repeatable) and `limit` (10 by default, 100 at most).
 
+Payload search needs RedisJSON (`JSON.GET`). Without it, all four searches answer 501 with
+`{"error": "payload search needs RedisJSON (JSON.GET), which this Redis does not have"}`, and gRPC `Unimplemented`;
+no match is 404 for one, and an empty page for all.
+
 `GET /api/jobs?search=text` finds jobs by a part of their ID or task type. It reads the jobs one by one, up to
 100,000 of them, so narrow it down with `status`, `task_type` or `tag` if there are many.
 

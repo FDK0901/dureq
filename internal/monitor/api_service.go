@@ -432,6 +432,13 @@ func (a *APIService) ListWorkflows(ctx context.Context, filter store.WorkflowFil
 	return a.store.ListWorkflowInstances(ctx, filter)
 }
 
+// ListWorkflowsPage is ListWorkflows, and also reports whether some workflows were not looked
+// at, so that there may be more that match than total (see store.WorkflowFilter.SkipTotal and
+// store.RedisStoreConfig.MaxNameScan).
+func (a *APIService) ListWorkflowsPage(ctx context.Context, filter store.WorkflowFilter) ([]types.WorkflowInstance, int, bool, error) {
+	return a.store.ListWorkflowInstancesPage(ctx, filter)
+}
+
 func (a *APIService) GetWorkflow(ctx context.Context, wfID string) (*types.WorkflowInstance, error) {
 	wf, _, err := a.store.GetWorkflow(ctx, wfID)
 	if err != nil {
@@ -537,6 +544,10 @@ func (a *APIService) GetWorkflowTaskResult(ctx context.Context, wfID, taskName s
 	if err != nil {
 		return nil, &ApiError{Msg: "result not found: " + err.Error(), StatusCode: http.StatusNotFound}
 	}
+	if result == nil {
+		// Not yet, or no longer: results are kept for ResultTTL, or WorkflowResultTTL.
+		return nil, &ApiError{Msg: "result not found: " + taskName, StatusCode: http.StatusNotFound}
+	}
 	return result.Output, nil
 }
 
@@ -624,6 +635,13 @@ func (a *APIService) RetryWorkflow(ctx context.Context, wfID string) error {
 
 func (a *APIService) ListBatches(ctx context.Context, filter store.BatchFilter) ([]types.BatchInstance, int, error) {
 	return a.store.ListBatchInstances(ctx, filter)
+}
+
+// ListBatchesPage is ListBatches, and also reports whether some batches were not looked at, so
+// that there may be more that match than total (see store.BatchFilter.SkipTotal and
+// store.RedisStoreConfig.MaxNameScan).
+func (a *APIService) ListBatchesPage(ctx context.Context, filter store.BatchFilter) ([]types.BatchInstance, int, bool, error) {
+	return a.store.ListBatchInstancesPage(ctx, filter)
 }
 
 func (a *APIService) GetBatch(ctx context.Context, batchID string) (*types.BatchInstance, error) {
@@ -970,9 +988,18 @@ func (a *APIService) SearchJobsByPayload(ctx context.Context, path, value, taskT
 	}
 	job, _, err := a.store.FindJobByPayloadPath(ctx, path, value, taskType)
 	if err != nil {
-		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+		return nil, a.searchFailed(ctx, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound})
 	}
 	return job, nil
+}
+
+// searchFailed returns the error of a payload search that has failed or found nothing: 501 if
+// it is that Redis cannot search payloads at all, or else otherwise.
+func (a *APIService) searchFailed(ctx context.Context, otherwise error) error {
+	if ok, err := a.store.HasPayloadSearch(ctx); err == nil && !ok {
+		return &ApiError{Msg: "payload search needs RedisJSON (JSON.GET), which this Redis does not have", StatusCode: http.StatusNotImplemented}
+	}
+	return otherwise
 }
 
 // SearchAllJobsByPayload returns the jobs whose payload matches and that q selects,
@@ -985,7 +1012,7 @@ func (a *APIService) SearchAllJobsByPayload(ctx context.Context, path, value str
 	q.Limit++
 	jobs, err := a.store.FindJobsByPayloadPath(ctx, path, value, q)
 	if err != nil {
-		return nil, false, err
+		return nil, false, a.searchFailed(ctx, err)
 	}
 	if len(jobs) > limit {
 		return jobs[:limit], true, nil
@@ -999,7 +1026,7 @@ func (a *APIService) SearchWorkflowsByPayload(ctx context.Context, path, value s
 	}
 	wf, _, err := a.store.FindWorkflowByTaskPayloadPath(ctx, path, value)
 	if err != nil {
-		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+		return nil, a.searchFailed(ctx, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound})
 	}
 	return wf, nil
 }
@@ -1010,7 +1037,7 @@ func (a *APIService) SearchBatchesByPayload(ctx context.Context, path, value str
 	}
 	batch, _, err := a.store.FindBatchByPayloadPath(ctx, path, value)
 	if err != nil {
-		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+		return nil, a.searchFailed(ctx, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound})
 	}
 	return batch, nil
 }

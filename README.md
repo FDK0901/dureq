@@ -442,7 +442,9 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 [dureqd](docs/dureqd.md) serves it, over HTTP on `:8080` and gRPC on `:9090` by default. In a server of your own, build endpoints on `dureq.NewAPIService`, which has the same calls.
 
 > [!IMPORTANT]
-> The API has no authentication. Put it behind something that has, and do not let it be reached without it. Web pages of other origins are refused, unless they are in [`allowedOrigins`](docs/dureqd.md#who-may-use-the-api); that is no protection from anything but browsers.
+> The API has no authentication. Put it behind something that has, and do not let it be reached without it. Web pages of other origins are refused, unless they are in [`allowedOrigins`](docs/dureqd.md#who-may-use-the-api); that is no protection from anything but browsers, and a page that rebinds its own name to the API's address (DNS rebinding) gets past it. So list the hosts that the API is reached by in [`allowedHosts`](docs/dureqd.md#who-may-use-the-api).
+
+What jobs carry may be personal data: payloads, results, progress and the errors of handlers. Answers that may hold any of it, such as jobs, workflows, batches, runs, events, the DLQ and searches, come with `Cache-Control: private, no-store`, so that a browser does not keep them. The others (stats, nodes, queues, schedules, Redis info, sync retries, signal stats, health) have a weak `ETag`, and are answered 304 if they have not changed.
 
 ### Endpoints
 
@@ -473,7 +475,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `POST` | `/api/workflows/{id}/retry`  | Retry from failure point |
 | `POST` | `/api/workflows/{id}/suspend` | Suspend workflow        |
 | `POST` | `/api/workflows/{id}/resume` | Resume a suspended workflow |
-| `GET`  | `/api/workflows/{id}/tasks/{task}/result` | Result of a task |
+| `GET`  | `/api/workflows/{id}/tasks/{task}/result` | Result of a task; 404 if it is not there, not yet or not any more |
 | `GET`  | `/api/workflows/{id}/signals/stats` | Signals of a workflow |
 | `POST` | `/api/workflows/validate`    | Check a definition       |
 
@@ -487,6 +489,8 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`  | `/api/batches/{id}/results/{itemId}` | Get single item result |
 | `POST` | `/api/batches/{id}/cancel`           | Cancel batch           |
 | `POST` | `/api/batches/{id}/retry`            | Retry batch            |
+
+The lists of workflows and batches take `?name=`. There is no index of names, so that a name is looked for among the newest (or, with `sort=oldest`, the oldest) 100,000 of them at most (`MaxNameScan` of the store); each of them is read, items and all, which takes about half a second for 10,000 batches of 50 items. If some were not looked at, the answer says `"total_is_lower_bound": true`: more may match. With `?total=false` it stops looking once the page is full, and says `"has_more"` instead of a total; that is true, too, if it stopped at `MaxNameScan`.
 
 **Bulk Operations:**
 
@@ -525,7 +529,7 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`    | `/api/stats`                | Cluster stats                      |
 | `GET`    | `/api/stats/daily`          | Daily aggregated statistics        |
 | `GET`    | `/api/nodes`                | Worker nodes, and whether they are `draining` |
-| `GET`    | `/api/nodes/{id}`           | A worker node                      |
+| `GET`    | `/api/nodes/{id}`           | A worker node, and whether it is `draining` |
 | `GET`    | `/api/schedules`            | Active schedules                   |
 | `GET`    | `/api/schedules/{jobId}`    | The schedule of a job              |
 | `GET`    | `/api/queues`               | Queue tiers (weight, paused, and how many jobs are `waiting`, `in_flight` and `delayed`) |
@@ -553,6 +557,8 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 | `GET`    | `/api/sync-retries`         | Pending sync retries               |
 | `GET`    | `/api/health`               | Health check                       |
 
+The searches by payload need RedisJSON; without it, they answer 501.
+
 **WebSocket:**
 
 | Path      | Description                                        |
@@ -561,7 +567,11 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 
 With `/api/ws?v=2`, a client also gets `{"type":"ws.heartbeat"}` at once and every 15 seconds, so that it knows a dead connection from a quiet one, and `{"type":"ws.resync"}` if it has missed events, because it was too slow or Redis was away for longer than the event stream reaches back. Then it has to read again what it shows.
 
-An event comes after what it stands for: whoever reads the job on `job.completed`, or its runs on `job.failed`, finds the new state.
+A client is told so once it has caught up with the events that are queued for it. One that has not caught up 5 seconds after it missed some, because events keep coming faster than it reads, is told all the same, and what is queued for it is dropped: it is to read everything again anyway. If it stays that slow, it is told again every 5 seconds or so.
+
+A heartbeat says that events come as they happen. If Redis has not answered the reader of the events for longer than a read takes (10 seconds), as when a connection stays open and nothing comes back, the reader gives the connection up and goes on where it was on another one. Until it hears from Redis again, a client with `?v=2` gets no heartbeat: one that is in is closed with 1013 (try again later) when its next heartbeat is due, and one that comes is answered 503. A WebSocket of your own on `dureq.NewAPIService` can do the same: its hub is a `dureq.HubHealth`, whose `Stalled()` says so.
+
+An event comes after what it stands for: whoever reads the job on `job.completed`, or its runs on `job.failed`, finds the new state. So it is with a run whose node is gone: `node.crash_detected`, and then `job.failed`, `job.dead` or `job.auto_recovered`, come once the run is in the history and no longer active. `job.failed` and `job.dead` carry the job's state then; `job.auto_recovered` does not, for by then the job may be running again.
 
 ## Event Types
 

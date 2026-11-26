@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -149,4 +151,101 @@ func TestCheckOrphanedRuns_OneOffJob_LostRunIsNotCounted(t *testing.T) {
 	if len(entries) != 1 || entries[0].FieldValues["attempt"] != "0" || entries[0].FieldValues["operation_key"] != job.ID {
 		t.Fatalf("redispatches: %v", entries)
 	}
+}
+
+// lookingDispatcher looks, as each event is published, at what the event stands for, as a UI
+// would that reads the job or its runs at once.
+type lookingDispatcher struct {
+	*dispatcher.Dispatcher
+	st       *store.RedisStore
+	events   []types.JobEvent
+	problems []string
+}
+
+func (d *lookingDispatcher) PublishEvent(e types.JobEvent) {
+	ctx := context.Background()
+	d.events = append(d.events, e)
+	note := func(format string, args ...any) {
+		d.problems = append(d.problems, fmt.Sprintf("%s: ", e.Type)+fmt.Sprintf(format, args...))
+	}
+	if _, _, err := d.st.GetRun(ctx, e.RunID); err == nil {
+		note("run %s is still active", e.RunID)
+	}
+	runs, _, err := d.st.ListJobRuns(ctx, store.RunFilter{JobID: &e.JobID, Limit: 5})
+	if err != nil || !slices.ContainsFunc(runs, func(r types.JobRun) bool { return r.ID == e.RunID && r.Status == types.RunStatusFailed }) {
+		note("run %s is not in the history as failed (%v)", e.RunID, err)
+	}
+	job, _, err := d.st.GetJob(ctx, e.JobID)
+	if err != nil {
+		note("get job: %v", err)
+		return
+	}
+	switch e.Type {
+	case types.EventJobFailed, types.EventJobDead, types.EventJobAutoRecovered:
+		if e.Status == "" && e.Type != types.EventJobAutoRecovered {
+			note("no status of the job")
+		}
+		if e.Status != "" && e.Status != job.Status {
+			note("says the job is %s, it is %s", e.Status, job.Status)
+		}
+	}
+	d.Dispatcher.PublishEvent(e)
+}
+
+// What orphan recovery announces has happened by then: the run is in the history and no longer
+// active, and the job is as the event says.
+func TestCheckOrphanedRuns_EventsComeAfterTheirEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(job *types.Job)
+		want  types.EventType
+	}{
+		{"redispatched", func(job *types.Job) {}, types.EventJobAutoRecovered},
+		{"dead", func(job *types.Job) { job.RetryPolicy = &types.RetryPolicy{MaxAttempts: 1}; job.Attempt = 1 }, types.EventJobDead},
+		{"task of a workflow", func(job *types.Job) {
+			wf := "wf-" + job.ID
+			job.WorkflowID = &wf
+			job.Status = types.JobStatusRunning
+		}, types.EventJobFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			d := &lookingDispatcher{Dispatcher: dispatcher.New(st, nil), st: st}
+			s := New(Config{Store: st, Dispatcher: d})
+			job := createOneOffJob(t, st, 0, "k")
+			editJob(t, st, job.ID, tc.setup)
+
+			loseRun(t, st, s, job.ID, 0, job.ID)
+
+			var got []types.EventType
+			for _, e := range d.events {
+				got = append(got, e.Type)
+			}
+			if want := []types.EventType{types.EventNodeCrashDetected, tc.want}; !slices.Equal(got, want) {
+				t.Fatalf("events %v, want %v", got, want)
+			}
+			for _, p := range d.problems {
+				t.Error(p)
+			}
+		})
+	}
+
+	// Retries used up, and the job stays on its schedule.
+	t.Run("kept on its schedule", func(t *testing.T) {
+		st := newTestStore(t)
+		d := &lookingDispatcher{Dispatcher: dispatcher.New(st, nil), st: st}
+		s := New(Config{Store: st, Dispatcher: d})
+		entry := createScheduledJob(t, st, nil, time.Now().Add(time.Hour))
+		editJob(t, st, entry.JobID, func(job *types.Job) {
+			job.Schedule.KeepOnFailure = true
+			job.RetryPolicy = &types.RetryPolicy{MaxAttempts: 1}
+		})
+		loseRun(t, st, s, entry.JobID, 1, entry.JobID+":1")
+		if n := len(d.events); n != 2 || d.events[1].Type != types.EventJobFailed {
+			t.Fatalf("events %+v", d.events)
+		}
+		for _, p := range d.problems {
+			t.Error(p)
+		}
+	})
 }

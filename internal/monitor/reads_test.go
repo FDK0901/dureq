@@ -43,6 +43,38 @@ func TestETag(t *testing.T) {
 	}
 }
 
+// What may hold payloads, results or what handlers report, such as personal data, is not to be
+// kept by a browser. The rest is still checked by its ETag.
+func TestETag_NotWherePayloadsAre(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	job := &types.Job{ID: "j1", TaskType: "send", Payload: json.RawMessage(`{"to":"someone"}`), Status: types.JobStatusPending, CreatedAt: time.Now()}
+	if _, err := st.CreateJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	head := func(path string) (int, http.Header) {
+		t.Helper()
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode, resp.Header
+	}
+	for _, path := range []string{"/api/jobs", "/api/jobs/j1", "/api/dlq", "/api/workflows", "/api/batches", "/api/runs", "/api/history/runs", "/api/history/events", "/api/jobs/j1/events", "/api/groups", "/api/jobs/none"} {
+		code, h := head(path)
+		if h.Get("ETag") != "" || h.Get("Cache-Control") != "private, no-store" {
+			t.Errorf("GET %s (%d): ETag %q, Cache-Control %q", path, code, h.Get("ETag"), h.Get("Cache-Control"))
+		}
+	}
+	for _, path := range []string{"/api/stats", "/api/nodes", "/api/queues", "/api/schedules", "/api/health"} {
+		code, h := head(path)
+		if code != 200 || h.Get("ETag") == "" || h.Get("Cache-Control") != "no-cache" {
+			t.Errorf("GET %s (%d): ETag %q, Cache-Control %q", path, code, h.Get("ETag"), h.Get("Cache-Control"))
+		}
+	}
+}
+
 // What a list has to look up for its rows takes one request.
 func TestByIDs(t *testing.T) {
 	st, srv := newTestAPI(t, nil)
@@ -135,6 +167,14 @@ func TestNodes_Draining(t *testing.T) {
 			t.Errorf("node %s draining: %v", n.NodeID, n.Draining)
 		}
 	}
+	// One node says so, too.
+	for _, id := range []string{"a", "b"} {
+		var n types.NodeInfo
+		get(t, srv, "/api/nodes/"+id, &n)
+		if n.Draining != (id == "b") {
+			t.Errorf("GET /api/nodes/%s: draining %v", id, n.Draining)
+		}
+	}
 }
 
 // Events of one job can be listed without counting them all.
@@ -157,6 +197,46 @@ func TestHistoryEvents_WithoutTotal(t *testing.T) {
 		get(t, srv, "/api/history/events?job_id=a&total=false&"+tc.query, &page)
 		if len(page.Data) != tc.count || page.HasMore != tc.more || page.Total != nil {
 			t.Errorf("%s: %d events, more: %v, total %v", tc.query, len(page.Data), page.HasMore, page.Total)
+		}
+	}
+}
+
+// A task whose result is not there, not yet or not any more, has none: 404, as with what else
+// is not found.
+func TestWorkflowTaskResult_NotThere(t *testing.T) {
+	st, srv := newTestAPI(t, nil)
+	ctx := context.Background()
+	wf := &types.WorkflowInstance{ID: "wf1", WorkflowName: "w", Status: types.WorkflowStatusRunning, CreatedAt: time.Now(),
+		Tasks: map[string]types.WorkflowTaskState{
+			"done": {Name: "done", JobID: "job-done", Status: types.JobStatusCompleted},
+			"gone": {Name: "gone", JobID: "job-gone", Status: types.JobStatusCompleted},
+		}}
+	if _, err := st.SaveWorkflow(ctx, wf); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PublishResult(ctx, types.WorkResult{JobID: "job-done", Success: true, Output: json.RawMessage(`{"n":1}`)}); err != nil {
+		t.Fatal(err)
+	}
+	fetch := func(path string) (int, string) {
+		t.Helper()
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+	if code, body := fetch("/api/workflows/wf1/tasks/done/result"); code != 200 || body != `{"output":{"n":1}}`+"\n" {
+		t.Errorf("a result that is there: %d %s", code, body)
+	}
+	for _, path := range []string{"/api/workflows/wf1/tasks/gone/result", "/api/workflows/wf1/tasks/none/result", "/api/workflows/none/tasks/done/result"} {
+		code, body := fetch(path)
+		var e struct {
+			Error string `json:"error"`
+		}
+		if code != 404 || json.Unmarshal([]byte(body), &e) != nil || e.Error == "" {
+			t.Errorf("GET %s: %d %s", path, code, body)
 		}
 	}
 }

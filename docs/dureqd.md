@@ -52,6 +52,7 @@ See [configs/config.yaml](../configs/config.yaml) for a fully annotated sample.
 | `dureqd.drainTimeoutMs` | int | `30000` | Shutdown drain timeout (ms) |
 | `dureqd.runHistoryRetentionHours` | int | `0` | Remove finished runs from the run history after so many hours; 0 = only by hand |
 | `dureqd.maxNameScan` | int | `100000` | How many workflows or batches a list filtered by name (`?name=`) looks at, at most; each is read |
+| `dureqd.requestTimeoutMs` | int | `30000` | How long a request of the HTTP API may take, but a WebSocket; one that takes longer, as when Redis does not answer, gets 503 with `Retry-After: 5`. Negative = no limit |
 
 ### Modes
 

@@ -116,6 +116,9 @@ func main() {
 	if err := api.AllowHosts(cfg.DureqdConfig.AllowedHosts); err != nil {
 		logger.Fatal().Err(err).Msg("invalid allowedHosts")
 	}
+	if ms := cfg.DureqdConfig.RequestTimeoutMs; ms != 0 {
+		api.SetRequestTimeout(time.Duration(ms) * time.Millisecond)
+	}
 	if w := srv.Worker(); w != nil {
 		api.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
 	}
@@ -161,7 +164,10 @@ func main() {
 	// All other routes go to the monitoring API.
 	mux.Handle("/", api.Handler())
 
-	httpSrv := &http.Server{Addr: apiAddr, Handler: mux}
+	// A request has the time of the API (requestTimeoutMs). The server gives a client 10 seconds
+	// to send the header of a request; it does not limit reads and writes as a whole, which would
+	// end WebSockets.
+	httpSrv := &http.Server{Addr: apiAddr, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	go func() {
 		logger.Info().String("addr", apiAddr).Msg("monitoring HTTP API listening")
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

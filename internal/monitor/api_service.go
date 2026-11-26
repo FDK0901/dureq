@@ -37,6 +37,8 @@ type APIService struct {
 	hub        Hub
 	hubCancel  context.CancelFunc
 
+	requestTimeout time.Duration
+
 	syncRetryStats SyncRetryStatsFunc
 }
 
@@ -51,11 +53,12 @@ func NewAPIService(s *store.RedisStore, disp Dispatcher, logger chainedlog.Logge
 	go h.follow(hubCtx, s.Client(), store.EventsStreamKey(s.Prefix()))
 
 	return &APIService{
-		store:      s,
-		dispatcher: disp,
-		logger:     logger,
-		hub:        h,
-		hubCancel:  hubCancel,
+		store:          s,
+		dispatcher:     disp,
+		logger:         logger,
+		hub:            h,
+		hubCancel:      hubCancel,
+		requestTimeout: DefaultRequestTimeout,
 	}
 }
 

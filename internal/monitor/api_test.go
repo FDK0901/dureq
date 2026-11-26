@@ -882,3 +882,118 @@ func TestPayloadSearch_WithoutJSONModule(t *testing.T) {
 		t.Errorf("without path: %d", code)
 	}
 }
+
+// While Redis does not answer, a request is answered 503 with Retry-After once its time is up,
+// not when Redis is back; and a call of a server of one's own gets the same error. A WebSocket
+// is not limited.
+func TestRequestTimeout_RedisDoesNotAnswer(t *testing.T) {
+	px := newRedisProxy(t)
+	st, err := store.NewRedisStore(px.client(t), store.RedisStoreConfig{
+		KeyPrefix: "test_" + xid.New().String(),
+		Tiers:     []store.TierConfig{{Name: "normal", Weight: 1, FetchBatch: 10}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := NewAPI(st, nil, nil)
+	t.Cleanup(api.Shutdown)
+	api.SetRequestTimeout(time.Second)
+	srv := httptest.NewServer(api.Handler())
+	t.Cleanup(srv.Close)
+	if code := call(t, srv, "GET", "/api/stats", nil); code != 200 {
+		t.Fatalf("before: %d", code)
+	}
+
+	px.hang(true)
+	start := time.Now()
+	res, err := (&http.Client{Timeout: 20 * time.Second}).Get(srv.URL + "/api/stats")
+	if err != nil {
+		t.Fatalf("no answer after %v: %v", time.Since(start).Round(time.Millisecond), err)
+	}
+	var e struct {
+		Error string `json:"error"`
+	}
+	json.NewDecoder(res.Body).Decode(&e)
+	res.Body.Close()
+	took := time.Since(start)
+	if res.StatusCode != http.StatusServiceUnavailable || res.Header.Get("Retry-After") != "5" || e.Error == "" || took > 4*time.Second {
+		t.Errorf("answered %d (Retry-After %q, %q) after %v; want 503 with Retry-After 5 after about a second", res.StatusCode, res.Header.Get("Retry-After"), e.Error, took)
+	}
+	t.Logf("answered %d after %v", res.StatusCode, took.Round(time.Millisecond))
+
+	svc := api.Service()
+	err = svc.Timed(context.Background(), func(ctx context.Context) error {
+		_, err := svc.GetStats(ctx)
+		return err
+	})
+	var apiErr *ApiError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("a timed call: %v, want 503", err)
+	}
+}
+
+// A request that is in time is answered as it is, with its headers, and a WebSocket lasts.
+func TestRequestTimeout_InTime(t *testing.T) {
+	defer shorten(&wsHeartbeat, 200*time.Millisecond)()
+	st, _ := newTestAPI(t, nil)
+	api := NewAPI(st, nil, nil)
+	t.Cleanup(api.Shutdown)
+	api.SetRequestTimeout(300 * time.Millisecond)
+	srv := httptest.NewServer(api.Handler())
+	t.Cleanup(srv.Close)
+	res, err := http.Get(srv.URL + "/api/jobs/none")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 404 || res.Header.Get("Content-Type") != "application/json" || res.Header.Get("Cache-Control") != "private, no-store" {
+		t.Errorf("%d %v", res.StatusCode, res.Header)
+	}
+	read := dial(t, srv, "?v=2")
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); {
+		if got := read(); !strings.Contains(got, "ws.heartbeat") {
+			t.Fatalf("got %s", got)
+		}
+	}
+}
+
+// What the time limit of requests costs: GET /api/stats and GET /api/health, without and with it.
+func BenchmarkRequestTimeout(b *testing.B) {
+	addr, password := strings.TrimPrefix(os.Getenv("REDIS_URL"), "redis://"), os.Getenv("REDIS_PASSWORD")
+	if addr == "" {
+		b.Skip("REDIS_URL not set")
+	}
+	if password == "" {
+		password = "your-password"
+	}
+	rdb, err := rueidis.NewClient(rueidis.ClientOption{InitAddress: []string{addr}, Password: password})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer rdb.Close()
+	st, err := store.NewRedisStore(rdb, store.RedisStoreConfig{KeyPrefix: "bench_" + xid.New().String(), Tiers: []store.TierConfig{{Name: "normal", Weight: 1, FetchBatch: 10}}}, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, path := range []string{"/api/health", "/api/stats"} {
+		for _, tc := range []struct {
+			name    string
+			timeout time.Duration
+		}{{"none", 0}, {"30s", DefaultRequestTimeout}} {
+			b.Run(path+"/"+tc.name, func(b *testing.B) {
+				api := NewAPI(st, nil, nil)
+				defer api.Shutdown()
+				api.SetRequestTimeout(tc.timeout)
+				h := api.Handler()
+				b.ReportAllocs()
+				for b.Loop() {
+					w := httptest.NewRecorder()
+					h.ServeHTTP(w, httptest.NewRequest("GET", "http://dureq.internal"+path, nil))
+					if w.Code != 200 {
+						b.Fatal(w.Code)
+					}
+				}
+			})
+		}
+	}
+}

@@ -444,6 +444,8 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 > [!IMPORTANT]
 > The API has no authentication. Put it behind something that has, and do not let it be reached without it. Web pages of other origins are refused, unless they are in [`allowedOrigins`](docs/dureqd.md#who-may-use-the-api); that is no protection from anything but browsers, and a page that rebinds its own name to the API's address (DNS rebinding) gets past it. So list the hosts that the API is reached by in [`allowedHosts`](docs/dureqd.md#who-may-use-the-api).
 
+A request that takes longer than 30 seconds, as when Redis does not answer, is answered 503 with `Retry-After: 5`, the same as a WebSocket that comes while the hub is stalled; `requestTimeoutMs` of dureqd sets another limit. The longest that are meant to be, a name filter or a payload search through 100,000, take a few seconds. A server of your own gets the same with `APIService.Timed`, which gives a call that long (`SetRequestTimeout`) and returns an `ApiError` with 503 when it is up.
+
 What jobs carry may be personal data: payloads, results, progress and the errors of handlers. Answers that may hold any of it, such as jobs, workflows, batches, runs, events, the DLQ and searches, come with `Cache-Control: private, no-store`, so that a browser does not keep them. The others (stats, nodes, queues, schedules, Redis info, sync retries, signal stats, health) have a weak `ETag`, and are answered 304 if they have not changed.
 
 ### Endpoints

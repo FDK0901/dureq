@@ -557,6 +557,8 @@ The lists of workflows and batches take `?name=`. There is no index of names, so
 | `GET`    | `/api/sync-retries`         | Pending sync retries               |
 | `GET`    | `/api/health`               | Health check                       |
 
+The searches by payload need RedisJSON; without it, they answer 501.
+
 **WebSocket:**
 
 | Path      | Description                                        |

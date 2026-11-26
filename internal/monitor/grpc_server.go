@@ -38,6 +38,8 @@ func toGRPCError(err error) error {
 			code = codes.InvalidArgument
 		case http.StatusConflict:
 			code = codes.AlreadyExists
+		case http.StatusNotImplemented:
+			code = codes.Unimplemented
 		}
 		return status.Error(code, apiErr.Msg)
 	}

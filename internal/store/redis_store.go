@@ -2316,6 +2316,20 @@ func (s *RedisStore) scanIndex(ctx context.Context, indexKey, sort string, chunk
 
 // isUnknownCommandErr reports whether the server does not know the command, e.g.
 // because the module that provides it is not loaded.
+// HasPayloadSearch reports whether Redis can search payloads, which takes JSON.GET of RedisJSON
+// (or of a module like it, such as valkey-json).
+func (s *RedisStore) HasPayloadSearch(ctx context.Context) (bool, error) {
+	err := s.rdb.Do(ctx, s.rdb.B().JsonGet().Key(JobPayloadKey(s.prefix, "")).Path("$").Build()).Error()
+	switch {
+	case err == nil || rueidis.IsRedisNil(err):
+		return true, nil
+	case isUnknownCommandErr(err):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 func isUnknownCommandErr(err error) bool {
 	var redisErr *rueidis.RedisError
 	return errors.As(err, &redisErr) && strings.Contains(strings.ToLower(redisErr.Error()), "unknown command")

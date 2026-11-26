@@ -988,9 +988,18 @@ func (a *APIService) SearchJobsByPayload(ctx context.Context, path, value, taskT
 	}
 	job, _, err := a.store.FindJobByPayloadPath(ctx, path, value, taskType)
 	if err != nil {
-		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+		return nil, a.searchFailed(ctx, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound})
 	}
 	return job, nil
+}
+
+// searchFailed returns the error of a payload search that has failed or found nothing: 501 if
+// it is that Redis cannot search payloads at all, or else otherwise.
+func (a *APIService) searchFailed(ctx context.Context, otherwise error) error {
+	if ok, err := a.store.HasPayloadSearch(ctx); err == nil && !ok {
+		return &ApiError{Msg: "payload search needs RedisJSON (JSON.GET), which this Redis does not have", StatusCode: http.StatusNotImplemented}
+	}
+	return otherwise
 }
 
 // SearchAllJobsByPayload returns the jobs whose payload matches and that q selects,
@@ -1003,7 +1012,7 @@ func (a *APIService) SearchAllJobsByPayload(ctx context.Context, path, value str
 	q.Limit++
 	jobs, err := a.store.FindJobsByPayloadPath(ctx, path, value, q)
 	if err != nil {
-		return nil, false, err
+		return nil, false, a.searchFailed(ctx, err)
 	}
 	if len(jobs) > limit {
 		return jobs[:limit], true, nil
@@ -1017,7 +1026,7 @@ func (a *APIService) SearchWorkflowsByPayload(ctx context.Context, path, value s
 	}
 	wf, _, err := a.store.FindWorkflowByTaskPayloadPath(ctx, path, value)
 	if err != nil {
-		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+		return nil, a.searchFailed(ctx, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound})
 	}
 	return wf, nil
 }
@@ -1028,7 +1037,7 @@ func (a *APIService) SearchBatchesByPayload(ctx context.Context, path, value str
 	}
 	batch, _, err := a.store.FindBatchByPayloadPath(ctx, path, value)
 	if err != nil {
-		return nil, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound}
+		return nil, a.searchFailed(ctx, &ApiError{Msg: err.Error(), StatusCode: http.StatusNotFound})
 	}
 	return batch, nil
 }

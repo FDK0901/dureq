@@ -91,6 +91,10 @@ func NewClient(opts ...client.Option) (*client.Client, error) {
 type RedisStore = store.RedisStore
 
 type APIService = monitor.APIService
+
+// DefaultRequestTimeout is how long a call given to APIService.Timed may take by default.
+const DefaultRequestTimeout = monitor.DefaultRequestTimeout
+
 type Hub = monitor.Hub
 type HubHealth = monitor.HubHealth
 

@@ -60,6 +60,11 @@ func (a *API) AllowHosts(hosts []string) error {
 	return nil
 }
 
+// SetRequestTimeout sets how long a request may take, but a WebSocket; 0 or less is no limit.
+// One that takes longer, as when Redis does not answer, is answered 503 with Retry-After.
+// Default: DefaultRequestTimeout. It is called before Handler.
+func (a *API) SetRequestTimeout(d time.Duration) { a.svc.SetRequestTimeout(d) }
+
 // SetSyncRetryStatsFunc sets the function used to retrieve SyncRetrier stats.
 func (a *API) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
 	a.svc.SetSyncRetryStatsFunc(fn)
@@ -67,7 +72,7 @@ func (a *API) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
 
 // Handler returns the HTTP handler for mounting in a server.
 func (a *API) Handler() http.Handler {
-	return a.hosts.middleware(a.guard.middleware(withETag(a.mux)))
+	return a.hosts.middleware(a.guard.middleware(withTimeout(a.svc.RequestTimeout(), withETag(a.mux))))
 }
 
 // Shutdown cancels the hub's Redis subscription.

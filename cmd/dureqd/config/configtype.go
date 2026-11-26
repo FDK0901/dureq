@@ -22,6 +22,10 @@ type DureqdConfig struct {
 
 	// MaxNameScan is how many workflows or batches a list filtered by name looks at; 0 = 100000
 	MaxNameScan int `koanf:"maxNameScan"`
+
+	// RequestTimeoutMs is how long (ms) a request of the HTTP API may take, but a WebSocket; one that takes
+	// longer is answered 503. 0 = 30000, negative = no limit
+	RequestTimeoutMs int `koanf:"requestTimeoutMs"`
 }
 
 type RedisConfig struct {

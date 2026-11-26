@@ -167,7 +167,7 @@ For full details including failure scenarios, see [docs/guarantees.md](docs/guar
 ### Prerequisites
 
 - Go 1.26.11+ (the go.mod minimum; older toolchains have known security vulnerabilities)
-- Redis 7+. Payload search needs RedisJSON, which Redis 8 comes with; everything else works without
+- Redis 7+. Payload search needs RedisJSON, which Redis 8 comes with, or valkey-json, which valkey-bundle comes with; everything else works without
 
 ### Quick Example
 
@@ -444,6 +444,8 @@ Pattern-based routing: register `"order.*"` to match `order.validate`, `order.ch
 > [!IMPORTANT]
 > The API has no authentication. Put it behind something that has, and do not let it be reached without it. Web pages of other origins are refused, unless they are in [`allowedOrigins`](docs/dureqd.md#who-may-use-the-api); that is no protection from anything but browsers, and a page that rebinds its own name to the API's address (DNS rebinding) gets past it. So list the hosts that the API is reached by in [`allowedHosts`](docs/dureqd.md#who-may-use-the-api).
 
+A request that takes longer than 30 seconds, as when Redis does not answer, is answered 503 with `Retry-After: 5`, the same as a WebSocket that comes while the hub is stalled; `requestTimeoutMs` of dureqd sets another limit. The longest that are meant to be, a name filter or a payload search through 100,000, take a few seconds. A server of your own gets the same with `APIService.Timed`, which gives a call that long (`SetRequestTimeout`) and returns an `ApiError` with 503 when it is up.
+
 What jobs carry may be personal data: payloads, results, progress and the errors of handlers. Answers that may hold any of it, such as jobs, workflows, batches, runs, events, the DLQ and searches, come with `Cache-Control: private, no-store`, so that a browser does not keep them. The others (stats, nodes, queues, schedules, Redis info, sync retries, signal stats, health) have a weak `ETag`, and are answered 304 if they have not changed.
 
 ### Endpoints
@@ -567,11 +569,13 @@ The searches by payload need RedisJSON; without it, they answer 501.
 
 With `/api/ws?v=2`, a client also gets `{"type":"ws.heartbeat"}` at once and every 15 seconds, so that it knows a dead connection from a quiet one, and `{"type":"ws.resync"}` if it has missed events, because it was too slow or Redis was away for longer than the event stream reaches back. Then it has to read again what it shows.
 
-A client is told so once it has caught up with the events that are queued for it. One that has not caught up 5 seconds after it missed some, because events keep coming faster than it reads, is told all the same, and what is queued for it is dropped: it is to read everything again anyway. If it stays that slow, it is told again every 5 seconds or so.
+Both say when the server wrote them, in `server_time_ms`: milliseconds since 1970 by the clock of the server, such as `{"type":"ws.heartbeat","server_time_ms":1795695303123}`. Behind a slow connection, events and heartbeats come late while the connection is open; a client can tell by how much: how much later it got a heartbeat than it was written (`Date.now() - server_time_ms`), less the least of that on the connection, which is about the difference of the clocks. Events have their own `timestamp`, when they happened by the clock of the node that published them.
+
+A client is told so once it has caught up with the events that are queued for it. One that has not caught up 5 seconds after it missed some, because events keep coming faster than it reads, is told all the same, and what is queued for it is dropped: it is to read everything again anyway. If it stays that slow, it is told again every 5 seconds or so. A frame that the connection does not take within 10 seconds ends it, as then nothing more can be told: the client is to connect again and read everything again.
 
 A heartbeat says that events come as they happen. If Redis has not answered the reader of the events for longer than a read takes (10 seconds), as when a connection stays open and nothing comes back, the reader gives the connection up and goes on where it was on another one. Until it hears from Redis again, a client with `?v=2` gets no heartbeat: one that is in is closed with 1013 (try again later) when its next heartbeat is due, and one that comes is answered 503. A WebSocket of your own on `dureq.NewAPIService` can do the same: its hub is a `dureq.HubHealth`, whose `Stalled()` says so, also once the service has been shut down.
 
-An event comes after what it stands for: whoever reads the job on `job.completed`, or its runs on `job.failed`, finds the new state. So it is with a run whose node is gone: `node.crash_detected`, and then `job.failed`, `job.dead` or `job.auto_recovered`, come once the run is in the history and no longer active. `job.failed` and `job.dead` carry the job's state then; `job.auto_recovered` does not, for by then the job may be running again.
+An event comes after what it stands for: whoever reads the job on `job.completed`, or its runs on `job.failed`, finds the new state. So it is with a run whose node is gone: `node.crash_detected`, and then `job.failed`, `job.dead` or `job.auto_recovered`, come once the run is in the history and no longer active. `job.failed` and `job.dead` carry the job's state then; `job.auto_recovered` does not, for by then the job may be running again. If the job cannot be saved or dispatched, or the leader goes away in the middle, the run stays as it is, and the next check, 30 seconds later, does it again.
 
 ## Event Types
 

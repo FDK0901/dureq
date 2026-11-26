@@ -52,6 +52,7 @@ See [configs/config.yaml](../configs/config.yaml) for a fully annotated sample.
 | `dureqd.drainTimeoutMs` | int | `30000` | Shutdown drain timeout (ms) |
 | `dureqd.runHistoryRetentionHours` | int | `0` | Remove finished runs from the run history after so many hours; 0 = only by hand |
 | `dureqd.maxNameScan` | int | `100000` | How many workflows or batches a list filtered by name (`?name=`) looks at, at most; each is read |
+| `dureqd.requestTimeoutMs` | int | `30000` | How long a request of the HTTP API may take, but a WebSocket; one that takes longer, as when Redis does not answer, gets 503 with `Retry-After: 5`. Negative = no limit |
 
 ### Modes
 
@@ -192,6 +193,9 @@ comes to point at the address of the API, and to the browser the page and the AP
 
   The host is the `Host` header and, behind a proxy that sets it, `X-Forwarded-Host`; both have to be listed if they
   differ. By default all hosts are answered, as before.
+
+  `/healthz` and `/readyz` are answered for any host, on purpose: load balancers and container checks call them by
+  address or by another name. They say whether dureqd and Redis are up, and nothing of jobs.
 
   This is dureqd's. A server of your own, built on `dureq.NewAPIService`, has an HTTP layer of its own, and the
   check of the host is up to it: answer only the names that the API is reached by.

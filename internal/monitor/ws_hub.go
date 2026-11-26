@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ type WSClient struct {
 	Send chan []byte
 
 	missed atomic.Bool // events that it did not get
+	shard  uint32      // the part of the hub that it is in
 }
 
 // NewWSClient creates a new WebSocket client with a buffered send channel.
@@ -69,9 +71,47 @@ type HubHealth interface {
 	Stalled() bool
 }
 
-type hub struct {
+// hubShards is how many parts the clients of a hub are kept in. Each has a lock of its own, and
+// a hub with many clients sends to the parts in parallel.
+//
+// The design is that of ShardedPubSub16 of bbaliweb (ws/pubsub/sharded16.go, 3cf7341): 16 parts,
+// each sent to under its read lock, in parallel only for many subscribers.
+const hubShards = 16
+
+// hubParallelMin is how many deliveries, clients times messages, a fan-out has at least before
+// the hub sends to its parts in parallel, a goroutine each. For fewer, starting the goroutines
+// costs more than they save: one event to 100 clients takes longer in parallel, one to 1,000 or
+// 100 events to 100 take less (BenchmarkHubBroadcast). With one processor it always sends one
+// part after the other.
+var hubParallelMin = 1000
+
+type hubShard struct {
 	mu      sync.RWMutex
 	clients map[*WSClient]struct{}
+	n       atomic.Int32
+}
+
+// send gives msgs, in order, to each client of the part. A client whose queue is full misses
+// what does not fit, which its Missed tells.
+func (s *hubShard) send(msgs [][]byte) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for c := range s.clients {
+		for _, m := range msgs {
+			select {
+			case c.Send <- m:
+			default:
+				c.missed.Store(true)
+			}
+		}
+	}
+}
+
+type hub struct {
+	shards  [hubShards]hubShard
+	next    atomic.Uint32 // the part of the next client
+	clients atomic.Int64
+	procs   atomic.Int32 // GOMAXPROCS, as of the last client that came
 	logger  chainedlog.Logger
 
 	started   atomic.Bool  // it has begun to follow the event stream
@@ -80,53 +120,96 @@ type hub struct {
 }
 
 func newHub(logger chainedlog.Logger) *hub {
-	return &hub{
-		clients: make(map[*WSClient]struct{}),
-		logger:  logger,
+	h := &hub{logger: logger}
+	for i := range h.shards {
+		h.shards[i].clients = make(map[*WSClient]struct{})
 	}
+	h.procs.Store(int32(runtime.GOMAXPROCS(0)))
+	return h
 }
 
 func (h *hub) Register(c *WSClient) {
-	h.mu.Lock()
-	h.clients[c] = struct{}{}
-	h.mu.Unlock()
+	c.shard = h.next.Add(1) % hubShards
+	s := &h.shards[c.shard]
+	s.mu.Lock()
+	s.clients[c] = struct{}{}
+	s.n.Add(1)
+	s.mu.Unlock()
+	h.clients.Add(1)
+	h.procs.Store(int32(runtime.GOMAXPROCS(0)))
 }
 
 func (h *hub) Unregister(c *WSClient) {
-	h.mu.Lock()
-	delete(h.clients, c)
+	s := &h.shards[c.shard]
+	s.mu.Lock()
+	if _, ok := s.clients[c]; ok {
+		delete(s.clients, c)
+		s.n.Add(-1)
+		h.clients.Add(-1)
+	}
 	close(c.Send)
-	h.mu.Unlock()
+	s.mu.Unlock()
 }
 
 // Broadcast sends a message to all connected clients.
 // Drops the message for any client whose send buffer is full (slow consumer protection),
 // which its Missed tells.
 func (h *hub) Broadcast(data []byte) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for c := range h.clients {
-		select {
-		case c.Send <- data:
-		default:
-			c.missed.Store(true)
+	if h.parallel(1) {
+		h.sendParallel([][]byte{data})
+		return
+	}
+	msgs := [1][]byte{data}
+	for i := range h.shards {
+		h.shards[i].send(msgs[:])
+	}
+}
+
+// broadcastBatch sends messages, in order, to all connected clients, as Broadcast does each.
+func (h *hub) broadcastBatch(msgs [][]byte) {
+	if len(msgs) == 0 {
+		return
+	}
+	if h.parallel(len(msgs)) {
+		h.sendParallel(msgs)
+		return
+	}
+	for i := range h.shards {
+		h.shards[i].send(msgs)
+	}
+}
+
+// parallel reports whether it pays to send messages to the parts in parallel.
+func (h *hub) parallel(messages int) bool {
+	return h.clients.Load()*int64(messages) >= int64(hubParallelMin) && h.procs.Load() > 1
+}
+
+// sendParallel sends msgs to the parts that have clients, a goroutine each, and waits for them,
+// so that every client gets what comes next after msgs.
+func (h *hub) sendParallel(msgs [][]byte) {
+	var wg sync.WaitGroup
+	for i := range h.shards {
+		if s := &h.shards[i]; s.n.Load() > 0 {
+			wg.Go(func() { s.send(msgs) })
 		}
 	}
+	wg.Wait()
 }
 
 // missed notes for all clients that there have been events which the hub did not get.
 func (h *hub) missed() {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for c := range h.clients {
-		c.missed.Store(true)
+	for i := range h.shards {
+		s := &h.shards[i]
+		s.mu.RLock()
+		for c := range s.clients {
+			c.missed.Store(true)
+		}
+		s.mu.RUnlock()
 	}
 }
 
 func (h *hub) ClientCount() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.clients)
+	return int(h.clients.Load())
 }
 
 // Stalled reports whether the hub has followed the event stream and does not any more, or Redis
@@ -187,12 +270,15 @@ func (h *hub) follow(ctx context.Context, rdb rueidis.Client, streamKey string) 
 				return err
 			}
 			h.answered()
-			for _, entry := range streams[streamKey] {
+			entries := streams[streamKey]
+			msgs := make([][]byte, 0, len(entries))
+			for _, entry := range entries {
 				if data := entry.FieldValues["data"]; data != "" {
-					h.Broadcast([]byte(data))
+					msgs = append(msgs, []byte(data))
 				}
 				last = entry.ID
 			}
+			h.broadcastBatch(msgs)
 			if len(streams[streamKey]) == hubReadCount {
 				// Behind: see whether what comes next is still there.
 				first, err := firstEventID(ctx, rdb, streamKey)
@@ -246,6 +332,10 @@ func parseEventID(s string) eventID {
 	return id
 }
 
+// The commands of the hub are pinned, not given back to rueidis for reuse once they are done. A
+// read that is given up, or one that rueidis retries on another connection, may still be in the
+// writer of the connection that was given up; reused, it was written to while that was reading it.
+
 // readEvents waits for the events after last, as long as hubReadBlock. A connection can stay
 // open and not answer, such as one to a proxy whose own connection to Redis is gone. A read that
 // is not answered in time gives it up, and the next one is made on another.
@@ -255,7 +345,7 @@ func readEvents(ctx context.Context, rdb rueidis.Client, streamKey, last string)
 	defer cancel()
 	timer := time.AfterFunc(hubReadBlock+hubReadSlack, cancel)
 	defer timer.Stop()
-	cmd := rdb.B().Xread().Count(hubReadCount).Block(hubReadBlock.Milliseconds()).Streams().Key(streamKey).Id(last).Build()
+	cmd := rdb.B().Xread().Count(hubReadCount).Block(hubReadBlock.Milliseconds()).Streams().Key(streamKey).Id(last).Build().Pin()
 	streams, err := rdb.Do(readCtx, cmd).AsXRead()
 	if err != nil && ctx.Err() == nil && readCtx.Err() != nil && !rueidis.IsRedisNil(err) {
 		return nil, fmt.Errorf("read events: no answer in %v: %w", hubReadBlock+hubReadSlack, err)
@@ -266,7 +356,7 @@ func readEvents(ctx context.Context, rdb rueidis.Client, streamKey, last string)
 func lastEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, hubCallTimeout)
 	defer cancel()
-	entries, err := rdb.Do(ctx, rdb.B().Xrevrange().Key(streamKey).End("+").Start("-").Count(1).Build()).AsXRange()
+	entries, err := rdb.Do(ctx, rdb.B().Xrevrange().Key(streamKey).End("+").Start("-").Count(1).Build().Pin()).AsXRange()
 	if err != nil {
 		return "", fmt.Errorf("last event: %w", err)
 	}
@@ -279,7 +369,7 @@ func lastEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (str
 func firstEventID(ctx context.Context, rdb rueidis.Client, streamKey string) (eventID, error) {
 	ctx, cancel := context.WithTimeout(ctx, hubCallTimeout)
 	defer cancel()
-	entries, err := rdb.Do(ctx, rdb.B().Xrange().Key(streamKey).Start("-").End("+").Count(1).Build()).AsXRange()
+	entries, err := rdb.Do(ctx, rdb.B().Xrange().Key(streamKey).Start("-").End("+").Count(1).Build().Pin()).AsXRange()
 	if err != nil {
 		return eventID{}, fmt.Errorf("first event: %w", err)
 	}

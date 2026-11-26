@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/FDK0901/go-chainedlog"
@@ -21,14 +22,26 @@ var (
 	wsResyncAfter = 5 * time.Second
 )
 
-// Messages that a client gets beside events if it asks for them, with ?v=2.
-var (
+// Messages that a client gets beside events if it asks for them, with ?v=2. Both say, in
+// server_time_ms, when the server wrote them, in milliseconds since 1970 by its clock: a client
+// that gets them late, behind a slow connection, can tell by how much.
+const (
 	// It comes right after the connection is open, and then regularly: if it stops coming,
 	// the connection is dead.
-	wsHeartbeatMsg = []byte(`{"type":"ws.heartbeat"}`)
+	wsHeartbeatType = "ws.heartbeat"
 	// There have been events that the client did not get.
-	wsResyncMsg = []byte(`{"type":"ws.resync"}`)
+	wsResyncType = "ws.resync"
 )
+
+// wsMessage returns a message of the type, with the time of the server.
+func wsMessage(typ string) []byte {
+	b := make([]byte, 0, 64)
+	b = append(b, `{"type":"`...)
+	b = append(b, typ...)
+	b = append(b, `","server_time_ms":`...)
+	b = strconv.AppendInt(b, time.Now().UnixMilli(), 10)
+	return append(b, '}')
+}
 
 const wsStalledReason = "events are not being read: Redis does not answer"
 
@@ -118,7 +131,7 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 			ticker := time.NewTicker(wsHeartbeat)
 			defer ticker.Stop()
 			heartbeat = ticker.C
-			if !write(wsHeartbeatMsg) {
+			if !write(wsMessage(wsHeartbeatType)) {
 				return
 			}
 		}
@@ -140,7 +153,7 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 					conn.Close(websocket.StatusTryAgainLater, wsStalledReason)
 					return
 				}
-				if !write(wsHeartbeatMsg) {
+				if !write(wsMessage(wsHeartbeatType)) {
 					return
 				}
 			}
@@ -160,7 +173,7 @@ func HandleWebSocket(hub Hub, logger chainedlog.Logger) http.HandlerFunc {
 				}
 				if caughtUp {
 					behind = time.Time{}
-					if client.Missed() && !write(wsResyncMsg) {
+					if client.Missed() && !write(wsMessage(wsResyncType)) {
 						return
 					}
 				}

@@ -244,11 +244,14 @@ func parseEventID(s string) eventID {
 // open and not answer, such as one to a proxy whose own connection to Redis is gone. A read that
 // is not answered in time gives it up, and the next one is made on another.
 func readEvents(ctx context.Context, rdb rueidis.Client, streamKey, last string) (map[string][]rueidis.XRangeEntry, error) {
-	ctx, cancel := context.WithTimeout(ctx, hubReadBlock+hubReadSlack)
+	// Not a deadline: with one, rueidis waits for the connection's deadline even if ctx ends.
+	readCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	timer := time.AfterFunc(hubReadBlock+hubReadSlack, cancel)
+	defer timer.Stop()
 	cmd := rdb.B().Xread().Count(hubReadCount).Block(hubReadBlock.Milliseconds()).Streams().Key(streamKey).Id(last).Build()
-	streams, err := rdb.Do(ctx, cmd).AsXRead()
-	if err != nil && ctx.Err() != nil && !rueidis.IsRedisNil(err) {
+	streams, err := rdb.Do(readCtx, cmd).AsXRead()
+	if err != nil && ctx.Err() == nil && readCtx.Err() != nil && !rueidis.IsRedisNil(err) {
 		return nil, fmt.Errorf("read events: no answer in %v: %w", hubReadBlock+hubReadSlack, err)
 	}
 	return streams, err

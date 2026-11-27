@@ -3,6 +3,7 @@ package monitor
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"testing"
 )
@@ -30,7 +31,11 @@ func broadcastEach(h *hub, msgs [][]byte) {
 // It needs no Redis. With DUREQ_HUB_BENCH_MODES=1, a version that can also runs it sequential
 // (mode=seq) and in parallel (mode=par) at every N.
 //
-//	go test -run '^$' -bench BenchmarkHubBroadcast -benchmem -count 10 -cpu 1,4,8 ./internal/monitor/
+// Give the processors with GOMAXPROCS, one process each, not with -cpu: testing runs a
+// sub-benchmark that uses b.Loop, the first time in a process, for the first value of -cpu with
+// the GOMAXPROCS of the last value. The metric procs says which it was.
+//
+//	GOMAXPROCS=2 go test -run '^$' -bench BenchmarkHubBroadcast -benchmem -count 10 ./internal/monitor/
 func BenchmarkHubBroadcast(b *testing.B) {
 	modes := []string{""}
 	if os.Getenv("DUREQ_HUB_BENCH_MODES") == "1" && setFanOut != nil {
@@ -75,6 +80,7 @@ func BenchmarkHubBroadcast(b *testing.B) {
 					}
 					b.StopTimer()
 					b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(n*batch), "ns/delivery")
+					b.ReportMetric(float64(runtime.GOMAXPROCS(0)), "procs")
 					for _, c := range clients {
 						h.Unregister(c)
 					}

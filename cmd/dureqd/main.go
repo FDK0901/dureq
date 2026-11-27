@@ -119,6 +119,7 @@ func main() {
 	if ms := cfg.DureqdConfig.RequestTimeoutMs; ms != 0 {
 		api.SetRequestTimeout(time.Duration(ms) * time.Millisecond)
 	}
+	api.Service().SetHubParallel(cfg.DureqdConfig.HubParallelMinProcs, cfg.DureqdConfig.HubParallelMinDeliveries)
 	if w := srv.Worker(); w != nil {
 		api.SetSyncRetryStatsFunc(func() any { return w.SyncerStats() })
 	}

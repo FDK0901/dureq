@@ -95,8 +95,8 @@ type APIService = monitor.APIService
 // DefaultRequestTimeout is how long a call given to APIService.Timed may take by default.
 const DefaultRequestTimeout = monitor.DefaultRequestTimeout
 
-// When the hub sends events to its WebSocket clients in parallel by default; see
-// APIService.SetHubParallel.
+// What APIService.SetHubParallel can be given to send events to WebSocket clients in parallel
+// where BenchmarkHubBroadcast found that faster. By default the hub sends one after the other.
 const (
 	DefaultHubParallelMinProcs      = monitor.DefaultHubParallelMinProcs
 	DefaultHubParallelMinDeliveries = monitor.DefaultHubParallelMinDeliveries

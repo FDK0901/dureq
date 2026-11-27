@@ -81,8 +81,11 @@ type HubHealth interface {
 // The parts are those of ShardedPubSub16 of bbaliweb (ws/pubsub/sharded16.go, 3cf7341).
 const hubShards = 16
 
-// What SetHubParallel is given by default, as BenchmarkHubBroadcast found, 10 runs each on a
-// cloud VM of 22 vCPUs.
+// What SetHubParallel can be given, as BenchmarkHubBroadcast found, 10 runs each on a cloud VM
+// of 22 vCPUs. The clients of that benchmark only drain their channels. A server that writes
+// each connection from a goroutine of its own took more than twice as long a delivery in
+// parallel with 4 processors, and with 8 and 16 for connections with heartbeats: measure before
+// turning it on.
 const (
 	// DefaultHubParallelMinProcs is how many processors (GOMAXPROCS) it takes. With 2, a
 	// parallel fan-out of one event to 1,000 to 10,000 clients took 1.06 to 3.17 times as long

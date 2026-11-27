@@ -72,8 +72,8 @@ func (a *APIService) Logger() chainedlog.Logger { return a.logger }
 // the event stream brought at once, and send to the parts in parallel with minProcs processors
 // (GOMAXPROCS) and minDeliveries deliveries (clients times events) at least; 1000 if
 // minDeliveries is 0 or less. DefaultHubParallelMinProcs and DefaultHubParallelMinDeliveries are
-// what the benchmarks found. With minProcs 0 or less it sends one after the other, as it does by
-// default and as v0.3.2 did.
+// where BenchmarkHubBroadcast found that faster, which a server of yours need not be; see there.
+// With minProcs 0 or less it sends one after the other, as it does by default and as v0.3.2 did.
 func (a *APIService) SetHubParallel(minProcs, minDeliveries int) {
 	if h, ok := a.hub.(*hub); ok {
 		h.setParallel(minProcs, minDeliveries)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -78,12 +79,19 @@ type HubHealth interface {
 // each sent to under its read lock, in parallel only for many subscribers.
 const hubShards = 16
 
-// hubParallelMin is how many deliveries, clients times messages, a fan-out has at least before
-// the hub sends to its parts in parallel, a goroutine each. For fewer, starting the goroutines
-// costs more than they save: one event to 100 clients takes longer in parallel, one to 1,000 or
-// 100 events to 100 take less (BenchmarkHubBroadcast). With one processor it always sends one
-// part after the other.
-var hubParallelMin = 1000
+// A hub sends to its parts in parallel, a goroutine each, only if it pays; else one after the
+// other. By default, as BenchmarkHubBroadcast found, 10 runs each on a cloud VM of 22 vCPUs:
+const (
+	// DefaultHubParallelMinProcs is how many processors (GOMAXPROCS) it takes. With 2, a
+	// parallel fan-out of one event to 1,000 to 10,000 clients took 1.06 to 3.17 times as long
+	// as one in sequence, and 100 events to 100 clients 1.13 times; with 4, 8 and 16 it took 0.16
+	// to 0.85 times as long wherever there were 1,000 deliveries or more.
+	DefaultHubParallelMinProcs = 4
+	// DefaultHubParallelMinDeliveries is how many deliveries, clients times messages, a fan-out
+	// has at least. One event to 100 clients took longer in parallel with any number of
+	// processors.
+	DefaultHubParallelMinDeliveries = 1000
+)
 
 type hubShard struct {
 	mu      sync.RWMutex
@@ -114,6 +122,10 @@ type hub struct {
 	procs   atomic.Int32 // GOMAXPROCS, as of the last client that came
 	logger  chainedlog.Logger
 
+	// When it sends in parallel: with this many processors and deliveries at least.
+	parallelProcs      atomic.Int32
+	parallelDeliveries atomic.Int64
+
 	started   atomic.Bool  // it has begun to follow the event stream
 	following atomic.Bool  // it follows the event stream
 	heard     atomic.Int64 // when Redis last answered it, in Unix nanoseconds
@@ -125,7 +137,18 @@ func newHub(logger chainedlog.Logger) *hub {
 		h.shards[i].clients = make(map[*WSClient]struct{})
 	}
 	h.procs.Store(int32(runtime.GOMAXPROCS(0)))
+	h.setParallel(DefaultHubParallelMinProcs, DefaultHubParallelMinDeliveries)
 	return h
+}
+
+// setParallel sets when the hub sends in parallel; 0 or less keeps what it is.
+func (h *hub) setParallel(minProcs, minDeliveries int) {
+	if minProcs > 0 {
+		h.parallelProcs.Store(int32(min(minProcs, math.MaxInt32)))
+	}
+	if minDeliveries > 0 {
+		h.parallelDeliveries.Store(int64(minDeliveries))
+	}
 }
 
 func (h *hub) Register(c *WSClient) {
@@ -179,9 +202,10 @@ func (h *hub) broadcastBatch(msgs [][]byte) {
 	}
 }
 
-// parallel reports whether it pays to send messages to the parts in parallel.
+// parallel reports whether it pays to send messages to the parts in parallel. It does not
+// allocate, and the fan-out in sequence does not either.
 func (h *hub) parallel(messages int) bool {
-	return h.clients.Load()*int64(messages) >= int64(hubParallelMin) && h.procs.Load() > 1
+	return h.procs.Load() >= h.parallelProcs.Load() && h.clients.Load()*int64(messages) >= h.parallelDeliveries.Load()
 }
 
 // sendParallel sends msgs to the parts that have clients, a goroutine each, and waits for them,

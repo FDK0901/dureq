@@ -26,6 +26,11 @@ type DureqdConfig struct {
 	// RequestTimeoutMs is how long (ms) a request of the HTTP API may take, but a WebSocket; one that takes
 	// longer is answered 503. 0 = 30000, negative = no limit
 	RequestTimeoutMs int `koanf:"requestTimeoutMs"`
+
+	// HubParallelMinProcs and HubParallelMinDeliveries are when the hub sends events to its WebSocket clients
+	// in parallel: with that many processors and deliveries (clients times events) at least; 0 = 4 and 1000
+	HubParallelMinProcs      int `koanf:"hubParallelMinProcs"`
+	HubParallelMinDeliveries int `koanf:"hubParallelMinDeliveries"`
 }
 
 type RedisConfig struct {

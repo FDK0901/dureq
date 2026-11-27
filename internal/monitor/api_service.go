@@ -68,6 +68,15 @@ func (a *APIService) Store() *store.RedisStore  { return a.store }
 func (a *APIService) Hub() Hub                  { return a.hub }
 func (a *APIService) Logger() chainedlog.Logger { return a.logger }
 
+// SetHubParallel sets when the hub sends events to its WebSocket clients in parallel: with
+// minProcs processors (GOMAXPROCS) and minDeliveries deliveries (clients times events) at least.
+// 0 or less keeps what it is. Default: DefaultHubParallelMinProcs, DefaultHubParallelMinDeliveries.
+func (a *APIService) SetHubParallel(minProcs, minDeliveries int) {
+	if h, ok := a.hub.(*hub); ok {
+		h.setParallel(minProcs, minDeliveries)
+	}
+}
+
 func (a *APIService) SetSyncRetryStatsFunc(fn SyncRetryStatsFunc) {
 	a.syncRetryStats = fn
 }

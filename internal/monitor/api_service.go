@@ -68,9 +68,12 @@ func (a *APIService) Store() *store.RedisStore  { return a.store }
 func (a *APIService) Hub() Hub                  { return a.hub }
 func (a *APIService) Logger() chainedlog.Logger { return a.logger }
 
-// SetHubParallel sets when the hub sends events to its WebSocket clients in parallel: with
-// minProcs processors (GOMAXPROCS) and minDeliveries deliveries (clients times events) at least.
-// 0 or less keeps what it is. Default: DefaultHubParallelMinProcs, DefaultHubParallelMinDeliveries.
+// SetHubParallel makes the hub keep its WebSocket clients in parts, hand them what a read of
+// the event stream brought at once, and send to the parts in parallel with minProcs processors
+// (GOMAXPROCS) and minDeliveries deliveries (clients times events) at least; 1000 if
+// minDeliveries is 0 or less. DefaultHubParallelMinProcs and DefaultHubParallelMinDeliveries are
+// what the benchmarks found. With minProcs 0 or less it sends one after the other, as it does by
+// default and as v0.3.2 did.
 func (a *APIService) SetHubParallel(minProcs, minDeliveries int) {
 	if h, ok := a.hub.(*hub); ok {
 		h.setParallel(minProcs, minDeliveries)

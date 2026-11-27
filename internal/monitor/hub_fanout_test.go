@@ -2,7 +2,6 @@ package monitor
 
 import (
 	"fmt"
-	"math"
 	"runtime"
 	"slices"
 	"sync"
@@ -12,16 +11,13 @@ import (
 
 func init() {
 	setFanOut = func(h *hub, mode string) func() {
-		procs, deliveries := h.parallelProcs.Load(), h.parallelDeliveries.Load()
 		switch mode {
-		case "seq":
-			h.parallelDeliveries.Store(math.MaxInt64)
-		case "par":
-			// also with one processor, to see what it costs there
-			h.parallelProcs.Store(1)
-			h.parallelDeliveries.Store(1)
+		case "seq": // as by default
+			h.setParallel(0, 0)
+		case "par": // also with one processor, to see what it costs there
+			h.setParallel(1, 1)
 		}
-		return func() { h.parallelProcs.Store(procs); h.parallelDeliveries.Store(deliveries) }
+		return func() { h.setParallel(0, 0) }
 	}
 }
 
@@ -90,9 +86,10 @@ func TestHub_FanOutKeepsOrder(t *testing.T) {
 	}
 }
 
-// The hub sends in parallel only with 4 processors and 1,000 deliveries at least, unless it is
-// told otherwise; in sequence, the fan-out does not allocate.
-func TestHub_ParallelWhenItPays(t *testing.T) {
+// By default the hub sends in sequence, as v0.3.2 did, and allocates nothing for it. Asked to,
+// it sends in parallel with 4 processors and 1,000 deliveries at least, and keeps its clients
+// when it is turned on and off.
+func TestHub_ParallelWhenAskedAndItPays(t *testing.T) {
 	for _, procs := range []int{1, 2, 4, 8} {
 		old := runtime.GOMAXPROCS(procs)
 		h := quietHub()
@@ -101,18 +98,29 @@ func TestHub_ParallelWhenItPays(t *testing.T) {
 			clients[i] = NewWSClient()
 			h.Register(clients[i]) // nothing reads: what is sent fills the queues, then is missed
 		}
-		if got, want := h.parallel(1), procs >= 4; got != want {
-			t.Errorf("GOMAXPROCS %d, one event to 5,000: parallel %v, want %v", procs, got, want)
-		}
-		if h.parallel(1) && len(clients) < 1000 {
-			t.Error("parallel with fewer deliveries")
-		}
 		msg := []byte("e")
-		if allocs := testing.AllocsPerRun(100, func() { h.Broadcast(msg) }); !h.parallel(1) && allocs != 0 {
-			t.Errorf("GOMAXPROCS %d: a fan-out in sequence allocates %.0f times", procs, allocs)
+		if h.parallel(1) {
+			t.Errorf("GOMAXPROCS %d: parallel by default", procs)
+		}
+		if allocs := testing.AllocsPerRun(100, func() { h.Broadcast(msg) }); allocs != 0 {
+			t.Errorf("GOMAXPROCS %d: a fan-out by default allocates %.0f times", procs, allocs)
+		}
+		h.setParallel(DefaultHubParallelMinProcs, DefaultHubParallelMinDeliveries)
+		if got, want := h.parallel(1), procs >= 4; got != want {
+			t.Errorf("GOMAXPROCS %d, asked to, one event to 5,000: parallel %v, want %v", procs, got, want)
+		}
+		if h.ClientCount() != len(clients) {
+			t.Errorf("%d clients after it was turned on", h.ClientCount())
+		}
+		h.setParallel(0, 0)
+		if h.parallel(1) || h.ClientCount() != len(clients) {
+			t.Errorf("turned off: parallel %v, %d clients", h.parallel(1), h.ClientCount())
 		}
 		for _, c := range clients {
 			h.Unregister(c)
+		}
+		if h.ClientCount() != 0 {
+			t.Errorf("%d clients left", h.ClientCount())
 		}
 		runtime.GOMAXPROCS(old)
 	}
@@ -121,17 +129,13 @@ func TestHub_ParallelWhenItPays(t *testing.T) {
 	for range 600 {
 		h.Register(NewWSClient())
 	}
-	h.procs.Store(2)
-	if h.parallel(1) {
-		t.Error("600 deliveries with 2 processors: parallel by default")
-	}
 	svc := &APIService{hub: h}
-	svc.SetHubParallel(2, 500)
+	svc.SetHubParallel(1, 500)
 	if !h.parallel(1) {
-		t.Error("told to go parallel with 2 processors and 500 deliveries, it does not")
+		t.Error("asked to go parallel with 1 processor and 500 deliveries, it does not")
 	}
-	svc.SetHubParallel(0, 0) // keeps what it is
-	if !h.parallel(1) {
-		t.Error("0 changed it")
+	svc.SetHubParallel(0, 0)
+	if h.parallel(1) {
+		t.Error("asked to stop, it goes on")
 	}
 }

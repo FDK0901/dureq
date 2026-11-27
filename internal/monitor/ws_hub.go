@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
+	"maps"
 	"runtime"
 	"strconv"
 	"strings"
@@ -72,15 +72,17 @@ type HubHealth interface {
 	Stalled() bool
 }
 
-// hubShards is how many parts the clients of a hub are kept in. Each has a lock of its own, and
-// a hub with many clients sends to the parts in parallel.
+// A hub sends events to its clients one after the other by default, as v0.3.2 did: one lock,
+// one map, and each event of a read of the event stream by itself. SetHubParallel makes it keep
+// its clients in hubShards parts instead, hand a read over at once, and send to the parts in
+// parallel when that pays. What that takes is kept apart, in hubParallel, so that the fan-out in
+// sequence reads no more than v0.3.2 did: it only sees that clients is not nil.
 //
-// The design is that of ShardedPubSub16 of bbaliweb (ws/pubsub/sharded16.go, 3cf7341): 16 parts,
-// each sent to under its read lock, in parallel only for many subscribers.
+// The parts are those of ShardedPubSub16 of bbaliweb (ws/pubsub/sharded16.go, 3cf7341).
 const hubShards = 16
 
-// A hub sends to its parts in parallel, a goroutine each, only if it pays; else one after the
-// other. By default, as BenchmarkHubBroadcast found, 10 runs each on a cloud VM of 22 vCPUs:
+// What SetHubParallel is given by default, as BenchmarkHubBroadcast found, 10 runs each on a
+// cloud VM of 22 vCPUs.
 const (
 	// DefaultHubParallelMinProcs is how many processors (GOMAXPROCS) it takes. With 2, a
 	// parallel fan-out of one event to 1,000 to 10,000 clients took 1.06 to 3.17 times as long
@@ -93,18 +95,114 @@ const (
 	DefaultHubParallelMinDeliveries = 1000
 )
 
-type hubShard struct {
+type hub struct {
 	mu      sync.RWMutex
-	clients map[*WSClient]struct{}
-	n       atomic.Int32
+	clients map[*WSClient]struct{} // nil while the clients are in par
+	logger  chainedlog.Logger
+
+	following atomic.Bool  // it follows the event stream
+	started   atomic.Bool  // it has begun to follow the event stream
+	heard     atomic.Int64 // when Redis last answered it, in Unix nanoseconds
+
+	par        *hubParallel // guarded by mu; nil by default
+	parallelOn atomic.Bool  // par is set: the reader of the stream hands a read over at once
 }
 
-// send gives msgs, in order, to each client of the part. A client whose queue is full misses
+// hubParallel is a hub's clients in parts, and when to send to the parts in parallel. It is
+// guarded by the lock of its hub: changed under the write lock, read under the read lock, also by
+// the goroutines of a parallel fan-out, which the fan-out waits for.
+type hubParallel struct {
+	shards  [hubShards]map[*WSClient]struct{}
+	next    uint32
+	clients int
+	procs   int // GOMAXPROCS, as of the last client that came
+
+	minProcs, minDeliveries int
+}
+
+func newHub(logger chainedlog.Logger) *hub {
+	return &hub{
+		clients: make(map[*WSClient]struct{}),
+		logger:  logger,
+	}
+}
+
+// setParallel makes the hub send in parallel with minProcs processors and minDeliveries
+// deliveries at least (1000 if 0 or less), or, if minProcs is 0 or less, one after the other as
+// by default. The clients that it has move along.
+func (h *hub) setParallel(minProcs, minDeliveries int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if minProcs <= 0 {
+		if h.par != nil {
+			h.clients = make(map[*WSClient]struct{}, h.par.clients)
+			for _, shard := range h.par.shards {
+				maps.Copy(h.clients, shard)
+			}
+			h.par = nil
+			h.parallelOn.Store(false)
+		}
+		return
+	}
+	if minDeliveries <= 0 {
+		minDeliveries = DefaultHubParallelMinDeliveries
+	}
+	if h.par == nil {
+		h.par = &hubParallel{procs: runtime.GOMAXPROCS(0)}
+		for i := range h.par.shards {
+			h.par.shards[i] = make(map[*WSClient]struct{})
+		}
+		for c := range h.clients {
+			h.par.add(c)
+		}
+		h.clients = nil
+		h.parallelOn.Store(true)
+	}
+	h.par.minProcs, h.par.minDeliveries = minProcs, minDeliveries
+}
+
+func (p *hubParallel) add(c *WSClient) {
+	p.next++
+	c.shard = p.next % hubShards
+	p.shards[c.shard][c] = struct{}{}
+	p.clients++
+	p.procs = runtime.GOMAXPROCS(0)
+}
+
+func (p *hubParallel) remove(c *WSClient) {
+	if _, ok := p.shards[c.shard][c]; ok {
+		delete(p.shards[c.shard], c)
+		p.clients--
+	}
+}
+
+// worth reports whether it pays to send messages to the parts in parallel.
+func (p *hubParallel) worth(messages int) bool {
+	return p.procs >= p.minProcs && p.clients*messages >= p.minDeliveries
+}
+
+// send gives msgs, in order, to each client of the parts, in parallel if it pays, and returns
+// once all have them, so that every client gets what comes next after msgs.
+func (p *hubParallel) send(msgs [][]byte) {
+	if !p.worth(len(msgs)) {
+		for _, shard := range p.shards {
+			sendShard(shard, msgs)
+		}
+		return
+	}
+	var wg sync.WaitGroup
+	for _, shard := range p.shards {
+		if len(shard) > 0 {
+			wg.Go(func() { sendShard(shard, msgs) })
+		}
+	}
+	wg.Wait()
+}
+
+// sendShard gives msgs, in order, to each client of a part. A client whose queue is full misses
 // what does not fit, which its Missed tells.
-func (s *hubShard) send(msgs [][]byte) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for c := range s.clients {
+func sendShard(shard map[*WSClient]struct{}, msgs [][]byte) {
+	for c := range shard {
 		for _, m := range msgs {
 			select {
 			case c.Send <- m:
@@ -115,125 +213,103 @@ func (s *hubShard) send(msgs [][]byte) {
 	}
 }
 
-type hub struct {
-	shards  [hubShards]hubShard
-	next    atomic.Uint32 // the part of the next client
-	clients atomic.Int64
-	procs   atomic.Int32 // GOMAXPROCS, as of the last client that came
-	logger  chainedlog.Logger
-
-	// When it sends in parallel: with this many processors and deliveries at least.
-	parallelProcs      atomic.Int32
-	parallelDeliveries atomic.Int64
-
-	started   atomic.Bool  // it has begun to follow the event stream
-	following atomic.Bool  // it follows the event stream
-	heard     atomic.Int64 // when Redis last answered it, in Unix nanoseconds
-}
-
-func newHub(logger chainedlog.Logger) *hub {
-	h := &hub{logger: logger}
-	for i := range h.shards {
-		h.shards[i].clients = make(map[*WSClient]struct{})
-	}
-	h.procs.Store(int32(runtime.GOMAXPROCS(0)))
-	h.setParallel(DefaultHubParallelMinProcs, DefaultHubParallelMinDeliveries)
-	return h
-}
-
-// setParallel sets when the hub sends in parallel; 0 or less keeps what it is.
-func (h *hub) setParallel(minProcs, minDeliveries int) {
-	if minProcs > 0 {
-		h.parallelProcs.Store(int32(min(minProcs, math.MaxInt32)))
-	}
-	if minDeliveries > 0 {
-		h.parallelDeliveries.Store(int64(minDeliveries))
-	}
-}
-
 func (h *hub) Register(c *WSClient) {
-	c.shard = h.next.Add(1) % hubShards
-	s := &h.shards[c.shard]
-	s.mu.Lock()
-	s.clients[c] = struct{}{}
-	s.n.Add(1)
-	s.mu.Unlock()
-	h.clients.Add(1)
-	h.procs.Store(int32(runtime.GOMAXPROCS(0)))
+	h.mu.Lock()
+	if h.clients == nil {
+		h.par.add(c)
+	} else {
+		h.clients[c] = struct{}{}
+	}
+	h.mu.Unlock()
 }
 
 func (h *hub) Unregister(c *WSClient) {
-	s := &h.shards[c.shard]
-	s.mu.Lock()
-	if _, ok := s.clients[c]; ok {
-		delete(s.clients, c)
-		s.n.Add(-1)
-		h.clients.Add(-1)
+	h.mu.Lock()
+	if h.clients == nil {
+		h.par.remove(c)
+	} else {
+		delete(h.clients, c)
 	}
 	close(c.Send)
-	s.mu.Unlock()
+	h.mu.Unlock()
 }
 
 // Broadcast sends a message to all connected clients.
 // Drops the message for any client whose send buffer is full (slow consumer protection),
 // which its Missed tells.
 func (h *hub) Broadcast(data []byte) {
-	if h.parallel(1) {
-		h.sendParallel([][]byte{data})
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.clients == nil {
+		h.par.send([][]byte{data})
 		return
 	}
-	msgs := [1][]byte{data}
-	for i := range h.shards {
-		h.shards[i].send(msgs[:])
-	}
-}
-
-// broadcastBatch sends messages, in order, to all connected clients, as Broadcast does each.
-func (h *hub) broadcastBatch(msgs [][]byte) {
-	if len(msgs) == 0 {
-		return
-	}
-	if h.parallel(len(msgs)) {
-		h.sendParallel(msgs)
-		return
-	}
-	for i := range h.shards {
-		h.shards[i].send(msgs)
-	}
-}
-
-// parallel reports whether it pays to send messages to the parts in parallel. It does not
-// allocate, and the fan-out in sequence does not either.
-func (h *hub) parallel(messages int) bool {
-	return h.procs.Load() >= h.parallelProcs.Load() && h.clients.Load()*int64(messages) >= h.parallelDeliveries.Load()
-}
-
-// sendParallel sends msgs to the parts that have clients, a goroutine each, and waits for them,
-// so that every client gets what comes next after msgs.
-func (h *hub) sendParallel(msgs [][]byte) {
-	var wg sync.WaitGroup
-	for i := range h.shards {
-		if s := &h.shards[i]; s.n.Load() > 0 {
-			wg.Go(func() { s.send(msgs) })
+	for c := range h.clients {
+		select {
+		case c.Send <- data:
+		default:
+			c.missed.Store(true)
 		}
 	}
-	wg.Wait()
+}
+
+// broadcastBatch sends messages, in order, to all connected clients: each by itself, as
+// Broadcast, or, while the hub has its clients in parts, all at once.
+func (h *hub) broadcastBatch(msgs [][]byte) {
+	if !h.parallelOn.Load() {
+		for _, m := range msgs {
+			h.Broadcast(m)
+		}
+		return
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.clients == nil {
+		h.par.send(msgs)
+		return
+	}
+	for _, m := range msgs { // it was turned off in the meantime
+		for c := range h.clients {
+			select {
+			case c.Send <- m:
+			default:
+				c.missed.Store(true)
+			}
+		}
+	}
+}
+
+// parallel reports whether the hub would send messages to its parts in parallel.
+func (h *hub) parallel(messages int) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.par != nil && h.par.worth(messages)
 }
 
 // missed notes for all clients that there have been events which the hub did not get.
 func (h *hub) missed() {
-	for i := range h.shards {
-		s := &h.shards[i]
-		s.mu.RLock()
-		for c := range s.clients {
-			c.missed.Store(true)
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.clients == nil {
+		for _, shard := range h.par.shards {
+			for c := range shard {
+				c.missed.Store(true)
+			}
 		}
-		s.mu.RUnlock()
+		return
+	}
+	for c := range h.clients {
+		c.missed.Store(true)
 	}
 }
 
 func (h *hub) ClientCount() int {
-	return int(h.clients.Load())
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	if h.clients == nil {
+		return h.par.clients
+	}
+	return len(h.clients)
 }
 
 // Stalled reports whether the hub has followed the event stream and does not any more, or Redis
@@ -294,15 +370,25 @@ func (h *hub) follow(ctx context.Context, rdb rueidis.Client, streamKey string) 
 				return err
 			}
 			h.answered()
-			entries := streams[streamKey]
-			msgs := make([][]byte, 0, len(entries))
-			for _, entry := range entries {
-				if data := entry.FieldValues["data"]; data != "" {
-					msgs = append(msgs, []byte(data))
+			if h.parallelOn.Load() {
+				// A read is handed over at once.
+				entries := streams[streamKey]
+				msgs := make([][]byte, 0, len(entries))
+				for _, entry := range entries {
+					if data := entry.FieldValues["data"]; data != "" {
+						msgs = append(msgs, []byte(data))
+					}
+					last = entry.ID
 				}
-				last = entry.ID
+				h.broadcastBatch(msgs)
+			} else {
+				for _, entry := range streams[streamKey] {
+					if data := entry.FieldValues["data"]; data != "" {
+						h.Broadcast([]byte(data))
+					}
+					last = entry.ID
+				}
 			}
-			h.broadcastBatch(msgs)
 			if len(streams[streamKey]) == hubReadCount {
 				// Behind: see whether what comes next is still there.
 				first, err := firstEventID(ctx, rdb, streamKey)

@@ -27,8 +27,9 @@ type DureqdConfig struct {
 	// longer is answered 503. 0 = 30000, negative = no limit
 	RequestTimeoutMs int `koanf:"requestTimeoutMs"`
 
-	// HubParallelMinProcs and HubParallelMinDeliveries are when the hub sends events to its WebSocket clients
-	// in parallel: with that many processors and deliveries (clients times events) at least; 0 = 4 and 1000
+	// HubParallelMinProcs and HubParallelMinDeliveries make the hub send events to its WebSocket clients in
+	// parallel with that many processors and deliveries (clients times events) at least; 0 = one after the
+	// other (the default), and 1000 deliveries
 	HubParallelMinProcs      int `koanf:"hubParallelMinProcs"`
 	HubParallelMinDeliveries int `koanf:"hubParallelMinDeliveries"`
 }

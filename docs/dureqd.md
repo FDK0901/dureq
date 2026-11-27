@@ -52,6 +52,8 @@ See [configs/config.yaml](../configs/config.yaml) for a fully annotated sample.
 | `dureqd.drainTimeoutMs` | int | `30000` | Shutdown drain timeout (ms) |
 | `dureqd.runHistoryRetentionHours` | int | `0` | Remove finished runs from the run history after so many hours; 0 = only by hand |
 | `dureqd.maxNameScan` | int | `100000` | How many workflows or batches a list filtered by name (`?name=`) looks at, at most; each is read |
+| `dureqd.hubParallelMinProcs` | int | `0` | 0: the hub sends events to its WebSocket clients one after the other. Else it sends in parallel with this many processors (GOMAXPROCS) at least; 4 is what the benchmarks found |
+| `dureqd.hubParallelMinDeliveries` | int | `1000` | Deliveries (clients times events) a fan-out of the hub has at least to go parallel, with `hubParallelMinProcs` set |
 | `dureqd.requestTimeoutMs` | int | `30000` | How long a request of the HTTP API may take, but a WebSocket; one that takes longer, as when Redis does not answer, gets 503 with `Retry-After: 5`. Negative = no limit |
 
 ### Modes
